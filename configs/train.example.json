@@ -1,0 +1,19 @@
+{
+  "manifest": "data/manifest.json",
+  "split": "data/split.json",
+  "relations": "data/relations.csv",
+  "out": "runs/dl1",
+  "epochs": 100,
+  "grid": 256,
+  "batch_size": 8,
+  "lr": 0.0003,
+  "temperature": 0.1,
+  "backbone": "tiny",
+  "weights": null,
+  "use_unit_size": false,
+  "unlabelled_negatives": false,
+  "augmentation": "none",
+  "resume": null,
+  "device": "cpu",
+  "seed": 0
+}

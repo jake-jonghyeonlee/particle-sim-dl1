@@ -32,14 +32,14 @@ def products():
 
 def pytest_addoption(parser):
     parser.addoption("--run-training", action="store_true", default=False,
-                     help="Explicitly opt into T9 training tests (not part of T8)")
+                     help="Explicitly opt into synthetic T9 training smoke (default suite performs no training)")
 
 
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("--run-training"):
         for item in items:
             if item.name == "test_training_lowers_the_loss_and_search_finds_the_same_layout_at_another_unit_size":
-                item.add_marker(pytest.mark.skip(reason="T9 train.py/search.py: training requires explicit --run-training; T8 forbids training"))
+                item.add_marker(pytest.mark.skip(reason="synthetic training smoke requires explicit --run-training"))
 
 
 @pytest.fixture(autouse=True)

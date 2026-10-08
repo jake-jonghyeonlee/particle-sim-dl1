@@ -1,36 +1,48 @@
 # psdl1 — DL1 product similarity
 
-DL1 aims to find products with similar original shapes and electrode connectivity even when unit sizes differ. Real layouts and correspondence labels are available only in the closed network; the current evidence uses synthetic shapes.
+DL1 aims to find products with similar original shapes and electrode connectivity even when unit sizes differ. The user approved **whole-unit isotropic resize + pad and electrode × actual-layer set aggregation on 2026-10-09**, prioritizing shape/connectivity matching over preserving absolute linewidth. Unit-size conditioning is optional and **off by default** so the user can compare it on and off in the closed network. No second original-µm view is implemented.
 
-G3 repository naming remains pending. G5 approval of whole-unit isotropic resize plus pad, electrode × actual-layer set aggregation, the real minimum linewidth and grid, and the source CNT/VIA endpoint format remains pending. The versioned manifest and three-channel tensor path here are **draft candidates**, not a confirmed user design. No real search performance or connectivity preservation has been established.
+The real minimum linewidth/grid choice and the source CNT/VIA endpoint metadata format remain open within G5. G6 label-format and closed-network acceptance criteria remain open. The exact encoder, endpoint feature representation, and training recipe are candidates; no real search performance or connectivity preservation has been established. G3 repository naming remains pending.
 
-The input consists of original shape masks and source-supplied connection metadata. Hotspot, CA, and fab fields are rejected. Products share a physical pixel pitch (about 0.05 µm in the user data); their pixel counts differ, and all layers within each product share one frame. This contract expects a single whole unit; it does not infer or crop a unit from a 2×2 simulation domain.
+Inputs contain only original shape, valid coverage, and supplied connectivity metadata; hotspot, CA, and fab fields are rejected. Products share physical pixel pitch (about 0.05 µm in the user data), have different pixel counts, and share a frame across their layers. See [docs/data_contract.md](docs/data_contract.md) for the accepted T8 draft schema. Its earlier broad `G5_pending` fields are historical/conservative: the input approach is now approved, while grid/linewidth and source endpoint format remain pending.
 
-See [docs/data_contract.md](docs/data_contract.md) for the manifest example, observation states, path rules, endpoint bindings, and validation evidence. Unversioned manifests must be explicitly converted with known lineage, frame, valid coverage, and observations; the loader does not guess them.
+The T9 model consumes T8 spatial valid coverage as a fourth image channel and source relations as features bound to the corresponding element representations. Connection features retain each endpoint's relative unit coordinate, CNT/VIA kind, observation flag, and mask coverage. Connectivity availability is separate from image values. A global CNT image without source endpoint metadata remains **unavailable**, never CNN-verified. No layer is independently centred. The fixed-grid image is a candidate representation and cannot certify connectivity.
 
-Validate and save the per-product grid evidence without training:
+Labels are explicit and unknown pairs are excluded from both loss numerator and denominator. Conflicting similar/different labels are rejected. Unlabelled negatives require `--unlabelled-negatives`; this experiment can push truly similar products apart, including when labels are incomplete. The relation sampler covers every supplied negative edge each epoch and reports effective pairs, excluded rows, and unsampled products. Training vocabulary/statistics use only the validated training partition; unknown query/candidate role or layer is rejected with a reason.
+
+Training uses an explicit lineage-safe split. Cropping and geometric augmentation are disabled; default augmentation is `none`, with an optional `intensity` ablation that applies one scalar to all product image channels and keeps connection geometry. Checkpoints store version/fingerprint, vocabulary/statistics, split, code/input/weights hashes, seed, optimizer state, RNG states, grid evidence, and relation coverage, with atomic replacement after each epoch. Resume rejects changed contracts and restores state.
+
+See [docs/training.md](docs/training.md) for the complete configuration and resume protocol, and [docs/validation.md](docs/validation.md) for held-out evaluation and limits. The endpoint-only hard negative is a held-out evaluation item. Its ranking by an untrained encoder is not performance evidence; the evaluator rejects such validation.
 
 ```bash
+# Input validation only; original masks must satisfy the versioned draft contract.
 .venv/bin/python -m psdl1.data data/manifest.json --grid 256 --report grid-report.json
-# Equivalent entry point after installation:
-psdl1-validate data/manifest.json --grid 256 --report grid-report.json
+
+# User-run closed-network training; configure grid, labels and split first.
+.venv/bin/python -m psdl1.train --config configs/train.example.json
+
+# Independent query and candidate manifests; JSON output with availability/reasons.
+.venv/bin/python -m psdl1.search --ckpt runs/dl1/dl1.pt \
+  --query-manifest data/query.json --query new-product \
+  --candidates-manifest data/candidates.json --topk 5 --batch-size 32 --out search.json
+
+# Held-out model vs normalized-image baseline; no real acceptance threshold yet.
+.venv/bin/python -m psdl1.evaluate --ckpt runs/dl1/dl1.pt \
+  --manifest data/manifest.json --split data/split.json --relations data/relations.csv \
+  --hard-negatives data/hard-negatives.json --topk 5 --out evaluation.json
 ```
 
-The report records thin-line warnings, thresholded component changes, coverage, and G5 pending status. Its axis-run estimate is a diagnostic, not the true physical minimum linewidth. A warning requires review or a different candidate grid. Even a report without warnings does not certify connectivity. The existing training entry point does not automatically enforce this validator; consuming spatial valid masks, endpoint relations, grid reports, and safe augmentation decisions belongs to T9.
+`configs/` contains illustrative filenames/IDs, not real data or approved real hyperparameters. Both manifests, labels, and split must be supplied with actual provenance before running user training. A 2×2 simulation domain is not automatically converted to a unit.
 
-`prepare_product` preserves spatial validity and source endpoint relations alongside the candidate tensors. `product_tensors` is the existing three-channel compatibility interface (element / CNT-VIA union / other elements), and the existing model consumes only that interface. Each rest channel excludes its own element before composing the other masks, including XY overlaps across layers. A CNT image without source endpoint metadata leaves connectivity **unavailable**, never CNN-verified. Role and actual layer remain bound to each element; layers are never centred independently.
-
-The existing model, training, loss, and search code is pending T9 review. Their set encoder, unlabeled negative policy, weights loader, and training augmentations are not approved by this input-contract task. `augment_with_check` supplies evidence for a single common transform and never approves a view as a connectivity-preserving positive label.
-
-The checked runtime is Python 3.12. `requirements.lock` records exact installed dependency versions, including the optional timm stack; it is a runtime snapshot for this macOS environment, not a portable wheel/build lock. Obtain approved distributions and the build backend through the closed-network package process; no dependency updates or downloads were performed in this task.
+The checked runtime is Python 3.12. The T8 `requirements.lock` records exact installed versions for the macOS runtime, including optional timm/test dependencies; it is not a portable wheel/build lock. Use the closed-network package process to obtain approved distributions and the build backend; no dependency updates or downloads were performed here.
 
 ```bash
-# From an approved local wheel directory, after preparing a Python environment:
 uv pip install --no-index --find-links /approved/wheels -r requirements.lock
 uv pip install --no-index --find-links /approved/wheels -e .
 
-.venv/bin/python -m pytest -p no:warnings tests/test_data.py tests/test_input_contract.py
 .venv/bin/python -m pytest -p no:warnings
+# Explicit opt-in to the existing synthetic training/search smoke:
+.venv/bin/python -m pytest -p no:warnings --run-training
 ```
 
-The full default suite skips the existing 40-epoch training/search test; its T9 coverage requires explicit `--run-training`. Test fixtures reject socket network connections. No training or pretrained weights were used for T8. Before importing any pretrained artifact, record its exact file hash, source, and applicable license; no artifact or license has been accepted here.
+Default tests use direct forward/loss/optimizer-state fixtures and skip dataset training. Socket network calls fail in tests. `pretrained=False` is always used for backbone construction; optional weights load from a local `.pt`, `.pth`, or `.safetensors` state dict with strict shape/finite checks and no online fallback. For the product encoder, local backbone files must match its four input channels. Record an imported artifact's exact hash, source and license before use; none was accepted here.

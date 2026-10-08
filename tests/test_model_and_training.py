@@ -46,7 +46,7 @@ def test_unit_size_condition_is_optional_and_required_when_enabled(products):
 
 def test_relation_matrix_without_and_with_labels():
     ids = ["A", "B", "C"]
-    assert relation_matrix(ids).tolist() == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    assert relation_matrix(ids, unlabelled_negatives=True).tolist() == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
     rel = relation_matrix(ids, similar={frozenset(("A", "B"))}, different={frozenset(("A", "C"))})
     assert rel[0].tolist() == [POSITIVE, POSITIVE, NEGATIVE]
     assert rel[1].tolist() == [POSITIVE, POSITIVE, UNKNOWN]
@@ -54,7 +54,7 @@ def test_relation_matrix_without_and_with_labels():
 
 def test_loss_is_low_when_aligned_and_ignores_unknown_pairs():
     z = torch.nn.functional.normalize(torch.eye(3), dim=1)
-    rel = relation_matrix(["A", "B", "C"])
+    rel = relation_matrix(["A", "B", "C"], unlabelled_negatives=True)
     assert masked_contrastive_loss(z, z, rel)[0] < 0.01
     shuffled = z[[1, 2, 0]]
     loss, rows = masked_contrastive_loss(z, shuffled, rel)
@@ -64,7 +64,7 @@ def test_loss_is_low_when_aligned_and_ignores_unknown_pairs():
     loss, rows = masked_contrastive_loss(z, shuffled, unknown)
     assert loss == 0.0 and rows == 0  # 구분할 쌍이 없는 행은 계산에서 뺌
     partly = rel.clone()
-    partly[0, 1] = UNKNOWN  # 0행은 2열과만 구분, 1열은 모름
+    partly[0, 1] = partly[1, 0] = UNKNOWN  # 0행은 2열과만 구분, 1열은 모름
     full_rows = masked_contrastive_loss(z, shuffled, rel)[0]
     assert masked_contrastive_loss(z, shuffled, partly)[1] == 3 and masked_contrastive_loss(z, shuffled, partly)[0] != full_rows
     with pytest.raises(ValueError, match="가까워야 하는 쌍"):
@@ -96,7 +96,7 @@ def test_training_needs_at_least_two_products(products, tmp_path):
 
 
 def test_tiny_backbone_has_no_pretrained_weights():
-    with pytest.raises(ValueError, match="사전학습 가중치가 없다"):
+    with pytest.raises(ValueError, match="local weights file"):
         build_backbone("tiny", weights_file="x.pth")
 
 
@@ -104,3 +104,76 @@ def test_timm_backbone_builds_without_network_when_installed():
     pytest.importorskip("timm")
     net = build_backbone("convnextv2_atto")
     assert net(torch.zeros(1, 3, 64, 64)).shape == (1, net.num_features)
+
+
+
+def test_singleton_training_forward_supported_and_invalid_inputs_rejected(products):
+    roles, layers, batch = batch_of(products[:1])
+    model = ProductEncoder(len(roles), len(layers)).train()
+    assert model(*batch).shape == (1, 128)
+    bad = list(batch); bad[3] = torch.zeros_like(batch[3])
+    with pytest.raises(ValueError, match="valid element"):
+        model(*bad)
+    bad = list(batch); bad[0] = torch.full_like(batch[0], float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        model(*bad)
+    with pytest.raises(ValueError, match="dimensions"):
+        ProductEncoder(3, 2, dim=7, heads=2)
+
+
+def test_structured_validity_and_endpoint_inputs_are_consumed(manifest_case):
+    from dataclasses import replace
+    from psdl1.data import load_manifest
+    from psdl1.train import encode_products
+    _, write, _ = manifest_case
+    p, = load_manifest(write())
+    roles, layers = build_vocab([p])
+    torch.manual_seed(3)
+    model = ProductEncoder(len(roles), len(layers)).eval()
+    before = encode_products(model, [p], 8, roles, layers)
+    c = p.connections[0]
+    moved = replace(p, connections=(replace(c, endpoints=(replace(c.endpoints[0], xy_um=(1.175, -1.975)), c.endpoints[1])),))
+    after = encode_products(model, [moved], 8, roles, layers)
+    assert not torch.allclose(before, after, atol=1e-7)  # mechanics, never ranking/performance
+    valid = p.valid.copy(); valid[3, 3] = 0
+    hole = replace(p, valid=valid)
+    assert not torch.allclose(before, encode_products(model, [hole], 8, roles, layers), atol=1e-7)
+
+
+def test_crop_augmentation_is_rejected_before_any_training(products, tmp_path):
+    with pytest.raises(ValueError, match="augmentation"):
+        train(products, tmp_path, epochs=1, augmentation="crop")
+
+
+@pytest.mark.parametrize("field,value", [("epochs", 0), ("batch_size", 1), ("grid", -1),
+                                          ("lr", float("nan")), ("temperature", 0), ("seed", -1)])
+def test_training_argument_errors_precede_any_optimizer_step(products, tmp_path, field, value):
+    with pytest.raises(ValueError):
+        train(products, tmp_path, relations=(set(), {frozenset(("bus-40", "comb-40"))}), **{field: value})
+
+
+def test_json_config_and_cli_override_without_training(manifest_case, tmp_path, monkeypatch, capsys):
+    import json
+    from psdl1.train import main
+    from psdl1.split import SPLIT_VERSION
+    _, write, _ = manifest_case
+    split_path = tmp_path / "split.json"
+    split_path.write_text(json.dumps({"schema_version": SPLIT_VERSION, "train": ["P"], "validation": [], "test": []}))
+    config_path = tmp_path / "train.json"
+    config_path.write_text(json.dumps({"manifest": str(write()), "split": str(split_path), "out": str(tmp_path / "out"), "epochs": 5, "grid": 4, "use_unit_size": False}))
+    received = {}
+    def fake_train(*args, **kwargs):
+        received["epochs"] = args[2]
+        received["unit"] = args[8]
+        received.update(kwargs)
+        return [0.5]
+    monkeypatch.setattr("psdl1.train.train", fake_train)
+    main(["--config", str(config_path), "--epochs", "7", "--use-unit-size"])
+    assert received["epochs"] == 7 and received["unit"] is True
+    assert received["split_manifest"]["train"] == ["P"]
+    assert json.loads(capsys.readouterr().out)["last_loss"] == 0.5
+
+
+def test_explicit_empty_split_cannot_fall_back_to_training_all_products(products, tmp_path):
+    with pytest.raises(ValueError, match="split schema"):
+        train(products, tmp_path, split_manifest={}, relations=(set(), {frozenset(("bus-40", "comb-40"))}))

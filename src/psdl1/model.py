@@ -1,6 +1,8 @@
 """원소 인코더 + 조건 결합 + Set Transformer → 제품 특징 하나."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,22 +27,36 @@ class TinyBackbone(nn.Module):
         return self.body(x).mean(dim=(2, 3))
 
 
-def build_backbone(name: str = "tiny", in_chans: int = CHANNELS, weights_file: str | None = None) -> nn.Module:
-    """name이 'tiny'면 내장 인코더, 아니면 timm 모델 이름(예: convnextv2_tiny).
+MODEL_INPUT_VERSION = "dl1_structured_v1_candidate"
 
-    weights_file을 주면 그 파일에서만 가중치를 읽는다. 네트워크로 받지 않는다.
-    """
+
+def build_backbone(name="tiny", in_chans=CHANNELS, weights_file=None):
+    """Construct without pretrained downloads; optional local state dict only."""
+    if weights_file is not None and not Path(weights_file).is_file():
+        raise ValueError(f"local weights file does not exist: {weights_file}")
     if name == "tiny":
-        if weights_file:
-            raise ValueError("tiny 인코더에는 사전학습 가중치가 없다")
-        return TinyBackbone(in_chans)
-    try:
-        import timm
-    except ImportError as err:
-        raise ImportError("timm 모델을 쓰려면 timm을 설치해야 한다 (pip install timm)") from err
+        net = TinyBackbone(in_chans)
+    else:
+        try:
+            import timm
+        except ImportError as err:
+            raise ImportError("optional timm dependency is required") from err
+        net = timm.create_model(name, pretrained=False, in_chans=in_chans, num_classes=0)
     if weights_file:
-        return timm.create_model(name, pretrained=True, pretrained_cfg_overlay={"file": weights_file}, in_chans=in_chans, num_classes=0)
-    return timm.create_model(name, pretrained=False, in_chans=in_chans, num_classes=0)
+        path = Path(weights_file)
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+            state = load_file(str(path), device="cpu")
+        elif path.suffix in {".pt", ".pth"}:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        else:
+            raise ValueError("local weights format must be .pt/.pth/.safetensors")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        if not isinstance(state, dict) or not state or not all(isinstance(v, torch.Tensor) and torch.isfinite(v).all() for v in state.values()):
+            raise ValueError("local weights require a finite state dict")
+        net.load_state_dict(state, strict=True)
+    return net
 
 
 class SetBlock(nn.Module):
@@ -64,7 +80,9 @@ class ProductEncoder(nn.Module):
     def __init__(self, n_roles: int, n_layers: int, backbone: str = "tiny", weights_file: str | None = None,
                  dim: int = 128, out_dim: int = 128, heads: int = 4, blocks: int = 2, use_unit_size: bool = False):
         super().__init__()
-        self.backbone = build_backbone(backbone, CHANNELS, weights_file)
+        if any(type(v) is not int or v <= 0 for v in (n_roles, n_layers, dim, out_dim, heads)) or type(blocks) is not int or blocks < 0 or dim % heads:
+            raise ValueError("positive dimensions and divisible attention heads required")
+        self.backbone = build_backbone(backbone, CHANNELS + 1, weights_file)
         self.feat_norm = nn.LayerNorm(self.backbone.num_features)  # 이미지 특징과 조건의 크기를 맞춘다
         self.role = nn.Embedding(n_roles + 1, 32, padding_idx=0)
         self.layer = nn.Embedding(n_layers + 1, 32, padding_idx=0)
@@ -76,15 +94,33 @@ class ProductEncoder(nn.Module):
         self.blocks = nn.ModuleList(SetBlock(dim, heads) for _ in range(blocks))
         self.seed = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.pool = nn.MultiheadAttention(dim, heads, batch_first=True)
-        # 묶음 안에서 특징을 가운데로 모으는 정규화를 둬서, 모든 제품이 같은 특징으로 쏠리는 것을 막는다
-        self.head = nn.Sequential(nn.Linear(dim, dim), nn.BatchNorm1d(dim), nn.GELU(), nn.Linear(dim, out_dim))
+        self.endpoint = nn.Sequential(nn.Linear(dim + 2, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.connection = nn.Sequential(nn.Linear(dim + 3, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.connectivity = nn.Embedding(3, dim)  # unavailable, partial, source-complete
+        # LayerNorm supports singleton batches; collapse prevention requires evaluation.
+        self.head = nn.Sequential(nn.Linear(dim, dim), nn.LayerNorm(dim), nn.GELU(), nn.Linear(dim, out_dim))
 
-    def forward(self, images, role_ids, layer_ids, valid, unit=None):
+    def forward(self, images, role_ids, layer_ids, valid, unit=None, *, spatial_valid=None,
+                connection_features=None, connection_valid=None, connectivity_status=None):
+        if valid.ndim != 2 or valid.dtype != torch.bool or not valid.numel() or not valid.any(dim=1).all():
+            raise ValueError("each product requires at least one valid element")
         b, n = valid.shape
-        feats = self.feat_norm(self.backbone(images.flatten(0, 1))).view(b, n, -1)
+        if images.ndim != 5 or images.shape[:3] != (b, n, CHANNELS) or images.shape[-1] != images.shape[-2] or images.shape[-1] <= 0 or not torch.isfinite(images).all() or (images < 0).any() or (images > 1).any():
+            raise ValueError("finite [B,N,3,G,G] coverage images required")
+        for ids, embedding in ((role_ids, self.role), (layer_ids, self.layer)):
+            if ids.shape != (b, n) or ids.dtype != torch.long or (ids < 0).any() or (ids >= embedding.num_embeddings).any() or (ids[valid] == 0).any() or (ids[~valid] != 0).any():
+                raise ValueError("role/layer IDs must be known, bound, and zero only for padding")
+        g = images.shape[-1]
+        if spatial_valid is None:
+            spatial_valid = torch.ones(b, g, g, device=images.device, dtype=images.dtype)
+        if spatial_valid.shape != (b, g, g) or not torch.isfinite(spatial_valid).all() or (spatial_valid < 0).any() or (spatial_valid > 1).any() or not spatial_valid.flatten(1).any(dim=1).all():
+            raise ValueError("spatial validity must have observed coverage per product")
+        coverage = spatial_valid[:, None, None].expand(b, n, 1, g, g)
+        backbone_input = torch.cat([images, coverage], dim=2)
+        feats = self.feat_norm(self.backbone(backbone_input.flatten(0, 1))).view(b, n, -1)
         cond = [self.role(role_ids), self.layer(layer_ids)]
         if self.use_unit_size:
-            if unit is None:
+            if unit is None or unit.shape != (b, 2) or not torch.isfinite(unit).all():
                 raise ValueError("use_unit_size=True면 unit 크기를 줘야 한다")
             cond.append(self.unit(unit)[:, None].expand(b, n, -1))
         x = self.fuse(torch.cat([feats, *cond], dim=-1))
@@ -92,4 +128,31 @@ class ProductEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, pad)
         pooled = self.pool(self.seed.expand(b, -1, -1), x, x, key_padding_mask=pad, need_weights=False)[0][:, 0]
+        if connectivity_status is None:
+            connectivity_status = torch.zeros(b, dtype=torch.long, device=images.device)
+        if connectivity_status.shape != (b,) or connectivity_status.dtype != torch.long or (connectivity_status < 0).any() or (connectivity_status > 2).any():
+            raise ValueError("invalid connectivity availability")
+        pooled = pooled + self.connectivity(connectivity_status)
+        if connection_features is not None:
+            if connection_features.ndim != 3 or connection_features.shape[0] != b or connection_features.shape[2] != 9 or not torch.isfinite(connection_features).all():
+                raise ValueError("connection features require finite [B,K,9]")
+            k = connection_features.shape[1]
+            if connection_valid is None or connection_valid.shape != (b, k) or connection_valid.dtype != torch.bool:
+                raise ValueError("connection padding mask required")
+            cf = connection_features
+            if k:
+                indices = cf[:, :, :2]
+                if (indices != indices.floor()).any() or (indices < 0).any() or (indices >= n).any() or (cf[:, :, 2:] < 0).any() or (cf[:, :, 2:] > 1).any():
+                    raise ValueError("invalid bound endpoint features")
+                batch = torch.arange(b, device=images.device)[:, None].expand(b, k)
+                ia, ib = indices[:, :, 0].long(), indices[:, :, 1].long()
+                if ((~valid[batch, ia] | ~valid[batch, ib]) & connection_valid).any():
+                    raise ValueError("endpoint bound to padding")
+                # Undirected endpoint pairing: swapping ends leaves the relation feature unchanged.
+                ea = self.endpoint(torch.cat([x[batch, ia], cf[:, :, 2:4]], dim=-1))
+                eb = self.endpoint(torch.cat([x[batch, ib], cf[:, :, 4:6]], dim=-1))
+                edge = self.connection(torch.cat([ea + eb, cf[:, :, 6:]], dim=-1))
+                pooled = pooled + (edge * connection_valid[:, :, None]).sum(dim=1) / connection_valid.sum(dim=1, keepdim=True).clamp_min(1)
+        elif connection_valid is not None:
+            raise ValueError("connection features required with mask")
         return F.normalize(self.head(pooled), dim=-1)

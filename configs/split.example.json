@@ -1,0 +1,7 @@
+{
+  "schema_version": "dl1_split_v1",
+  "policy": "user_supplied_lineage_split_example",
+  "train": ["train-family-A-v1", "train-family-A-v2", "train-family-B-v1"],
+  "validation": ["validation-family-C-v1", "validation-family-C-v2"],
+  "test": ["test-family-D-query", "test-family-D-positive", "test-family-D-endpoint-negative"]
+}

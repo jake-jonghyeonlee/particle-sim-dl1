@@ -1,46 +1,77 @@
-"""대조 학습 손실. 관계를 모르는 쌍은 계산에서 뺀다."""
+"""Label-aware contrastive loss; unlabelled negatives require explicit opt-in."""
 from __future__ import annotations
 
+import math
 import torch
 
 POSITIVE, NEGATIVE, UNKNOWN = 1, 0, -1
 
 
-def relation_matrix(product_ids: list[str], similar: set[frozenset] | None = None, different: set[frozenset] | None = None) -> torch.Tensor:
-    """제품 쌍의 관계 [B,B]. 자기 자신은 가깝게(1).
+def validate_relations(similar=None, different=None, *, product_ids=None):
+    similar, different = set(similar or ()), set(different or ())
+    for pair in similar | different:
+        if not isinstance(pair, frozenset) or len(pair) != 2 or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in pair):
+            raise ValueError("relations require two distinct trimmed product IDs")
+        if product_ids is not None and not pair <= set(product_ids):
+            raise ValueError(f"relation references unknown product: {sorted(pair)}")
+    if similar & different:
+        raise ValueError(f"conflicting similar/different relation: {sorted(map(sorted, similar & different))}")
+    return similar, different
 
-    정답이 없으면(similar, different 모두 None) 다른 제품은 모두 구분(0)으로 둔다.
-    정답이 있으면 적힌 쌍만 쓰고, 적히지 않은 쌍은 모름(-1)으로 둔다.
-    """
-    b = len(product_ids)
-    labelled = similar is not None or different is not None
-    rel = torch.full((b, b), UNKNOWN if labelled else NEGATIVE)
-    for i in range(b):
-        for j in range(b):
-            key = frozenset((product_ids[i], product_ids[j]))
-            if product_ids[i] == product_ids[j] or (similar and key in similar):
+
+def relation_matrix(product_ids, similar=None, different=None, *, unlabelled_negatives=False):
+    if not product_ids or len(set(product_ids)) != len(product_ids):
+        raise ValueError("batch needs unique product IDs")
+    similar, different = validate_relations(similar, different)
+    rel = torch.full((len(product_ids), len(product_ids)), NEGATIVE if unlabelled_negatives else UNKNOWN, dtype=torch.long)
+    for i, a in enumerate(product_ids):
+        for j, b in enumerate(product_ids):
+            key = frozenset((a, b))
+            if i == j or key in similar:
                 rel[i, j] = POSITIVE
-            elif different and key in different:
+            elif key in different:
                 rel[i, j] = NEGATIVE
     return rel
 
 
-def masked_contrastive_loss(z1: torch.Tensor, z2: torch.Tensor, relation: torch.Tensor, temperature: float = 0.1) -> tuple[torch.Tensor, int]:
-    """z1[i]와 z2[j]의 관계가 relation[i,j]. 가까워야 하는 쌍을 그 행의 알려진 쌍들 가운데서 고르게 한다.
-
-    모름(-1)은 분자에도 분모에도 넣지 않는다. 모르는 쌍을 다른 쌍으로 밀어내지 않기 위해서다.
-    구분할 쌍이 하나도 없는 행은 뺀다. 그런 행만 있으면 모든 특징을 같게 만드는 것이 답이 되기 때문이다.
-    (손실, 계산에 쓴 행 수)를 돌려준다.
-    """
-    logits = z1 @ z2.T / temperature
-    known = relation != UNKNOWN
-    positive = relation == POSITIVE
-    if not positive.any(dim=1).all():
+def validate_matrix(relation, size):
+    if relation.shape != (size, size) or not torch.isfinite(relation).all() or not torch.isin(relation, torch.tensor([UNKNOWN, NEGATIVE, POSITIVE], device=relation.device)).all():
+        raise ValueError("relation matrix requires square batch shape and values -1,0,1")
+    if not torch.equal(relation, relation.T):
+        raise ValueError("relation matrix must be symmetric")
+    if not (relation == POSITIVE).any(dim=1).all():
         raise ValueError("행마다 가까워야 하는 쌍이 하나는 있어야 한다")
+
+
+def relation_coverage(relation):
+    validate_matrix(relation, len(relation))
+    upper = torch.triu(torch.ones_like(relation, dtype=torch.bool), diagonal=1)
+    usable = (relation == NEGATIVE).any(dim=1)
+    return {"positive_pairs": int(((relation == POSITIVE) & upper).sum()),
+            "negative_pairs": int(((relation == NEGATIVE) & upper).sum()),
+            "unknown_pairs": int(((relation == UNKNOWN) & upper).sum()),
+            "usable_rows": int(usable.sum()), "excluded_positive_only_rows": int((~usable).sum()),
+            "effective_pairs": int((((relation != UNKNOWN) & usable[:, None]) & ~torch.eye(len(relation), dtype=torch.bool, device=relation.device)).sum())}
+
+
+def loss_from_logits(logits, relation):
+    if logits.ndim != 2 or logits.shape[0] != logits.shape[1] or not logits.numel() or not torch.isfinite(logits).all():
+        raise ValueError("finite nonempty square logits required")
+    validate_matrix(relation, logits.shape[0])
+    relation = relation.to(logits.device)
     usable = (relation == NEGATIVE).any(dim=1)
     if not usable.any():
-        return logits.sum() * 0.0, 0
-    logits = logits.masked_fill(~known, float("-inf"))
-    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    per_row = -(log_prob.masked_fill(~positive, 0.0)).sum(dim=1) / positive.sum(dim=1)
+        return logits[0, 0] * 0, 0
+    positive = relation == POSITIVE
+    masked = logits.masked_fill(relation == UNKNOWN, float("-inf"))
+    log_prob = masked - torch.logsumexp(masked, dim=1, keepdim=True)
+    per_row = -log_prob.masked_fill(~positive, 0).sum(dim=1) / positive.sum(dim=1)
     return per_row[usable].mean(), int(usable.sum())
+
+
+def masked_contrastive_loss(z1, z2, relation, temperature=0.1):
+    if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) or not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    if z1.ndim != 2 or z1.shape != z2.shape or not z1.numel() or not torch.isfinite(z1).all() or not torch.isfinite(z2).all():
+        raise ValueError("embeddings must have equal nonempty [B,D] shape and finite values")
+    return loss_from_logits(z1 @ z2.T / temperature, relation)
