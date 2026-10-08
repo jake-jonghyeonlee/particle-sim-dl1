@@ -1,4 +1,4 @@
-"""Draft DL1 original-shape contract; G5 approval remains pending."""
+"""DL1 original-shape draft; input method approved, real grid/endpoint format pending."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +8,11 @@ import numpy as np
 
 SCHEMA_VERSION = "dl1_shape_v1_draft"
 FORBIDDEN_FIELDS = {"hotspot", "ca", "fab"}
+
+
+def approval_status():
+    return {"input_method": "user_approved_2026_10_09", "real_grid_linewidth": "pending",
+            "endpoint_source_format": "pending", "G6": "pending"}
 
 
 def identifier(value, name):

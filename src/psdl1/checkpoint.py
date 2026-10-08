@@ -48,7 +48,7 @@ def state_hash(state):
 
 def validate_config(config):
     required = {"grid", "roles", "layers", "backbone", "use_unit_size", "unknown_vocabulary", "model_kwargs"}
-    if set(config) != required or type(config["grid"]) is not int or config["grid"] <= 0 or config["unknown_vocabulary"] != "reject":
+    if not isinstance(config, dict) or set(config) != required or type(config["grid"]) is not int or config["grid"] <= 0 or config["unknown_vocabulary"] != "reject":
         raise ValueError("incompatible model config/fingerprint")
     for name in ("roles", "layers"):
         vocab = config[name]
@@ -109,6 +109,9 @@ def read_checkpoint(path):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(saved, dict) or saved.get("format_version") != CHECKPOINT_VERSION or saved.get("schema_version") != SCHEMA_VERSION or saved.get("model_input_version") != MODEL_INPUT_VERSION:
         raise ValueError("incompatible checkpoint/schema version")
+    required = {"config", "state_dict", "optimizer", "rng", "epoch", "history", "metadata", "fingerprint", "weights_hash"}
+    if not required <= saved.keys() or not isinstance(saved["state_dict"], dict) or not isinstance(saved["metadata"], dict):
+        raise ValueError("incomplete checkpoint: required fields are missing or malformed")
     if saved.get("fingerprint") != validate_config(saved["config"]):
         raise ValueError("incompatible checkpoint fingerprint")
     if saved.get("weights_hash") != state_hash(saved["state_dict"]):

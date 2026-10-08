@@ -27,7 +27,7 @@ class TinyBackbone(nn.Module):
         return self.body(x).mean(dim=(2, 3))
 
 
-MODEL_INPUT_VERSION = "dl1_structured_v1_candidate"
+MODEL_INPUT_VERSION = "dl1_structured_v2_padded_endpoints"
 
 
 def build_backbone(name="tiny", in_chans=CHANNELS, weights_file=None):

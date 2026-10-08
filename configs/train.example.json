@@ -4,7 +4,6 @@
   "relations": "data/relations.csv",
   "out": "runs/dl1",
   "epochs": 100,
-  "grid": 256,
   "batch_size": 8,
   "lr": 0.0003,
   "temperature": 0.1,
@@ -15,5 +14,7 @@
   "augmentation": "none",
   "resume": null,
   "device": "cpu",
-  "seed": 0
+  "seed": 0,
+  "allow_grid_override": false,
+  "allow_grid_check_failure": false
 }

@@ -19,16 +19,25 @@ def validate_relations(similar=None, different=None, *, product_ids=None):
     return similar, different
 
 
-def relation_matrix(product_ids, similar=None, different=None, *, unlabelled_negatives=False):
+def relation_matrix(product_ids, similar=None, different=None, *, unlabelled_negatives=False, lineage_ids=None):
     if not product_ids or len(set(product_ids)) != len(product_ids):
         raise ValueError("batch needs unique product IDs")
     similar, different = validate_relations(similar, different)
+    if lineage_ids is not None and (len(lineage_ids) != len(product_ids) or any(not isinstance(v, str) or not v.strip() for v in lineage_ids)):
+        raise ValueError("lineage_ids must bind every product")
+    if unlabelled_negatives and lineage_ids is None:
+        raise ValueError("unlabelled negatives require lineage_ids")
+    if unlabelled_negatives and any(lineage_ids[i] == lineage_ids[j] and frozenset((a, b)) in different
+                                    for i, a in enumerate(product_ids) for j, b in enumerate(product_ids) if i != j):
+        raise ValueError("same-lineage negative forbidden in unlabelled-negative experiment")
     rel = torch.full((len(product_ids), len(product_ids)), NEGATIVE if unlabelled_negatives else UNKNOWN, dtype=torch.long)
     for i, a in enumerate(product_ids):
         for j, b in enumerate(product_ids):
             key = frozenset((a, b))
             if i == j or key in similar:
                 rel[i, j] = POSITIVE
+            elif unlabelled_negatives and lineage_ids[i] == lineage_ids[j]:
+                rel[i, j] = UNKNOWN
             elif key in different:
                 rel[i, j] = NEGATIVE
     return rel
@@ -41,6 +50,8 @@ def validate_matrix(relation, size):
         raise ValueError("relation matrix must be symmetric")
     if not (relation == POSITIVE).any(dim=1).all():
         raise ValueError("행마다 가까워야 하는 쌍이 하나는 있어야 한다")
+    if not (relation.diag() == POSITIVE).all():
+        raise ValueError("relation diagonal must be POSITIVE")
 
 
 def relation_coverage(relation):

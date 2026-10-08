@@ -1,7 +1,7 @@
 [project]
 name = "psdl1"
 version = "0.1.0"
-description = "DL1 original-shape input validation and product similarity candidates (G5 pending)."
+description = "DL1 original-shape input validation and product similarity (input method approved; real grid/endpoint format pending)."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
 psdl1-validate = "psdl1.data:main"
 
 [project.optional-dependencies]
+local-weights = ["safetensors>=0.8"]
 timm = ["timm>=1.0"]
 
 [dependency-groups]

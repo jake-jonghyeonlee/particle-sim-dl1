@@ -209,7 +209,7 @@ def test_cli_stores_per_product_evidence(manifest_case, monkeypatch):
     monkeypatch.setattr("sys.argv", ["psdl1-validate", str(write()), "--grid", "2", "--report", str(report)])
     main()
     result = json.loads(report.read_text())
-    assert result["approval"] == "G5_pending"
+    assert result["approval"] == {"input_method": "user_approved_2026_10_09", "real_grid_linewidth": "pending", "endpoint_source_format": "pending", "G6": "pending"}
     assert result["products"][0]["product_id"] == "P"
     assert result["products"][0]["grid"] == 2
     assert result["products"][0]["elements"][0]["source_components"] == 1

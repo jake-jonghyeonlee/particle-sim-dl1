@@ -10,6 +10,7 @@ import torch
 from .checkpoint import read_checkpoint, validate_config
 from .data import load_manifest, input_identity
 from .model import ProductEncoder
+from .schema import approval_status
 from .train import encode_products
 
 
@@ -50,8 +51,10 @@ def embed(model, cfg, products, *, batch_size=32):
     model.eval()
     if not products:
         return torch.empty(0, model.head[-1].out_features)
-    chunks = [encode_products(model, products[i:i + batch_size], cfg["grid"], cfg["roles"], cfg["layers"]).cpu()
-              for i in range(0, len(products), batch_size)]
+    # Canonical inference shape: neither padding neighbours nor requested chunk size
+    # changes the model's arithmetic. Chunks bound memory; forwards are per product.
+    chunks = [torch.cat([encode_products(model, [p], cfg["grid"], cfg["roles"], cfg["layers"]).cpu()
+                         for p in products[i:i + batch_size]]) for i in range(0, len(products), batch_size)]
     z = torch.cat(chunks)
     if not torch.isfinite(z).all():
         raise ValueError("nonfinite search embeddings")
@@ -67,8 +70,9 @@ def search(model, cfg, query, candidates, *, topk=5, batch_size=32):
     validate_config(cfg)
     if len({p.product_id for p in candidates}) != len(candidates):
         raise ValueError("candidate product IDs must be unique")
-    result = {"query_id": query.product_id, "approval": {"input_method": "user_approved_2026_10_09", "real_grid_linewidth": "pending", "endpoint_source_format": "pending", "G6": "pending"}, "status": "unavailable", "reason": None,
+    result = {"query_id": query.product_id, "approval": approval_status(), "status": "unavailable", "reason": None,
               "rankings": [], "excluded": [], "candidate_count": len(candidates), "eligible_count": 0,
+              "score_policy": "canonical_single_product_float64_cosine_round6_then_id",
               "fingerprint": validate_config(cfg), "query_connectivity": query.connectivity_status}
     reason = vocabulary_reason(query, cfg)
     if reason:
@@ -81,6 +85,7 @@ def search(model, cfg, query, candidates, *, topk=5, batch_size=32):
             result["excluded"].append({"product_id": p.product_id, **reason})
         else:
             eligible.append(p)
+    result["excluded"].sort(key=lambda row: row["product_id"])
     result["eligible_count"] = len(eligible)
     if not eligible:
         result["reason"] = "no_candidates" if not candidates else "no_eligible_candidates"
@@ -90,7 +95,8 @@ def search(model, cfg, query, candidates, *, topk=5, batch_size=32):
     scores = []
     for start in range(0, len(eligible), batch_size):
         chunk = eligible[start:start + batch_size]
-        scores.extend((embed(model, cfg, chunk, batch_size=batch_size) @ qz).tolist())
+        vectors = embed(model, cfg, chunk, batch_size=batch_size).to(torch.float64)
+        scores.extend(round(float((vector * qz.to(torch.float64)).sum()), 6) for vector in vectors)
     ranked = sorted(zip(eligible, scores), key=lambda pair: (-pair[1], pair[0].product_id))[:topk]
     result.update(status="available", rankings=[{"product_id": p.product_id, "score": score,
                     "connectivity_status": p.connectivity_status, "input_identity": input_identity(p)} for p, score in ranked])

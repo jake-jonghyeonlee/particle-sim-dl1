@@ -46,7 +46,7 @@ def test_unit_size_condition_is_optional_and_required_when_enabled(products):
 
 def test_relation_matrix_without_and_with_labels():
     ids = ["A", "B", "C"]
-    assert relation_matrix(ids, unlabelled_negatives=True).tolist() == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    assert relation_matrix(ids, unlabelled_negatives=True, lineage_ids=ids).tolist() == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
     rel = relation_matrix(ids, similar={frozenset(("A", "B"))}, different={frozenset(("A", "C"))})
     assert rel[0].tolist() == [POSITIVE, POSITIVE, NEGATIVE]
     assert rel[1].tolist() == [POSITIVE, POSITIVE, UNKNOWN]
@@ -54,7 +54,7 @@ def test_relation_matrix_without_and_with_labels():
 
 def test_loss_is_low_when_aligned_and_ignores_unknown_pairs():
     z = torch.nn.functional.normalize(torch.eye(3), dim=1)
-    rel = relation_matrix(["A", "B", "C"], unlabelled_negatives=True)
+    rel = relation_matrix(["A", "B", "C"], unlabelled_negatives=True, lineage_ids=["A", "B", "C"])
     assert masked_contrastive_loss(z, z, rel)[0] < 0.01
     shuffled = z[[1, 2, 0]]
     loss, rows = masked_contrastive_loss(z, shuffled, rel)
@@ -75,7 +75,7 @@ def test_training_lowers_the_loss_and_search_finds_the_same_layout_at_another_un
     families = ("bus", "comb", "ring")
     similar = {frozenset((f"{f}-40", f"{f}-64")) for f in families}
     different = {frozenset((f"{f}-{a}", f"{g}-{b}")) for f in families for g in families if f != g for a in (40, 64) for b in (40, 64)}
-    history = train(products, tmp_path, epochs=40, grid=32, batch_size=6, lr=3e-4, relations=(similar, different))
+    history = train(products, tmp_path, epochs=40, grid=32, batch_size=6, lr=3e-4, relations=(similar, different), allow_grid_check_failure=True)
     assert history[-1] < history[0]
     model, cfg = load_model(tmp_path / "dl1.pt")
     query = make_product("comb", 96, product_id="new")       # 학습에 없던 unit 크기
@@ -142,14 +142,14 @@ def test_structured_validity_and_endpoint_inputs_are_consumed(manifest_case):
 
 def test_crop_augmentation_is_rejected_before_any_training(products, tmp_path):
     with pytest.raises(ValueError, match="augmentation"):
-        train(products, tmp_path, epochs=1, augmentation="crop")
+        train(products, tmp_path, epochs=1, grid=32, augmentation="crop")
 
 
 @pytest.mark.parametrize("field,value", [("epochs", 0), ("batch_size", 1), ("grid", -1),
                                           ("lr", float("nan")), ("temperature", 0), ("seed", -1)])
 def test_training_argument_errors_precede_any_optimizer_step(products, tmp_path, field, value):
     with pytest.raises(ValueError):
-        train(products, tmp_path, relations=(set(), {frozenset(("bus-40", "comb-40"))}), **{field: value})
+        train(products, tmp_path, relations=(set(), {frozenset(("bus-40", "comb-40"))}), **{**{"grid": 32}, field: value})
 
 
 def test_json_config_and_cli_override_without_training(manifest_case, tmp_path, monkeypatch, capsys):
@@ -176,4 +176,4 @@ def test_json_config_and_cli_override_without_training(manifest_case, tmp_path, 
 
 def test_explicit_empty_split_cannot_fall_back_to_training_all_products(products, tmp_path):
     with pytest.raises(ValueError, match="split schema"):
-        train(products, tmp_path, split_manifest={}, relations=(set(), {frozenset(("bus-40", "comb-40"))}))
+        train(products, tmp_path, grid=32, split_manifest={}, relations=(set(), {frozenset(("bus-40", "comb-40"))}))

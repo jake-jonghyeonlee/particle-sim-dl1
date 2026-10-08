@@ -16,6 +16,7 @@ from .data import Product, build_vocab, collate, grid_check, input_identity, loa
 from .losses import NEGATIVE, masked_contrastive_loss, relation_coverage, relation_matrix, validate_relations
 from .model import ProductEncoder
 from .split import training_only_split, validate_split
+from .schema import approval_status
 
 
 def load_relations(path):
@@ -33,13 +34,13 @@ def load_relations(path):
 
 class RelationBatchSampler:
     """Every labelled negative edge is scheduled each epoch, including sparse edges."""
-    def __init__(self, product_ids, batch_size, similar=None, different=None, *, unlabelled_negatives=False):
+    def __init__(self, product_ids, batch_size, similar=None, different=None, *, unlabelled_negatives=False, lineage_ids=None):
         if type(batch_size) is not int or batch_size < 2:
             raise ValueError("batch_size must be at least two")
         self.ids = list(product_ids)
         self.batch_size = batch_size
         self.similar, self.different = validate_relations(similar, different, product_ids=self.ids)
-        self.relation = relation_matrix(self.ids, self.similar, self.different, unlabelled_negatives=unlabelled_negatives)
+        self.relation = relation_matrix(self.ids, self.similar, self.different, unlabelled_negatives=unlabelled_negatives, lineage_ids=lineage_ids)
         self.edges = [(i, j) for i in range(len(self.ids)) for j in range(i + 1, len(self.ids)) if self.relation[i, j] == NEGATIVE]
         if not self.edges:
             raise ValueError("구분할 쌍이 없다: provide different labels or explicitly opt into unlabelled negatives")
@@ -62,12 +63,15 @@ class RelationBatchSampler:
         return result
 
 
-def structured_batch(products, grid, roles, layers, *, augmentation="none", generator=None):
+def structured_batch(products, grid, roles, layers, *, augmentation="none", generator=None, prepared=None):
     if not products:
         raise ValueError("cannot encode an empty product batch")
     if augmentation not in {"none", "intensity"}:
         raise ValueError("crop/geometry augmentation is disabled: connection preservation is unconfirmed")
-    prepared = [prepare_product(p, grid, roles, layers) for p in products]
+    if prepared is None:
+        prepared = [prepare_product(p, grid, roles, layers) for p in products]
+    if len(prepared) != len(products):
+        raise ValueError("prepared batch must match products")
     items = []
     for p, item in zip(products, prepared):
         images = item.images
@@ -85,9 +89,16 @@ def structured_batch(products, grid, roles, layers, *, augmentation="none", gene
         by_id = {e.key: i for i, e in enumerate(p.elements)}
         for j, c in enumerate(item.connections):
             a, z = c.endpoints
-            # Whole-unit-relative physical coordinates. No per-layer centring.
-            ax, ay = [(a.xy_um[v] - p.frame.origin_xy_um[v]) / (p.frame.shape_yx[1 - v] * p.frame.pixel_pitch_um) for v in range(2)]
-            zx, zy = [(z.xy_um[v] - p.frame.origin_xy_um[v]) / (p.frame.shape_yx[1 - v] * p.frame.pixel_pitch_um) for v in range(2)]
+            # Exactly the image resize/pad recipe, in normalized candidate-grid XY.
+            h, w = p.frame.shape_yx
+            nh, nw = max(1, round(h * grid / max(h, w))), max(1, round(w * grid / max(h, w)))
+            left, top = (grid - nw) // 2, (grid - nh) // 2
+            def position(endpoint):
+                x = (endpoint.xy_um[0] - p.frame.origin_xy_um[0]) / p.frame.pixel_pitch_um
+                y = (endpoint.xy_um[1] - p.frame.origin_xy_um[1]) / p.frame.pixel_pitch_um
+                return ((x * nw / w + left) / grid, (y * nh / h + top) / grid)
+            ax, ay = position(a)
+            zx, zy = position(z)
             cf[b, j] = torch.tensor([by_id[a.element_id], by_id[z.element_id], ax, ay, zx, zy,
                                       c.kind == "VIA", c.observation == "observed", float(item.connection_masks[j].mean())])
             cv[b, j] = True
@@ -96,8 +107,8 @@ def structured_batch(products, grid, roles, layers, *, augmentation="none", gene
     return batch, extra, prepared
 
 
-def encode_products(model, products, grid, roles, layers, generator=None, *, augmentation="none"):
-    batch, extra, _ = structured_batch(products, grid, roles, layers, augmentation=augmentation, generator=generator)
+def encode_products(model, products, grid, roles, layers, generator=None, *, augmentation="none", prepared=None):
+    batch, extra, _ = structured_batch(products, grid, roles, layers, augmentation=augmentation, generator=generator, prepared=prepared)
     device = next(model.parameters()).device
     batch = tuple(t.to(device) for t in batch)
     extra = {key: t.to(device) for key, t in extra.items()}
@@ -109,11 +120,37 @@ def model_config(grid, roles, layers, backbone="tiny", use_unit_size=False, mode
             "roles": roles, "layers": layers, "unknown_vocabulary": "reject", "model_kwargs": model_kwargs or {}}
 
 
-def train(products, out_dir, epochs=100, grid=256, batch_size=8, lr=3e-4, backbone="tiny", weights_file=None,
+
+def resolve_training_grid(products, grid=None, *, allow_grid_override=False):
+    if type(allow_grid_override) is not bool:
+        raise ValueError("allow_grid_override must be boolean")
+    reports = [p.grid_check for p in products]
+    candidates = {r.get("manifest_candidate_grid", r["grid"]) for r in reports if r is not None}
+    if len(candidates) > 1:
+        raise ValueError("inconsistent manifest candidate_grid values")
+    candidate = next(iter(candidates), None)
+    if grid is None:
+        if candidate is None or any(r is None for r in reports):
+            raise ValueError("No grid supplied: load a manifest with candidate_grid or specify an explicit API grid")
+        grid = candidate
+    if type(grid) is not int or grid <= 0:
+        raise ValueError("grid must be a positive integer")
+    override = candidate is not None and grid != candidate
+    if override and not allow_grid_override:
+        raise ValueError(f"grid {grid} conflicts with manifest candidate_grid {candidate}; explicit --allow-grid-override is required")
+    return grid, {"manifest_candidate_grid": candidate, "selected_grid": grid,
+                  "source": "manifest_candidate" if candidate is not None and not override else "explicit_override" if override else "api_explicit",
+                  "override": override, "override_requested": allow_grid_override}
+
+def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backbone="tiny", weights_file=None,
           use_unit_size=False, relations=None, seed=0, *, split_manifest=None, unlabelled_negatives=False,
-          augmentation="none", resume=None, device="cpu", temperature=0.1, model_kwargs=None):
+          augmentation="none", resume=None, device="cpu", temperature=0.1, model_kwargs=None,
+          allow_grid_override=False, allow_grid_check_failure=False):
     if len(products) < 2:
         raise ValueError("제품이 둘 이상 있어야 학습할 수 있다")
+    grid, grid_selection = resolve_training_grid(products, grid, allow_grid_override=allow_grid_override)
+    if type(allow_grid_check_failure) is not bool:
+        raise ValueError("allow_grid_check_failure must be boolean")
     if type(epochs) is not int or epochs <= 0 or type(grid) is not int or grid <= 0 or isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0 or isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature <= 0 or type(seed) is not int or not 0 <= seed < 2**32:
         raise ValueError("positive epochs/grid/lr/temperature and integer seed required")
     if augmentation not in {"none", "intensity"}:
@@ -132,8 +169,16 @@ def train(products, out_dir, epochs=100, grid=256, batch_size=8, lr=3e-4, backbo
     train_ids = {p.product_id for p in training}
     similar = {pair for pair in all_similar if pair <= train_ids}
     different = {pair for pair in all_different if pair <= train_ids}
-    sampler = RelationBatchSampler([p.product_id for p in training], batch_size, similar, different, unlabelled_negatives=unlabelled_negatives)
+    sampler = RelationBatchSampler([p.product_id for p in training], batch_size, similar, different, unlabelled_negatives=unlabelled_negatives, lineage_ids=[p.lineage_id for p in training])
     roles, layers = build_vocab(training)
+    prepared_training = [prepare_product(p, grid, roles, layers) for p in training]
+    prepared_cache = {p.product_id: item for p, item in zip(training, prepared_training)}
+    failures = [{"product_id": p.product_id, "reasons": item.grid_check["reasons"]} for p, item in zip(training, prepared_training)
+                if any(e.get("thin_line_warning") or e.get("bridge_or_component_loss") for e in item.grid_check["elements"])]
+    if failures and not allow_grid_check_failure:
+        raise ValueError(f"grid check failed before training: {failures}; select a reviewed grid or explicitly pass --allow-grid-check-failure")
+    grid_gate = {"policy": "strict_default", "bypass_requested": allow_grid_check_failure,
+                 "status": "bypassed" if failures else "passed", "failures": failures}
     config = model_config(grid, roles, layers, backbone, use_unit_size, model_kwargs)
     validate_config(config)
     random.seed(seed)
@@ -146,13 +191,15 @@ def train(products, out_dir, epochs=100, grid=256, batch_size=8, lr=3e-4, backbo
     input_hash = json_hash(records)
     contract = {"split": split_manifest, "similar": sorted(map(sorted, all_similar)), "different": sorted(map(sorted, all_different)),
                 "augmentation": augmentation, "unlabelled_negatives": unlabelled_negatives, "batch_size": batch_size,
-                "lr": lr, "temperature": temperature, "seed": seed}
+                "lr": lr, "temperature": temperature, "seed": seed, "grid_selection": grid_selection,
+                "allow_grid_check_failure": allow_grid_check_failure}
     metadata = {"input_hash": input_hash, "code_hash": code_hash(), "initial_weights_hash": file_hash(weights_file) if weights_file else None,
                 "seed": seed, "split": split_manifest, "input_records": records,
-                "grid_checks": [grid_check(p, grid) for p in training], "contract": contract, "contract_hash": json_hash(contract),
+                "grid_selection": grid_selection, "grid_gate": grid_gate,
+                "grid_checks": [item.grid_check for item in prepared_training], "contract": contract, "contract_hash": json_hash(contract),
                 "training_statistics": {"product_count": len(training), "lineage_count": len({p.lineage_id for p in training}),
                                         "mean_unit_size_um": np.mean([p.unit_size_um for p in training], axis=0).tolist()},
-                "relation_coverage": relation_coverage(sampler.relation), "epochs": [], "approval": {"input_method": "user_approved_2026_10_09", "real_grid_linewidth": "pending", "endpoint_source_format": "pending", "G6": "pending"}}
+                "relation_coverage": relation_coverage(sampler.relation), "epochs": [], "approval": approval_status()}
     start, history = 0, []
     if resume:
         saved = resume_checkpoint(resume, model, optimizer, gen, expected_config=config, expected_input_hash=input_hash,
@@ -171,8 +218,8 @@ def train(products, out_dir, epochs=100, grid=256, batch_size=8, lr=3e-4, backbo
             batch = [training[i] for i in indices]
             rel = sampler.relation[indices][:, indices].to(device)
             coverage = relation_coverage(rel)
-            z1 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation)
-            z2 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation)
+            z1 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation, prepared=[prepared_cache[p.product_id] for p in batch])
+            z2 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation, prepared=[prepared_cache[p.product_id] for p in batch])
             l1, n1 = masked_contrastive_loss(z1, z2, rel, temperature)
             l2, n2 = masked_contrastive_loss(z2, z1, rel.T, temperature)
             if n1 + n2 == 0:
@@ -210,7 +257,9 @@ def main(argv=None):
     ap.add_argument("--split", help="explicit lineage-safe split JSON")
     ap.add_argument("--out")
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--grid", type=int, default=256)
+    ap.add_argument("--grid", type=int, default=None, help="defaults to manifest candidate_grid; never guessed")
+    ap.add_argument("--allow-grid-override", action="store_true")
+    ap.add_argument("--allow-grid-check-failure", action="store_true")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--temperature", type=float, default=0.1)
@@ -232,11 +281,14 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not a.manifest or not a.split or not a.out:
         ap.error("manifest, split, and out are required through config or CLI")
-    history = train(load_manifest(a.manifest, grid=a.grid), a.out, a.epochs, a.grid, a.batch_size, a.lr, a.backbone, a.weights,
+    products = load_manifest(a.manifest)
+    grid, _ = resolve_training_grid(products, a.grid, allow_grid_override=a.allow_grid_override)
+    history = train(products, a.out, a.epochs, grid, a.batch_size, a.lr, a.backbone, a.weights,
                     a.use_unit_size, load_relations(a.relations) if a.relations else None, a.seed,
                     split_manifest=json.loads(Path(a.split).read_text()), unlabelled_negatives=a.unlabelled_negatives,
-                    augmentation=a.augmentation, resume=a.resume, device=a.device, temperature=a.temperature)
-    print(json.dumps({"last_loss": history[-1], "checkpoint": str(Path(a.out) / "dl1.pt"), "approval": {"input_method": "user_approved_2026_10_09", "real_grid_linewidth": "pending", "endpoint_source_format": "pending", "G6": "pending"}}))
+                    augmentation=a.augmentation, resume=a.resume, device=a.device, temperature=a.temperature, allow_grid_override=a.allow_grid_override,
+                    allow_grid_check_failure=a.allow_grid_check_failure)
+    print(json.dumps({"last_loss": history[-1], "checkpoint": str(Path(a.out) / "dl1.pt"), "approval": approval_status()}))
 
 
 if __name__ == "__main__":

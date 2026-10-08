@@ -14,6 +14,7 @@ def test_extreme_unknown_b_logit_does_not_change_a_loss_or_gradient():
     extreme = logits.detach().clone()
     extreme[0, 1] = extreme[1, 0] = 1e20
     after, _ = loss_from_logits(extreme, relation)
+    assert before.item() == pytest.approx(0.31326168751822286, abs=1e-7)  # ln(1 + exp(-1)), hand-computed
     assert rows == 2 and before.item() == pytest.approx(after.item(), abs=1e-8)
     before.backward()
     assert logits.grad[0, 1] == 0 and logits.grad[1, 0] == 0
@@ -36,7 +37,7 @@ def test_conflicting_relation_rejected_regardless_of_order(tmp_path, reverse):
 
 def test_unlabelled_negatives_require_explicit_opt_in():
     assert relation_matrix(["A", "B"]).tolist() == [[1, -1], [-1, 1]]
-    assert relation_matrix(["A", "B"], unlabelled_negatives=True).tolist() == [[1, 0], [0, 1]]
+    assert relation_matrix(["A", "B"], unlabelled_negatives=True, lineage_ids=["family-A", "family-B"]).tolist() == [[1, 0], [0, 1]]
 
 
 @pytest.mark.parametrize("temp", [0, -1, float("nan"), float("inf"), True])

@@ -1,6 +1,6 @@
 # DL1 original-shape contract — `dl1_shape_v1_draft`
 
-This is the T8 internal draft, validated with synthetic masks. G3 repository names and G5 whole-unit isotropic resize + pad, electrode × actual-layer set aggregation, real linewidth/grid choices, and the source CNT/VIA endpoint metadata format are **pending approval**. The three-channel set input is an implementation candidate. Schema acceptance does not resolve those gates, establish real labels, or prove a CNN can distinguish connectivity.
+The whole-unit isotropic resize + pad and electrode × actual-layer set input method was user-approved on 2026-10-09. G3 repository naming, real linewidth/grid, the source CNT/VIA endpoint metadata format and G6 acceptance remain pending. Encoding details remain an internal draft, and synthetic schema checks do not prove electrical connectivity or search performance. Every report uses the same four-field approval object: approved input method, pending real grid/linewidth, pending endpoint source format, and pending G6.
 
 ## Manifest
 
@@ -57,7 +57,7 @@ A product may also supply optional `cnt` as a global original-frame CNT mask. It
 
 A single full-frame isotropic scale and pad recipe is applied to every shape, valid mask, and CNT/VIA mask. It uses area interpolation and rounds resized dimensions to integers; the small rounding discrepancy is recorded through source shape, grid, and scale. The mask foreground is never used to choose a separate centre. Endpoint coordinates remain in the original frame so their physical meaning survives resizing. To locate an endpoint on the candidate grid, convert `(xy-origin)/pitch` to cell-edge coordinates, multiply each axis by its rounded resized size divided by original size, and add the shared pad. This derived position is diagnostic; thresholded occupancy may change under resizing.
 
-The current compatibility images have channels `[self, CNT/VIA union, rest]`. For element i, `rest_i = clip(sum(normalized_element_j for j != i), 0, 1)`. At an XY pixel occupied by two different elements, both rest values are exactly 1 at an unchanged grid. Excluding self **before** composition prevents overlap erasure. Rest loses the layer identity of its contributors; individual elements and their role-layer bindings remain separate. The legacy three-channel model does not consume the structured valid/endpoints yet; that work belongs to T9.
+The current compatibility images have channels `[self, CNT/VIA union, rest]`. For element i, `rest_i = clip(sum(normalized_element_j for j != i), 0, 1)`. At an XY pixel occupied by two different elements, both rest values are exactly 1 at an unchanged grid. Excluding self **before** composition prevents overlap erasure. Rest loses the layer identity of its contributors; individual elements and their role-layer bindings remain separate. The T9 encoder additionally consumes spatial validity as its fourth image channel and bound endpoint features in the padded-image coordinate frame.
 
 `input_identity` fingerprints original masks, coverage, frame, unit, each bound element tuple, and source endpoint relations independent of element/connection ordering. It is an input fingerprint, not a learned embedding or a lineage split key. A product with bindings A/L1,B/L2 differs from A/L2,B/L1 even with identical XY masks and equal role and layer sets. Element order permutes candidate rows together with their bound IDs and does not change this identity.
 
@@ -73,17 +73,17 @@ Each mask's evidence includes source/target foreground pixel counts, 4-neighbour
 
 Changing a component count flags bridge splitting, complete erasure, or unintended merging. The checks are conservative diagnostics: equal component counts may still conceal changed paths, endpoints, or topology. Therefore `connectivity_preserving` is always false (no certification), including warning-free cases. The report does not use area similarity to establish connectivity. It records missing observations and valid holes separately.
 
-`augment_with_check` applies one affine transform to every element and channel, returns component evidence and the common theta, and always leaves `safe_for_positive_label: false`. A deliberately removed 1-pixel bridge in the tests changes only `8/384 ≈ 2.08%` of image area yet splits one component into two. Shrink and common-crop tests both report that loss with hand-written expected counts. Endpoint/coverage-aware augmentation approval and positive-label gating must be implemented by T9; the legacy training consumer does not enforce these reports automatically.
+`augment_with_check` applies one affine transform to every element and channel, returns component evidence and the common theta, and always leaves `safe_for_positive_label: false`. A deliberately removed 1-pixel bridge in the tests changes only `8/384 ≈ 2.08%` of image area yet splits one component into two. Shrink and common-crop tests both report that loss with hand-written expected counts. Every image channel, including CNT/VIA, contributes to the common-transform loss report. The trainer rejects geometric augmentation and uses none or intensity-only views; it blocks thin-line/bridge grid failures unless an explicit recorded bypass is supplied.
 
 ## Validation evidence and limits
 
 Synthetic tests compare the same shape at pixel sizes 40,80,120,160 (pitch 0.05 µm, differing unit dimensions) using grids 16,32,64. Mean absolute normalized-mask coverage error must be below 0.04. Exact unchanged-grid overlap values and role-layer ID arrays provide independent hand-written oracles. Tests also exercise valid holes, source endpoints, missing assets, input identity, units, frame extents, and path rejection.
 
-The default full suite excludes the existing 40-epoch T9 training/search test unless explicitly enabled with `--run-training`; no training, pretrained weights, or network are required for this contract. No model.py, losses.py, train.py, or search.py changes are included. Real electrical/connectivity labels, held-out search quality, the source metadata adapter, and final G5 policy acceptance remain pending.
+The default full suite excludes the existing 40-epoch T9 training/search test unless explicitly enabled with `--run-training`; no training, pretrained weights, or network are required for this contract. The historical T8-only implementation did not change the model, losses, training or search; T9 now consumes this structured contract. Real electrical/connectivity labels, held-out search quality, the source metadata adapter, and final G5 policy acceptance remain pending.
 
-## T8 execution record — 2026-10-09
+## Historical T8 execution record — 2026-10-09 (before T9 and R3 fixes)
 
-Baseline: `rewrite/shape-connectivity-v1`, commit `44a13a671d80f41ce495a7f1bf2da2cca2e16264`, initially clean. Changes are left uncommitted in the assigned repository. T9 implementation files and `particle-sim-compare` were not modified; no import/signature adjustments to T9 files were needed.
+Baseline: `rewrite/shape-connectivity-v1`, commit `44a13a671d80f41ce495a7f1bf2da2cca2e16264`, initially clean. T8 was subsequently committed as `81d1f57`; this section records its initial validation only. T9 implementation files and `particle-sim-compare` were not modified; no import/signature adjustments to T9 files were needed.
 
 | Command | Observed result |
 | --- | --- |
@@ -92,4 +92,8 @@ Baseline: `rewrite/shape-connectivity-v1`, commit `44a13a671d80f41ce495a7f1bf2da
 
 The skipped test is `tests/test_model_and_training.py::test_training_lowers_the_loss_and_search_finds_the_same_layout_at_another_unit_size`, owned by T9 `train.py` and `search.py`; running it would violate T8's no-training scope. All other collected tests passed with socket connections blocked.
 
-The bridge example's stored check uses source shape `[16,24]`, grid 6, scale 0.25, coverage threshold 0.5, and 4-neighbour components. Its source contains 136 active pixels and 1 component; the thresholded normalized mask contains 8 active pixels and 2 components. The shortest axis run is 1 pixel (estimated 0.25 at the chosen grid), and both thin-line and bridge/component-loss warnings are set, with connectivity unavailable and preservation uncertified. This evidence is synthetic and does not approve a real grid. Independent review is still required under the adopted R3 route.
+The bridge example's stored check uses source shape `[16,24]`, grid 6, scale 0.25, coverage threshold 0.5, and 4-neighbour components. Its source contains 136 active pixels and 1 component; the thresholded normalized mask contains 8 active pixels and 2 components. The shortest axis run is 1 pixel (estimated 0.25 at the chosen grid), and both thin-line and bridge/component-loss warnings are set, with connectivity unavailable and preservation uncertified. This evidence is synthetic and does not approve a real grid. Independent R3 review subsequently identified findings recorded in `docs/review/R3_REVIEW.md`; the fix candidate requires re-review.
+
+## Current training grid policy
+
+`candidate_grid` is required and is not inferred from physical pitch or an example configuration. Training uses that manifest value by default. A conflicting explicit grid requires `--allow-grid-override`; a thin-line/bridge failure requires the separate `--allow-grid-check-failure` flag. Both decisions and the evidence are recorded in checkpoint metadata. Reports remain diagnostics, not electrical preservation certificates. The input identity canonicalizes numeric metadata so integer/float JSON serialization of the same physical values has the same fingerprint.

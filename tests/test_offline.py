@@ -47,3 +47,13 @@ def test_bad_local_weights_format_and_nonfinite_values(tmp_path):
     torch.save({"bad": torch.tensor(float("nan"))}, file)
     with pytest.raises(ValueError, match="finite state"):
         build_backbone("tiny", weights_file=str(file))
+
+
+def test_n4_public_three_channel_classifier_state_is_not_silently_converted(tmp_path):
+    timm = pytest.importorskip("timm")
+    from psdl1.model import ProductEncoder
+    public_shape = timm.create_model("convnextv2_atto", pretrained=False)
+    file = tmp_path / "public-shaped-state.pt"
+    torch.save(public_shape.state_dict(), file)
+    with pytest.raises(RuntimeError, match="size mismatch|Unexpected key"):
+        ProductEncoder(2, 2, backbone="convnextv2_atto", weights_file=str(file))

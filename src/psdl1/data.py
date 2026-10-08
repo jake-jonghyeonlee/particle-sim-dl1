@@ -1,4 +1,4 @@
-"""Original-shape preparation; whole-unit and three-channel paths are G5 candidates."""
+"""Original-shape preparation; whole-unit/set input approved; real grid and endpoint format pending."""
 from __future__ import annotations
 
 import hashlib
@@ -13,9 +13,9 @@ import torch.nn.functional as F
 
 from .schema import (SCHEMA_VERSION, Connection, Element, Endpoint, Frame, Product,
                      asset_path, binary_mask, fields, identifier, reject_forbidden,
-                     validate_product, numbers)
+                     validate_product, numbers, approval_status)
 
-CHANNELS = 3  # compatibility candidate; T9 must explicitly consume structured evidence
+CHANNELS = 3  # image channels; structured encoder also consumes spatial valid and bindings
 
 
 def _grid(grid):
@@ -118,7 +118,7 @@ def grid_check(product: Product, grid: int):
         reasons.append("missing_observations_or_valid_holes")
     return {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
             "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
-            "approval": "G5_pending", "connectivity_status": product.connectivity_status,
+            "approval": approval_status(), "connectivity_status": product.connectivity_status,
             "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",
             "reasons": reasons, "elements": evidence}
 
@@ -133,7 +133,15 @@ def input_identity(product: Product):
                "connectivity_observation": product.connectivity_observation,
                "elements": sorted([(e.key, e.electrode_id or e.role, e.role, e.layer, e.observation, digest(e.mask)) for e in product.elements]),
                "connections": sorted([(c.connection_id, c.kind, c.observation, sorted((ep.element_id, ep.xy_um) for ep in c.endpoints), digest(c.mask)) for c in product.connections])}
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    def canonical(value):
+        if isinstance(value, dict):
+            return {key: canonical(v) for key, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [canonical(v) for v in value]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value) if value != 0 else 0.0
+        return value
+    return hashlib.sha256(json.dumps(canonical(payload), sort_keys=True).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -178,7 +186,7 @@ def prepare_product(product: Product, grid: int, roles, layers):
 
 
 def product_tensors(product: Product, grid: int, roles, layers):
-    """Legacy three-channel candidate; structured validity/endpoints require T9 consumer."""
+    """Compatibility image-only interface; the trainer uses the structured consumer."""
     item = prepare_product(product, grid, roles, layers)
     return item.images, item.role_ids, item.layer_ids
 
@@ -227,8 +235,11 @@ def augment_with_check(images: torch.Tensor, generator: torch.Generator, scale=(
         raise ValueError("one finite 2x3 common transform required")
     sample_grid = F.affine_grid(theta.expand(n, 2, 3), (n, c, g, g), align_corners=False)
     out = F.grid_sample(images, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-    evidence = [check_resampling((src[0].detach().cpu().numpy() >= 0.5).astype(np.float32), dst[0].detach().cpu().numpy()) for src, dst in zip(images, out)]
-    report = {"elements": evidence, "connectivity_preserving": False, "approval": "G5_pending",
+    channels = [[check_resampling((src[ch].detach().cpu().numpy() >= 0.5).astype(np.float32), dst[ch].detach().cpu().numpy())
+                 for ch in range(c)] for src, dst in zip(images, out)]
+    evidence = [{**checks[0], "channels": checks,
+                 "bridge_or_component_loss": any(check["bridge_or_component_loss"] for check in checks)} for checks in channels]
+    report = {"elements": evidence, "connectivity_preserving": False, "approval": approval_status(),
               "safe_for_positive_label": False, "common_theta": theta.detach().cpu().tolist()}
     return out, report
 
@@ -293,7 +304,9 @@ def load_manifest(path: str | Path, *, grid: int | None = None) -> list[Product]
             connections.append(Connection(c["connection_id"], c["kind"], tuple(endpoints), None if c["mask"] is None else read(c["mask"]), c["observation"]))
         product = Product(raw["product_id"], raw["unit_size_um"], tuple(elements), None if raw.get("cnt") is None else read(raw["cnt"]),
                           raw["lineage_id"], raw["design_version"], frame, read(raw["valid"]), tuple(connections), raw["connectivity_observation"])
-        products.append(replace(product, grid_check=grid_check(product, chosen_grid)))
+        report = grid_check(product, chosen_grid)
+        report["manifest_candidate_grid"] = doc["candidate_grid"]
+        products.append(replace(product, grid_check=report))
     if len({p.product_id for p in products}) != len(products):
         raise ValueError("duplicate product_id")
     if not all(np.isclose(p.frame.pixel_pitch_um, products[0].frame.pixel_pitch_um, atol=1e-9, rtol=1e-9) for p in products):
@@ -309,7 +322,7 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     products = load_manifest(args.manifest, grid=args.grid)
-    report = {"schema_version": SCHEMA_VERSION, "approval": "G5_pending", "products": [p.grid_check for p in products]}
+    report = {"schema_version": SCHEMA_VERSION, "approval": approval_status(), "products": [p.grid_check for p in products]}
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 

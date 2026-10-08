@@ -11,7 +11,7 @@ from .checkpoint import json_hash
 from .data import input_identity, load_manifest, normalize_unit
 from .losses import validate_relations
 from .search import load_model, search, vocabulary_reason
-from .schema import binary_mask
+from .schema import binary_mask, approval_status
 from .split import validate_split
 from .train import load_relations
 
@@ -54,9 +54,12 @@ def evaluate(model, cfg, products, split_manifest, relations, *, topk=5, batch_s
     if not hard <= different or any(not pair <= heldout_ids for pair in hard):
         raise ValueError("hard negatives must be labelled different and wholly held out")
     rows, recalls, baseline_recalls = [], [], []
+    full_results = {}
     for query in heldout:
         candidates = [p for p in heldout if p.product_id != query.product_id]
-        result = search(model, cfg, query, candidates, topk=topk, batch_size=batch_size)
+        full = search(model, cfg, query, candidates, topk=max(1, len(candidates)), batch_size=batch_size)
+        full_results[query.product_id] = full
+        result = {**full, "rankings": full["rankings"][:topk]}
         eligible = [p for p in candidates if vocabulary_reason(p, cfg) is None]
         baseline = sorted(((p.product_id, normalized_image_distance(query, p, cfg["grid"])) for p in eligible), key=lambda row: (row[1], row[0]))[:topk] if result["status"] == "available" else []
         positive = {p.product_id for p in eligible if frozenset((query.product_id, p.product_id)) in similar}
@@ -72,12 +75,41 @@ def evaluate(model, cfg, products, split_manifest, relations, *, topk=5, batch_s
                      "known_candidate_pairs": known, "unknown_candidate_pairs": len(eligible) - known,
                      "known_positive_candidates": len(positive), "recall_at_k": recall, "baseline_recall_at_k": base_recall,
                      "model": result, "baseline": [{"product_id": pid, "distance": score} for pid, score in baseline]})
-    return {"schema_version": "dl1_evaluation_v1", "approval": {"input_method": "user_approved_2026_10_09", "real_grid_linewidth": "pending", "endpoint_source_format": "pending", "G6": "pending"}, "performance_acceptance": "not_established",
+    hard_items = []
+    for pair in sorted(map(sorted, hard)):
+        directions = []
+        for qid, nid in (pair, pair[::-1]):
+            full = full_results[qid]
+            ranked = full["rankings"]
+            negative = next((r for r in ranked if r["product_id"] == nid), None)
+            positives = [r for r in ranked if frozenset((qid, r["product_id"])) in similar]
+            comparison_available = negative is not None and bool(positives)
+            directions.append({"query_id": qid, "negative_id": nid,
+                               "status": "available" if negative else "unavailable",
+                               "reason": None if negative else (full["reason"] or "hard_negative_candidate_excluded"),
+                               "score": negative["score"] if negative else None,
+                               "rank": next((i + 1 for i, r in enumerate(ranked) if r["product_id"] == nid), None),
+                               "known_positives": [{"product_id": r["product_id"], "score": r["score"],
+                                                    "rank": ranked.index(r) + 1} for r in positives],
+                               "comparison_status": "available" if comparison_available else "unavailable",
+                               "comparison_reason": None if comparison_available else "no_known_positive_candidate" if negative else "hard_negative_score_unavailable",
+                               "below_all_known_positives": all(negative["score"] < r["score"] for r in positives) if comparison_available else None,
+                               "margin_to_lowest_positive": min(r["score"] for r in positives) - negative["score"] if comparison_available else None})
+        scored = sum(d["status"] == "available" for d in directions)
+        hard_items.append({"pair": pair, "status": "available" if scored == 2 else "partial" if scored else "unavailable",
+                           "reason": None if scored == 2 else "some_scores_unavailable" if scored else "scores_unavailable",
+                           "directions": directions, "acceptance_threshold": "G6_pending"})
+    all_scored = bool(hard_items) and all(item["status"] == "available" for item in hard_items)
+    any_scored = any(item["status"] != "unavailable" for item in hard_items)
+    hard_evaluation = {"status": "available" if all_scored else "partial" if any_scored else "unavailable",
+                       "reason": None if all_scored else "none_supplied" if not hard_items else "some_scores_unavailable" if any_scored else "scores_unavailable",
+                       "items": hard_items}
+    return {"schema_version": "dl1_evaluation_v1", "approval": approval_status(), "performance_acceptance": "not_established",
             "topk": topk, "model_config": cfg, "checkpoint_weights_hash": getattr(model, "weights_hash", None),
             "input_hash": expected_hash, "code_hash": model.training_metadata.get("code_hash"), "split_hash": json_hash(split_manifest), "evaluated_queries": len(recalls),
             "unavailable_queries": len(rows) - len(recalls), "recall_at_k": float(np.mean(recalls)) if recalls else None,
             "baseline_recall_at_k": float(np.mean(baseline_recalls)) if baseline_recalls else None,
-            "hard_negative_pairs": sorted(map(sorted, hard)), "queries": rows}
+            "hard_negative_pairs": sorted(map(sorted, hard)), "hard_negative_evaluation": hard_evaluation, "queries": rows}
 
 
 def main(argv=None):

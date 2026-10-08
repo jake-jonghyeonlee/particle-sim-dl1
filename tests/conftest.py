@@ -20,7 +20,8 @@ def make_product(family: str, size_px: int, um_per_px: float = 0.05, product_id:
             m[round(y0 * size_px):round(y1 * size_px), round(x0 * size_px):round(x1 * size_px)] = 1.0
         elements.append(Element(role, layer, m))
     cnt = np.zeros((size_px, size_px), dtype=np.float32)
-    cnt[round(0.48 * size_px):round(0.52 * size_px), round(0.48 * size_px):round(0.52 * size_px)] = 1.0
+    cx, cy = {"bus": (0.50, 0.50), "comb": (0.25, 0.75), "ring": (0.50, 0.30)}[family]
+    cnt[round((cy - 0.02) * size_px):round((cy + 0.02) * size_px), round((cx - 0.02) * size_px):round((cx + 0.02) * size_px)] = 1.0
     unit = size_px * um_per_px
     return Product(product_id or f"{family}-{size_px}", (unit, unit), tuple(elements), cnt, lineage_id=family, design_version="synthetic-v1")
 

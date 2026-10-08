@@ -104,13 +104,22 @@ def test_evaluation_metrics_and_unknown_coverage_using_fixed_ranking_fixture(man
     model.training_metadata = {"split": split, "input_hash": json_hash({p.product_id: {"identity": input_identity(p), "lineage": p.lineage_id, "design": p.design_version} for p in products})}
     model.trained_epochs = 1  # direct harness fixture, not an encoder performance test
     def fixed_search(model, cfg, query, candidates, **kwargs):
-        return {"status": "available", "reason": None, "rankings": [{"product_id": p.product_id, "score": 0} for p in sorted(candidates, key=lambda p: p.product_id)], "excluded": []}
+        ordered = sorted(candidates, key=lambda p: (p.product_id != "query", p.product_id)) if query.product_id == "positive" else sorted(candidates, key=lambda p: p.product_id)
+        return {"status": "available", "reason": None, "rankings": [{"product_id": p.product_id, "score": 0.9 - i * 0.3} for i, p in enumerate(ordered[:kwargs["topk"]])], "excluded": []}
     monkeypatch.setattr("psdl1.evaluate.search", fixed_search)
     positive = {frozenset(("query", "positive"))}
     negative = {frozenset(("query", "endpoint-negative"))}
-    report = evaluate(model, cfg, products, split, (positive, negative), topk=2, hard_negative_pairs=[("query", "endpoint-negative")])
+    report = evaluate(model, cfg, products, split, (positive, negative), topk=1, hard_negative_pairs=[("query", "endpoint-negative")])
     assert report["evaluated_queries"] == 2
-    assert report["recall_at_k"] == 1 and report["baseline_recall_at_k"] == 1
+    assert report["recall_at_k"] == 0.5 and report["baseline_recall_at_k"] == 0
+    per_query = {row["query_id"]: row for row in report["queries"]}
+    assert per_query["query"]["recall_at_k"] == 0 and per_query["positive"]["recall_at_k"] == 1
+    item = report["hard_negative_evaluation"]["items"][0]
+    direction = next(d for d in item["directions"] if d["query_id"] == "query")
+    assert direction["score"] == pytest.approx(0.9) and direction["rank"] == 1
+    assert direction["known_positives"] == [{"product_id": "positive", "score": pytest.approx(0.6), "rank": 2}]
+    assert direction["below_all_known_positives"] is False
+    assert direction["margin_to_lowest_positive"] == pytest.approx(-0.3)
     assert report["unavailable_queries"] == 1
     assert report["hard_negative_pairs"] == [["endpoint-negative", "query"]]
     assert report["performance_acceptance"] == "not_established"
@@ -146,3 +155,53 @@ def test_image_baseline_accepts_binary_255_valid_and_shape_encodings(products):
     encoded = replace(original, elements=tuple(replace(e, mask=e.mask * 255) for e in original.elements),
                       valid=torch.ones_like(torch.from_numpy(original.elements[0].mask)).numpy() * 255)
     assert normalized_image_distance(original, encoded, 16) == 0
+
+
+def test_n3_evaluation_cli_scores_hard_negative_outside_topk_and_missing_list(manifest_case, tmp_path, monkeypatch):
+    import json
+    from psdl1.checkpoint import json_hash
+    from psdl1.data import input_identity
+    from psdl1.evaluate import main
+    products, split = endpoint_heldout(manifest_case)
+    products.append(replace(products[1], product_id="positive", lineage_id="positive-family"))
+    split["test"].append("positive")
+    model, cfg = setup_model([products[0]])
+    model.trained_epochs = 1  # metric fixture, not performance evidence
+    model.training_metadata = {"split": split, "input_hash": json_hash({p.product_id: {"identity": input_identity(p), "lineage": p.lineage_id, "design": p.design_version} for p in products})}
+    monkeypatch.setattr("psdl1.evaluate.load_model", lambda path: (model, cfg))
+    monkeypatch.setattr("psdl1.evaluate.load_manifest", lambda *args, **kwargs: products)
+    def scored_fixture(model, cfg, query, candidates, **kwargs):
+        ordered = sorted(candidates, key=lambda p: (p.product_id != "positive", p.product_id))
+        return {"status": "available", "reason": None, "excluded": [],
+                "rankings": [{"product_id": p.product_id, "score": 0.8 - i * 0.3} for i, p in enumerate(ordered[:kwargs["topk"]])]}
+    monkeypatch.setattr("psdl1.evaluate.search", scored_fixture)
+    split_file, labels, hard, out = (tmp_path / name for name in ("split.json", "relations.csv", "hard.json", "result.json"))
+    split_file.write_text(json.dumps(split))
+    labels.write_text("query,positive,similar\nquery,endpoint-negative,different\n")
+    hard.write_text(json.dumps([["query", "endpoint-negative"]]))
+    args = ["--ckpt", "fixture.pt", "--manifest", "fixture.json", "--split", str(split_file), "--relations", str(labels), "--topk", "1", "--out", str(out)]
+    main([*args, "--hard-negatives", str(hard)])
+    report = json.loads(out.read_text())
+    direction = next(d for d in report["hard_negative_evaluation"]["items"][0]["directions"] if d["query_id"] == "query")
+    assert direction["score"] == pytest.approx(0.5)
+    assert direction["rank"] == 2  # outside the requested topk=1, still scored
+    assert direction["known_positives"] == [{"product_id": "positive", "score": pytest.approx(0.8), "rank": 1}]
+    assert direction["below_all_known_positives"] is True
+    assert direction["margin_to_lowest_positive"] == pytest.approx(0.3)
+    main(args)
+    assert json.loads(out.read_text())["hard_negative_evaluation"] == {"status": "unavailable", "reason": "none_supplied", "items": []}
+
+
+def test_n3_unknown_hard_negative_has_unavailable_scores_not_available_claim(manifest_case):
+    from psdl1.checkpoint import json_hash
+    from psdl1.data import input_identity
+    products, split = endpoint_heldout(manifest_case)
+    negative = products[2]
+    products[2] = replace(negative, elements=(replace(negative.elements[0], role="unseen"), *negative.elements[1:]))
+    model, cfg = setup_model([products[0]])
+    model.trained_epochs = 1  # provenance fixture; both searches stop before any forward
+    model.training_metadata = {"split": split, "input_hash": json_hash({p.product_id: {"identity": input_identity(p), "lineage": p.lineage_id, "design": p.design_version} for p in products})}
+    report = evaluate(model, cfg, products, split, (set(), {frozenset(("query", "endpoint-negative"))}), hard_negative_pairs=[("query", "endpoint-negative")])
+    hard = report["hard_negative_evaluation"]
+    assert hard["status"] == "unavailable" and hard["reason"] == "scores_unavailable"
+    assert all(d["score"] is None and d["status"] == "unavailable" and d["reason"] for d in hard["items"][0]["directions"])
