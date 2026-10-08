@@ -1,45 +1,35 @@
-"""제품 하나 = 전극 x layer 이미지들의 묶음.
-
-unit 전체를 같은 픽셀 격자로 맞춘다(비율 유지, 남는 쪽은 빈칸).
-unit 크기가 달라도 배치와 연결이 그대로 겹치게 하려는 것이다.
-절대 치수는 여기서 사라진다. 필요하면 unit 크기를 조건으로 따로 준다.
-"""
+"""Original-shape preparation; whole-unit and three-channel paths are G5 candidates."""
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-CHANNELS = 3  # 이 전극·layer / CNT / 제품의 나머지 배선
+from .schema import (SCHEMA_VERSION, Connection, Element, Endpoint, Frame, Product,
+                     asset_path, binary_mask, fields, identifier, reject_forbidden,
+                     validate_product, numbers)
+
+CHANNELS = 3  # compatibility candidate; T9 must explicitly consume structured evidence
 
 
-@dataclass(frozen=True)
-class Element:
-    role: str   # source, drain, gate ... 제품 간 같은 역할
-    layer: str
-    mask: np.ndarray  # 2-D, 원본 격자
-
-
-@dataclass(frozen=True)
-class Product:
-    product_id: str
-    unit_size_um: tuple[float, float]  # (가로, 세로)
-    elements: tuple[Element, ...]
-    cnt: np.ndarray | None = None
+def _grid(grid):
+    if type(grid) is not int or grid <= 0:
+        raise ValueError("grid must be a positive integer")
+    return grid
 
 
 def normalize_unit(mask: np.ndarray, grid: int) -> np.ndarray:
-    """2-D mask를 grid x grid로. 면적 평균으로 줄이고 비율을 유지하며 가운데에 둔다."""
-    m = torch.as_tensor(np.asarray(mask), dtype=torch.float32)
-    if m.ndim != 2:
-        raise ValueError("mask는 2-D")
+    """Common full-frame area resize + central pad, never per-element centring."""
+    _grid(grid)
+    m = torch.from_numpy(binary_mask(mask))
     h, w = m.shape
-    scale = grid / max(h, w)
-    nh, nw = max(1, round(h * scale)), max(1, round(w * scale))
+    nh, nw = max(1, round(h * grid / max(h, w))), max(1, round(w * grid / max(h, w)))
     resized = F.interpolate(m[None, None], size=(nh, nw), mode="area")[0, 0]
     out = torch.zeros(grid, grid)
     top, left = (grid - nh) // 2, (grid - nw) // 2
@@ -48,33 +38,149 @@ def normalize_unit(mask: np.ndarray, grid: int) -> np.ndarray:
 
 
 def narrowest_run_px(mask: np.ndarray) -> int:
-    """가로·세로로 이어진 True 구간 중 가장 짧은 길이. 줄였을 때 가는 선이 남는지 볼 때 쓴다."""
-    m = np.asarray(mask).astype(bool)
-    best = max(m.shape)
+    """Auxiliary axis-run estimate; zero for empty, not a physical linewidth proof."""
+    m = binary_mask(mask).astype(bool)
+    lengths = []
     for arr in (m, m.T):
-        padded = np.pad(arr, ((0, 0), (1, 1))).astype(np.int8)
-        edges = np.diff(padded, axis=1)
+        edges = np.diff(np.pad(arr, ((0, 0), (1, 1))).astype(np.int8), axis=1)
         for row in edges:
             starts, ends = np.flatnonzero(row == 1), np.flatnonzero(row == -1)
             if len(starts):
-                best = min(best, int((ends - starts).min()))
-    return best
+                lengths.append(int((ends - starts).min()))
+    return min(lengths, default=0)
 
 
-def product_tensors(product: Product, grid: int, roles: dict[str, int], layers: dict[str, int]):
-    """원소별 이미지 [N, 3, grid, grid]와 역할·layer 번호 [N]."""
-    if not product.elements:
-        raise ValueError(f"원소가 없는 제품: {product.product_id}")
-    norm = [normalize_unit(e.mask, grid) for e in product.elements]
-    total = np.clip(np.sum(norm, axis=0), 0.0, 1.0)
-    cnt = normalize_unit(product.cnt, grid) if product.cnt is not None else np.zeros((grid, grid), dtype=np.float32)
-    images = np.stack([np.stack([n, cnt, np.clip(total - n, 0.0, 1.0)]) for n in norm]).astype(np.float32)
+def _components(mask):
+    """4-neighbour components via horizontal runs (no optional dependency)."""
+    parent = []
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    previous = []
+    for row in np.asarray(mask, dtype=bool):
+        edges = np.diff(np.pad(row, (1, 1)).astype(np.int8))
+        current = []
+        j = 0
+        for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+            idx = len(parent)
+            parent.append(idx)
+            while j < len(previous) and previous[j][1] <= start:
+                j += 1
+            k = j
+            while k < len(previous) and previous[k][0] < end:
+                parent[find(idx)] = find(previous[k][2])
+                k += 1
+            current.append((start, end, idx))
+        previous = current
+    return len({find(i) for i in range(len(parent))})
+
+
+def check_resampling(source, transformed, *, threshold=0.5):
+    """Conservative bridge/component diagnostic, also applicable after common crop."""
+    src = binary_mask(source)
+    out = np.asarray(transformed)
+    if out.ndim != 2 or not out.size or not np.isfinite(out).all() or (out < 0).any() or (out > 1).any():
+        raise ValueError("transformed mask must be finite 2-D coverage in [0,1]")
+    if not np.isfinite(threshold) or not 0 < threshold <= 1:
+        raise ValueError("threshold must be in (0,1]")
+    before, after = _components(src), _components(out >= threshold)
+    return {"threshold": threshold, "neighbours": 4,
+            "source_components": before, "target_components": after,
+            "source_active_pixels": int(src.sum()), "target_active_pixels": int((out >= threshold).sum()),
+            "bridge_or_component_loss": before != after,
+            "connectivity_preserving": False,
+            "certification": "not_certified: component equality and area similarity do not prove connectivity"}
+
+
+def grid_check(product: Product, grid: int):
+    shape, valid = validate_product(product)
+    _grid(grid)
+    scale = grid / max(shape)
+    evidence = []
+    for name, mask in [(e.key, e.mask) for e in product.elements] + [(c.connection_id, c.mask) for c in product.connections] + ([("global_CNT", product.cnt)] if product.cnt is not None else []):
+        if mask is None:
+            evidence.append({"id": name, "observation": "missing"})
+            continue
+        source = binary_mask(mask) * valid
+        width = narrowest_run_px(source)
+        evidence.append({"id": name, "observation": "observed", "axis_run_px": width,
+                         "estimated_run_at_grid_px": width * scale,
+                         "thin_line_warning": bool(width and width * scale < 2),
+                         **check_resampling(source, normalize_unit(source, grid))})
+    reasons = []
+    if any(e.get("thin_line_warning") for e in evidence):
+        reasons.append("axis_run_below_2px; real_minimum_linewidth_unconfirmed")
+    if any(e.get("bridge_or_component_loss") for e in evidence):
+        reasons.append("bridge_or_component_loss_at_grid")
+    if any(e["observation"] == "missing" for e in evidence) or not valid.all():
+        reasons.append("missing_observations_or_valid_holes")
+    return {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
+            "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
+            "approval": "G5_pending", "connectivity_status": product.connectivity_status,
+            "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",
+            "reasons": reasons, "elements": evidence}
+
+
+def input_identity(product: Product):
+    """Order-independent fingerprint; preserve bound role/layer and endpoint geometry."""
+    validate_product(product)
+    def digest(m):
+        return None if m is None else hashlib.sha256(binary_mask(m).tobytes()).hexdigest()
+    payload = {"frame": None if product.frame is None else product.frame.__dict__,
+               "unit": product.unit_size_um, "valid": digest(product.valid), "cnt": digest(product.cnt),
+               "connectivity_observation": product.connectivity_observation,
+               "elements": sorted([(e.key, e.electrode_id or e.role, e.role, e.layer, e.observation, digest(e.mask)) for e in product.elements]),
+               "connections": sorted([(c.connection_id, c.kind, c.observation, sorted((ep.element_id, ep.xy_um) for ep in c.endpoints), digest(c.mask)) for c in product.connections])}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class PreparedInput:
+    images: torch.Tensor
+    role_ids: torch.Tensor
+    layer_ids: torch.Tensor
+    valid: torch.Tensor  # spatial observed coverage, distinct from collate element padding
+    connections: tuple[Connection, ...]  # original-frame endpoint bindings
+    connection_masks: torch.Tensor
+    identity: str
+    grid_check: dict
+    connectivity_status: str
+
+
+def prepare_product(product: Product, grid: int, roles, layers):
+    shape, valid = validate_product(product)
+    if any(e.mask is None for e in product.elements):
+        raise ValueError("missing element observation cannot be represented as zero")
+    report = grid_check(product, grid)
+    if report["reasons"]:
+        warnings.warn(f"{product.product_id}: grid check: {', '.join(report['reasons'])}", UserWarning, stacklevel=2)
+    norm = [normalize_unit(binary_mask(e.mask) * valid, grid) for e in product.elements]
+    cnt_sources = [binary_mask(c.mask) for c in product.connections if c.mask is not None]
+    if product.cnt is not None:
+        cnt_sources.append(binary_mask(product.cnt))
+    cnt = normalize_unit(np.maximum.reduce(cnt_sources) * valid, grid) if cnt_sources else np.zeros((grid, grid), dtype=np.float32)
+    # Exclude self before composing: overlapping other wiring must survive.
+    rest = [np.clip(np.sum([other for j, other in enumerate(norm) if j != i], axis=0), 0, 1)
+            if len(norm) > 1 else np.zeros((grid, grid), dtype=np.float32) for i in range(len(norm))]
+    images = np.stack([np.stack([n, cnt, r]) for n, r in zip(norm, rest)]).astype(np.float32)
     try:
-        role_ids = [roles[e.role] for e in product.elements]
-        layer_ids = [layers[e.layer] for e in product.elements]
+        rids = [roles[e.role] for e in product.elements]
+        lids = [layers[e.layer] for e in product.elements]
     except KeyError as err:
         raise ValueError(f"어휘에 없는 역할 또는 layer: {err.args[0]!r} ({product.product_id})") from None
-    return torch.from_numpy(images), torch.tensor(role_ids), torch.tensor(layer_ids)
+    cm = [normalize_unit(binary_mask(c.mask) * valid, grid) if c.mask is not None else np.zeros((grid, grid), dtype=np.float32) for c in product.connections]
+    return PreparedInput(torch.from_numpy(images), torch.tensor(rids), torch.tensor(lids),
+                         torch.from_numpy(normalize_unit(valid, grid)), product.connections,
+                         torch.from_numpy(np.stack(cm)) if cm else torch.empty(0, grid, grid),
+                         input_identity(product), report, product.connectivity_status)
+
+
+def product_tensors(product: Product, grid: int, roles, layers):
+    """Legacy three-channel candidate; structured validity/endpoints require T9 consumer."""
+    item = prepare_product(product, grid, roles, layers)
+    return item.images, item.role_ids, item.layer_ids
 
 
 def build_vocab(products: list[Product]) -> tuple[dict[str, int], dict[str, int]]:
@@ -105,43 +211,107 @@ def unit_feature(unit_size_um: tuple[float, float]) -> torch.Tensor:
     return torch.log(torch.tensor(unit_size_um, dtype=torch.float32))
 
 
-def augment(images: torch.Tensor, generator: torch.Generator, scale=(0.6, 1.0), shift=0.08) -> torch.Tensor:
-    """한 제품의 모든 원소에 같은 변형을 준다: 무작위로 일부를 잘라 원래 크기로 키우고 조금 옮긴다.
-
-    크기가 달라도 같은 구조로 보도록 배우게 하려는 것이다. 원소마다 다르게 변형하면
-    전극 사이의 배치 관계가 깨지므로 제품 단위로 한 번만 뽑는다.
-    """
+def augment_with_check(images: torch.Tensor, generator: torch.Generator, scale=(0.6, 1.0), shift=0.08, *, theta=None):
+    """Shared candidate transform with evidence; no automatic positive-label approval."""
+    if images.ndim != 4 or not images.shape[0] or images.shape[-1] != images.shape[-2] or not torch.isfinite(images).all() or (images < 0).any() or (images > 1).any():
+        raise ValueError("images must be nonempty finite [N,C,G,G] coverage")
+    if len(scale) != 2 or not all(np.isfinite(v) for v in scale) or not 0 < scale[0] <= scale[1] or not np.isfinite(shift) or shift < 0:
+        raise ValueError("invalid augmentation scale or shift")
     n, c, g, _ = images.shape
-    s = float(torch.empty(1).uniform_(scale[0], scale[1], generator=generator))
-    tx, ty = (torch.empty(2).uniform_(-shift, shift, generator=generator) + (torch.rand(2, generator=generator) - 0.5) * (1 - s)).tolist()
-    theta = torch.tensor([[s, 0.0, tx * 2], [0.0, s, ty * 2]]).expand(n, 2, 3)
-    grid = F.affine_grid(theta, (n, c, g, g), align_corners=False)
-    return F.grid_sample(images, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+    if theta is None:
+        s = float(torch.empty(1).uniform_(scale[0], scale[1], generator=generator))
+        tx, ty = (torch.empty(2).uniform_(-shift, shift, generator=generator) + (torch.rand(2, generator=generator) - 0.5) * (1 - s)).tolist()
+        theta = [[s, 0.0, tx * 2], [0.0, s, ty * 2]]
+    theta = torch.as_tensor(theta, device=images.device, dtype=images.dtype)
+    if theta.shape != (2, 3) or not torch.isfinite(theta).all():
+        raise ValueError("one finite 2x3 common transform required")
+    sample_grid = F.affine_grid(theta.expand(n, 2, 3), (n, c, g, g), align_corners=False)
+    out = F.grid_sample(images, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+    evidence = [check_resampling((src[0].detach().cpu().numpy() >= 0.5).astype(np.float32), dst[0].detach().cpu().numpy()) for src, dst in zip(images, out)]
+    report = {"elements": evidence, "connectivity_preserving": False, "approval": "G5_pending",
+              "safe_for_positive_label": False, "common_theta": theta.detach().cpu().tolist()}
+    return out, report
 
 
-def load_manifest(path: str | Path) -> list[Product]:
-    """manifest.json을 읽는다. mask는 .npy(2-D). 경로는 manifest 폴더 기준 상대 경로.
+def augment(images: torch.Tensor, generator: torch.Generator, scale=(0.6, 1.0), shift=0.08) -> torch.Tensor:
+    """Legacy common-transform candidate; T9 must inspect evidence before labelling."""
+    out, report = augment_with_check(images, generator, scale, shift)
+    if any(e["bridge_or_component_loss"] for e in report["elements"]):
+        warnings.warn("common transform loses a bridge/component; connectivity not preserved", UserWarning, stacklevel=2)
+    return out
 
-    {"products": [{"product_id": "A", "unit_size_um": [60, 60], "cnt": "A/cnt.npy",
-                   "elements": [{"role": "gate", "layer": "layer1", "mask": "A/gate_layer1.npy"}]}]}
-    """
+
+def load_manifest(path: str | Path, *, grid: int | None = None) -> list[Product]:
+    """Strict versioned draft manifest; store per-product grid evidence on load."""
     path = Path(path)
     root = path.parent.resolve()
-
-    def read(rel: str) -> np.ndarray:
-        target = (root / rel).resolve()
-        if root not in target.parents:
-            raise ValueError(f"manifest 폴더 밖의 경로: {rel}")
-        arr = np.load(target, allow_pickle=False)
-        return (arr > 0).astype(np.float32)  # 0/255로 저장된 mask도 0/1로
-
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON field: {key}")
+            result[key] = value
+        return result
+    doc = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    reject_forbidden(doc)
+    fields(doc, ("schema_version", "candidate_grid", "products"))
+    if doc["schema_version"] != SCHEMA_VERSION:
+        raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+    _grid(doc["candidate_grid"])
+    chosen_grid = doc["candidate_grid"] if grid is None else _grid(grid)
+    if not isinstance(doc["products"], list) or not doc["products"]:
+        raise ValueError("products must be nonempty list")
+    def read(rel):
+        return binary_mask(np.load(asset_path(root, rel), allow_pickle=False))
     products = []
-    for raw in json.loads(path.read_text(encoding="utf-8"))["products"]:
-        elements = tuple(Element(e["role"], e["layer"], read(e["mask"])) for e in raw["elements"])
-        shapes = {e.mask.shape for e in elements}
-        if len(shapes) != 1:
-            raise ValueError(f"한 제품의 mask 격자가 서로 다르다: {raw['product_id']}")
-        products.append(Product(raw["product_id"], tuple(raw["unit_size_um"]), elements, read(raw["cnt"]) if raw.get("cnt") else None))
+    for raw in doc["products"]:
+        fields(raw, ("product_id", "lineage_id", "design_version", "unit_size_um", "frame", "valid", "elements", "connections", "connectivity_observation"), ("cnt",))
+        for key in ("product_id", "lineage_id", "design_version"):
+            identifier(raw[key], key)
+        fr = raw["frame"]
+        fields(fr, ("frame_id", "length_unit", "origin_xy_um", "pixel_pitch_um", "shape_yx", "axis_order"))
+        if not isinstance(fr["shape_yx"], list):
+            raise ValueError("shape_yx must be a list")
+        frame = Frame(fr["frame_id"], tuple(fr["shape_yx"]), fr["pixel_pitch_um"], fr["origin_xy_um"], fr["length_unit"], fr["axis_order"])
+        if not isinstance(raw["elements"], list) or not isinstance(raw["connections"], list):
+            raise ValueError("elements and connections must be lists")
+        elements = []
+        for e in raw["elements"]:
+            fields(e, ("element_id", "electrode_id", "role", "actual_layer", "observation", "mask"))
+            identifier(e["element_id"], "element_id")
+            identifier(e["electrode_id"], "electrode_id")
+            elements.append(Element(e["role"], e["actual_layer"], None if e["mask"] is None else read(e["mask"]), e["electrode_id"], e["element_id"], e["observation"]))
+        connections = []
+        for c in raw["connections"]:
+            fields(c, ("connection_id", "kind", "endpoints", "mask", "observation"))
+            if not isinstance(c["endpoints"], list):
+                raise ValueError("endpoints must be list")
+            endpoints = []
+            for ep in c["endpoints"]:
+                fields(ep, ("element_id", "xy_um"))
+                endpoints.append(Endpoint(ep["element_id"], numbers(ep["xy_um"], 2, "endpoint xy_um")))
+            connections.append(Connection(c["connection_id"], c["kind"], tuple(endpoints), None if c["mask"] is None else read(c["mask"]), c["observation"]))
+        product = Product(raw["product_id"], raw["unit_size_um"], tuple(elements), None if raw.get("cnt") is None else read(raw["cnt"]),
+                          raw["lineage_id"], raw["design_version"], frame, read(raw["valid"]), tuple(connections), raw["connectivity_observation"])
+        products.append(replace(product, grid_check=grid_check(product, chosen_grid)))
     if len({p.product_id for p in products}) != len(products):
-        raise ValueError("product_id가 겹친다")
+        raise ValueError("duplicate product_id")
+    if not all(np.isclose(p.frame.pixel_pitch_um, products[0].frame.pixel_pitch_um, atol=1e-9, rtol=1e-9) for p in products):
+        raise ValueError("products must share the same pixel pitch")
     return products
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Validate draft original-shape inputs; never certifies connectivity")
+    parser.add_argument("manifest", type=Path)
+    parser.add_argument("--grid", type=int)
+    parser.add_argument("--report", type=Path, required=True)
+    args = parser.parse_args()
+    products = load_manifest(args.manifest, grid=args.grid)
+    report = {"schema_version": SCHEMA_VERSION, "approval": "G5_pending", "products": [p.grid_check for p in products]}
+    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

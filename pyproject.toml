@@ -1,13 +1,16 @@
 [project]
 name = "psdl1"
 version = "0.1.0"
-description = "DL1: product-level layout similarity across different unit sizes (electrode x layer images + Set Transformer)."
+description = "DL1 original-shape input validation and product similarity candidates (G5 pending)."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "torch>=2.2",
 ]
+
+[project.scripts]
+psdl1-validate = "psdl1.data:main"
 
 [project.optional-dependencies]
 timm = ["timm>=1.0"]
