@@ -104,7 +104,7 @@ def test_n2_real_encoder_results_invariant_to_order_and_batch_size(products):
     torch.manual_seed(31)
     two = replace(products[0], elements=products[0].elements[:2], product_id="query")
     roles, layers = build_vocab(products)
-    cfg = model_config(16, roles, layers)
+    cfg = model_config(64, roles, layers)
     model = ProductEncoder(len(roles), len(layers)).eval()
     a, z = replace(two, product_id="A"), replace(two, product_id="Z")
     m = replace(products[2], product_id="M")

@@ -58,7 +58,7 @@ JSON contains model/baseline rankings, per-query and aggregate Recall@k, eligibl
 
 ## Search contract
 
-Queries and candidates are separate manifests; the query need not have been in the training or candidate pool. Checkpoint versions/config fingerprints/state hashes are checked before loading. All source observations must satisfy T8 validation. Candidate encoding is bounded by `batch_size`; only scores are retained for the full corpus. Canonical single-product forward shapes remove padding/batch-context variation. Cosines accumulate in float64 and are rounded to six decimals before product-ID tie sorting. The checked encoder path produces identical rankings/scores across input order and chunk sizes; multi-product forward throughput is traded for reproducibility. `topk` and batch size must be positive integers, and duplicate candidate IDs are rejected.
+Queries and candidates are separate manifests; the query need not have been in the training or candidate pool. Checkpoint versions/config fingerprints/state hashes are checked before loading. All source observations must satisfy T8 validation. Candidate encoding is bounded by `batch_size`; only scores are retained for the full corpus. Canonical single-product forward shapes remove padding/batch-context variation. Evaluation caches one embedding per eligible product for the duration of the command, avoiding repeated forwards across queries; this uses O(N × embedding dimension) memory. `batch_size` bounds chunks, not the number of products in a forward. Single-query search still retains only scores across candidate chunks. Cosines accumulate in float64 and are rounded to six decimals before product-ID tie sorting. The checked encoder path produces identical rankings/scores across input order and chunk sizes; multi-product forward throughput is traded for reproducibility. `topk` and batch size must be positive integers, and duplicate candidate IDs are rejected.
 
 JSON returns unavailable reasons for no candidates, no eligible candidates, and unseen training vocabulary, plus candidate exclusions. Query ID matches are excluded as self results. Connectivity availability is reported independently of similarity scores; unavailable metadata is never presented as CNN-verified connectivity.
 
@@ -89,7 +89,7 @@ The one default skip is `tests/test_model_and_training.py::test_training_lowers_
 
 ## R3 finding response — fix candidate, 2026-10-09
 
-Baseline: clean `rewrite/shape-connectivity-v1` at `63a36369597547996818af7606b1400b694b2b25` (the original R3 report reviews `7e52d67`). Changes below remain uncommitted for independent re-review; this implementation record is not an independent PASS. `particle-sim-compare` and the original review report were not modified. The coordinator explicitly extended ownership to the two finding-related `pyproject.toml` edits: approval wording and optional safetensors declaration; no install/download occurred.
+Baseline: clean `rewrite/shape-connectivity-v1` at `63a36369597547996818af7606b1400b694b2b25` (the original R3 report reviews `7e52d67`). The changes below were committed as `dba0fb5` and independently reviewed as PASS-WITH-NOTES; this historical implementation record is not itself an independent PASS. `particle-sim-compare` and the original review report were not modified. The coordinator explicitly extended ownership to the two finding-related `pyproject.toml` edits: approval wording and optional safetensors declaration; no install/download occurred.
 
 | Finding | Status and concrete change | Counterexample/evidence |
 | --- | --- | --- |
@@ -124,3 +124,28 @@ Final validation on the fix candidate:
 | `git diff --check` | Passed |
 
 Default tests use direct forward/loss/optimizer fixtures, including a two-parameter fixture through the trainer/resume driver. Only the explicitly opted-in existing synthetic smoke trains the CNN; no real training, pretrained artifact or network was used. The remaining decisions are real grid/minimum linewidth, source endpoint format, G6 acceptance and independent re-review of this exact candidate.
+
+## R3 re-review notes response — 2026-10-09
+
+Baseline: clean `rewrite/shape-connectivity-v1` at `b45bd77d7cd370b84b231ee134f43ab1b01f0977`. This is an implementation record for R1–R6 from the independent `dba0fb5` re-review, not an independent review verdict. The review report and `particle-sim-compare` are untouched. No guessed grid, network access, imported weights or real-data training was added.
+
+| Note | Response | Counterexample evidence |
+| --- | --- | --- |
+| R1 | Fixed: search/evaluation report numeric applied `grid`, manifest candidate grids and explicit selection provenance. A mismatch errors unless `--allow-grid-override`, which records the conflict while retaining the checkpoint grid | Both real manifest CLI paths reject candidate 8/checkpoint 4 before output creation and accept only the recorded override |
+| R2 | Fixed: query/candidate and held-out grid checks recomputed at checkpoint grid. Thin-line/bridge failures block queries and exclude candidates by default; baseline uses the same exclusion. Separate `--allow-grid-check-failure` records per-product bypass evidence | CLI checks for both commands; hand-built 1 px line in 8 px unit at grid 4 has run estimate 0.5; bridge loses components; failing held-out products yield null metrics and empty baseline rankings |
+| R3 | Fixed: only the loader's explicit `manifest_candidate_grid` field supplies manifest provenance; a standalone hand-written grid report cannot supply an implicit training grid | API stops without an explicit grid, then reports `api_explicit` and null manifest candidate for explicit 64 |
+| R4 | Fixed: historical R3 status reflects committed `dba0fb5`; validator example uses manifest grid, with no literal recommended grid | Documentation regression test; actual grid/minimum width remain pending |
+| R5 | Mitigated and made explicit: evaluation caches embeddings once per product per command, reducing repeated encoder forwards from N × N to N; JSON/docs state single-product forward semantics and chunk meaning | Actual encoder held-out fixture requires exactly two forwards for two queries rather than four, with unchanged scores. Single-query multi-product forward acceleration is intentionally unchanged to preserve verified batch-size-independent arithmetic; throughput cost remains documented |
+| R6 | Fixed: the existing opt-in 40-epoch real CNN synthetic smoke uses explicit synthetic grid 64 and strict gate without bypass | Checkpoint asserts `passed`, no failures and `bypass_requested: false`; original loss decrease, same-family top-two and >0.1 score separation assertions retained |
+
+Changed expectations and fixtures: search tests now choose the fixture manifest grid 4 when present, or explicit synthetic 64 instead of 16 to keep thin-line rejection from hiding tie/vocabulary assertions. The real-encoder N2 fixture uses explicit synthetic 64 instead of 16 for the same reason; all exact invariance and tie assertions are unchanged. The opt-in smoke changes only its explicit synthetic grid 32 to 64 and removes the bypass, adding the strict-checkpoint assertion; epochs, learning rate and all existing performance assertions are unchanged. No real grid recommendation follows from these fixture choices. No tests were weakened.
+
+Caching is scoped to one evaluation command and requires O(N × embedding dimension) memory; single-query search continues to bound candidate embedding memory by chunks. Original source masks remain eagerly loaded. Per-product evidence is retained even when Python warnings are suppressed. A grid-check pass never certifies connectivity preservation or establishes real performance. Input-method approval remains 2026-10-09; real grid/linewidth, source endpoint format and G6 acceptance remain pending.
+
+| Required validation | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest -p no:warnings` | 195 passed, 1 skipped in 2.38s |
+| `.venv/bin/python -m pytest -p no:warnings --run-training` | 196 passed in 7.13s |
+| `git diff --check` | Passed |
+
+The default suite uses encoder/optimizer fixtures only; the existing synthetic CNN smoke remains opt-in. All tests retain the socket-network ban. Changes are left in the working tree without a commit; independent review of this candidate remains the coordinator's responsibility.

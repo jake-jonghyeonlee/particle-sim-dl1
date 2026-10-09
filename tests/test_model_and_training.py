@@ -75,8 +75,10 @@ def test_training_lowers_the_loss_and_search_finds_the_same_layout_at_another_un
     families = ("bus", "comb", "ring")
     similar = {frozenset((f"{f}-40", f"{f}-64")) for f in families}
     different = {frozenset((f"{f}-{a}", f"{g}-{b}")) for f in families for g in families if f != g for a in (40, 64) for b in (40, 64)}
-    history = train(products, tmp_path, epochs=40, grid=32, batch_size=6, lr=3e-4, relations=(similar, different), allow_grid_check_failure=True)
+    history = train(products, tmp_path, epochs=40, grid=64, batch_size=6, lr=3e-4, relations=(similar, different))
     assert history[-1] < history[0]
+    from psdl1.checkpoint import read_checkpoint
+    assert read_checkpoint(tmp_path / "dl1.pt")["metadata"]["grid_gate"] == {"policy": "strict_default", "bypass_requested": False, "status": "passed", "failures": []}
     model, cfg = load_model(tmp_path / "dl1.pt")
     query = make_product("comb", 96, product_id="new")       # 학습에 없던 unit 크기
     ranked = rank(model, cfg, query, products)

@@ -10,7 +10,7 @@ import numpy as np
 from .checkpoint import json_hash
 from .data import input_identity, load_manifest, normalize_unit
 from .losses import validate_relations
-from .search import load_model, search, vocabulary_reason
+from .search import load_model, search, vocabulary_reason, inference_grid_selection, inference_grid_checks
 from .schema import binary_mask, approval_status
 from .split import validate_split
 from .train import load_relations
@@ -27,7 +27,7 @@ def normalized_image_distance(a, b, grid):
     return float(np.mean([np.abs(aa.get(k, zero) - bb.get(k, zero)).mean() for k in keys]))
 
 
-def evaluate(model, cfg, products, split_manifest, relations, *, topk=5, batch_size=32, hard_negative_pairs=()):
+def evaluate(model, cfg, products, split_manifest, relations, *, topk=5, batch_size=32, hard_negative_pairs=(), allow_grid_override=False, allow_grid_check_failure=False):
     if type(topk) is not int or topk <= 0:
         raise ValueError("topk must be positive")
     parts = validate_split(products, split_manifest)
@@ -53,14 +53,18 @@ def evaluate(model, cfg, products, split_manifest, relations, *, topk=5, batch_s
     heldout_ids = {p.product_id for p in heldout}
     if not hard <= different or any(not pair <= heldout_ids for pair in hard):
         raise ValueError("hard negatives must be labelled different and wholly held out")
+    selection = inference_grid_selection(products, cfg, allow_grid_override=allow_grid_override)
+    gate = inference_grid_checks(heldout, cfg["grid"], allow_grid_check_failure=allow_grid_check_failure)
+    blocked = {r["product_id"] for r in gate["products"] if r["gate_status"] == "blocked"}
+    embedding_cache = {}
     rows, recalls, baseline_recalls = [], [], []
     full_results = {}
     for query in heldout:
         candidates = [p for p in heldout if p.product_id != query.product_id]
-        full = search(model, cfg, query, candidates, topk=max(1, len(candidates)), batch_size=batch_size)
+        full = search(model, cfg, query, candidates, topk=max(1, len(candidates)), batch_size=batch_size, allow_grid_override=allow_grid_override, allow_grid_check_failure=allow_grid_check_failure, embedding_cache=embedding_cache)
         full_results[query.product_id] = full
         result = {**full, "rankings": full["rankings"][:topk]}
-        eligible = [p for p in candidates if vocabulary_reason(p, cfg) is None]
+        eligible = [p for p in candidates if vocabulary_reason(p, cfg) is None and p.product_id not in blocked]
         baseline = sorted(((p.product_id, normalized_image_distance(query, p, cfg["grid"])) for p in eligible), key=lambda row: (row[1], row[0]))[:topk] if result["status"] == "available" else []
         positive = {p.product_id for p in eligible if frozenset((query.product_id, p.product_id)) in similar}
         known = sum(frozenset((query.product_id, p.product_id)) in similar | different for p in eligible)
@@ -104,7 +108,7 @@ def evaluate(model, cfg, products, split_manifest, relations, *, topk=5, batch_s
     hard_evaluation = {"status": "available" if all_scored else "partial" if any_scored else "unavailable",
                        "reason": None if all_scored else "none_supplied" if not hard_items else "some_scores_unavailable" if any_scored else "scores_unavailable",
                        "items": hard_items}
-    return {"schema_version": "dl1_evaluation_v1", "approval": approval_status(), "performance_acceptance": "not_established",
+    return {"grid": cfg["grid"], "grid_selection": selection, "grid_gate": gate, "schema_version": "dl1_evaluation_v1", "approval": approval_status(), "performance_acceptance": "not_established",
             "topk": topk, "model_config": cfg, "checkpoint_weights_hash": getattr(model, "weights_hash", None),
             "input_hash": expected_hash, "code_hash": model.training_metadata.get("code_hash"), "split_hash": json_hash(split_manifest), "evaluated_queries": len(recalls),
             "unavailable_queries": len(rows) - len(recalls), "recall_at_k": float(np.mean(recalls)) if recalls else None,
@@ -121,11 +125,14 @@ def main(argv=None):
     ap.add_argument("--hard-negatives", help="optional JSON list of held-out product-ID pairs")
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--allow-grid-override", action="store_true")
+    ap.add_argument("--allow-grid-check-failure", action="store_true")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     model, cfg = load_model(a.ckpt)
     result = evaluate(model, cfg, load_manifest(a.manifest, grid=cfg["grid"]), json.loads(Path(a.split).read_text()),
                       load_relations(a.relations), topk=a.topk, batch_size=a.batch_size,
+                      allow_grid_override=a.allow_grid_override, allow_grid_check_failure=a.allow_grid_check_failure,
                       hard_negative_pairs=json.loads(Path(a.hard_negatives).read_text()) if a.hard_negatives else ())
     Path(a.out).write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 

@@ -63,10 +63,10 @@ The current compatibility images have channels `[self, CNT/VIA union, rest]`. Fo
 
 ## Grid and transform evidence
 
-The validator CLI writes a durable JSON report with the version, pending approval, and one grid check per product:
+The validator CLI writes a durable JSON report with the version, current approval status, and one grid check per product at the manifest candidate grid:
 
 ```bash
-.venv/bin/python -m psdl1.data manifest.json --grid 256 --report grid-report.json
+.venv/bin/python -m psdl1.data manifest.json --report grid-report.json
 ```
 
 Each mask's evidence includes source/target foreground pixel counts, 4-neighbour component counts at a stated target coverage threshold of 0.5, the shortest horizontal/vertical active run, its scaled estimate, and a bridge/component loss flag. Empty foreground has run 0. Axis runs below about 2 candidate pixels produce a warning; this is an auxiliary heuristic, sensitive to corners/diagonals and unrelated to a proven physical minimum linewidth. Real minimum-linewidth acceptance remains G5 pending.
@@ -97,3 +97,5 @@ The bridge example's stored check uses source shape `[16,24]`, grid 6, scale 0.2
 ## Current training grid policy
 
 `candidate_grid` is required and is not inferred from physical pitch or an example configuration. Training uses that manifest value by default. A conflicting explicit grid requires `--allow-grid-override`; a thin-line/bridge failure requires the separate `--allow-grid-check-failure` flag. Both decisions and the evidence are recorded in checkpoint metadata. Reports remain diagnostics, not electrical preservation certificates. The input identity canonicalizes numeric metadata so integer/float JSON serialization of the same physical values has the same fingerprint.
+
+Inference checks the checkpoint grid against every manifest candidate grid. A mismatch requires `--allow-grid-override`, which retains the checkpoint grid and records both values; it does not approve the physical grid. Search and evaluation recompute thin-line and bridge diagnostics for query/candidate/held-out products at the applied grid. A failed query is unavailable and a failed candidate is excluded by default. `--allow-grid-check-failure` records a per-product bypass; the image baseline follows the same eligibility policy. Hand-computed grid reports without the loader's explicit `manifest_candidate_grid` field are diagnostics, not manifest provenance, and cannot supply an implicit trainer grid.

@@ -125,12 +125,12 @@ def resolve_training_grid(products, grid=None, *, allow_grid_override=False):
     if type(allow_grid_override) is not bool:
         raise ValueError("allow_grid_override must be boolean")
     reports = [p.grid_check for p in products]
-    candidates = {r.get("manifest_candidate_grid", r["grid"]) for r in reports if r is not None}
+    candidates = {r["manifest_candidate_grid"] for r in reports if r is not None and "manifest_candidate_grid" in r}
     if len(candidates) > 1:
         raise ValueError("inconsistent manifest candidate_grid values")
     candidate = next(iter(candidates), None)
     if grid is None:
-        if candidate is None or any(r is None for r in reports):
+        if candidate is None or any(r is None or "manifest_candidate_grid" not in r for r in reports):
             raise ValueError("No grid supplied: load a manifest with candidate_grid or specify an explicit API grid")
         grid = candidate
     if type(grid) is not int or grid <= 0:

@@ -14,7 +14,7 @@ from psdl1.train import model_config, structured_batch
 
 def setup_model(products):
     roles, layers = build_vocab(products)
-    cfg = model_config(16, roles, layers)
+    cfg = model_config(products[0].grid_check["manifest_candidate_grid"] if products[0].grid_check else 64, roles, layers)
     return ProductEncoder(len(roles), len(layers)).eval(), cfg
 
 
