@@ -1,5 +1,7 @@
 # psdl1 — DL1 product similarity
 
+> 한국어 사용 안내: 전체 절차와 입력·출력 형식은 **[docs/USAGE.md](docs/USAGE.md)** 에 정리되어 있습니다.
+
 DL1 aims to find products with similar original shapes and electrode connectivity even when unit sizes differ. The user approved **whole-unit isotropic resize + pad and electrode × actual-layer set aggregation on 2026-10-09**, prioritizing shape/connectivity matching over preserving absolute linewidth. Unit-size conditioning is optional and **off by default** so the user can compare it on and off in the closed network. No second original-µm view is implemented.
 
 The real minimum linewidth/grid choice and the source CNT/VIA endpoint metadata format remain open within G5. G6 label-format and closed-network acceptance criteria remain open. The exact encoder, endpoint feature representation, and training recipe are candidates; no real search performance or connectivity preservation has been established. G3 repository naming remains pending.
