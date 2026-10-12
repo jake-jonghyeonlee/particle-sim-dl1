@@ -702,3 +702,47 @@ def test_pillow_large_multiple_idat_and_ancillary_chunks_accepted(tmp_path):
         offset += length + 12
     assert idats > 1
     assert np.argwhere(decode_png(path)[0]).tolist() == [[0, 0], [1499, 1699]]
+
+
+def test_source_replacement_after_validation_cannot_change_snapshot(monkeypatch, tmp_path):
+    import hashlib
+    from png_helpers import raw_png
+    import psdl1.png_source as module
+    path = write_png(tmp_path, "M/A/1-X.png", pixels=((0, 0),))
+    original = path.read_bytes()
+    validate = module._validate_png_structure
+    def replace_after_validation(snapshot, **kwargs):
+        validate(snapshot, **kwargs)
+        # The new on-disk PNG is valid and has different geometry; it must not
+        # influence the already captured/validated decoder snapshot or byte hash.
+        path.write_bytes(raw_png(1203, 1001, 8, 0, (b"\0" + b"\xff" * 1203) * 1001))
+    monkeypatch.setattr(module, "_validate_png_structure", replace_after_validation)
+    model, = module.discover_source(tmp_path).models
+    asset, = model.assets
+    assert asset.mask.sum() == 1 and asset.mask[0, 0]
+    assert asset.file_sha256 == hashlib.sha256(original).hexdigest()
+    assert asset.file_sha256 != hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("depth,entries,packed", [(1, 1, b"\x80"), (2, 2, b"\x80"), (4, 2, b"\x20")])
+def test_palette_index_equal_entry_count_rejected(tmp_path, depth, entries, packed):
+    from png_helpers import raw_png
+    path = tmp_path / "undefined.png"
+    path.write_bytes(raw_png(1, 1, depth, 3, b"\0" + packed,
+                            before_idat=((b"PLTE", b"\0\0\0" * entries),)))
+    with pytest.raises(PNGSourceError) as error:
+        decode_png(path)
+    assert error.value.issue.reason == "palette pixel index has no PLTE entry"
+
+
+def test_pixel_guard_precedes_inflate_and_pillow_open(monkeypatch, tmp_path):
+    from png_helpers import raw_png
+    path = tmp_path / "huge.png"
+    path.write_bytes(raw_png(100000, 100000, 8, 0, b"", idat_parts=(b"not-zlib",)))
+    def forbidden(*args, **kwargs):
+        pytest.fail("over-limit input reached Pillow pixel decoding")
+    monkeypatch.setattr(Image, "open", forbidden)
+    with pytest.raises(PNGSourceError) as error:
+        decode_png(path, png_max_image_pixels=100)
+    assert error.value.issue.exception_class == "DecompressionBombError"
+    assert error.value.issue.pixels == 10_000_000_000

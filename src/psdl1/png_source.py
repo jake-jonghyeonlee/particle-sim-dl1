@@ -5,6 +5,7 @@ geometry nor source names are resampled, registered, thresholded or aliased.
 """
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
+from io import BytesIO
 import hashlib
 import json
 from pathlib import Path
@@ -81,6 +82,17 @@ def _header_shape(path):
         w, h = struct.unpack(">II", header[16:24])
         return h, w
     return None
+
+
+class _PNGBuffer:
+    """Immutable compressed snapshot shared by all decoder/validator reads."""
+    def __init__(self, data):
+        self.data = data
+
+    def open(self, mode="rb"):
+        if mode != "rb":
+            raise ValueError("PNG snapshot is read-only")
+        return BytesIO(self.data)
 
 
 
@@ -273,11 +285,13 @@ def _decode(path, diagnostic_path, policy):
     Image, _ = _pillow()
     shape = None
     try:
-        shape = _header_shape(path)
+        data = path.read_bytes()
+        snapshot = _PNGBuffer(data)
+        shape = _header_shape(snapshot)
         # Validate structure and the finite pixel guard before Pillow can decode
         # (PNG getexif() may itself trigger image.load()).
-        _validate_png_structure(path, policy=policy)
-        with Image.open(path) as image:
+        _validate_png_structure(snapshot, policy=policy)
+        with Image.open(BytesIO(data)) as image:
             if image.format != "PNG":
                 raise ValueError("file is not PNG")
             if getattr(image, "n_frames", 1) != 1:
@@ -299,7 +313,7 @@ def _decode(path, diagnostic_path, policy):
                 raise ValueError("pixels must be exactly black or white (no grey/colour threshold)")
             mask = np.ascontiguousarray(black, dtype=np.bool_)
             mask.flags.writeable = False
-            return mask, mode
+            return mask, mode, hashlib.sha256(data).hexdigest()
     except Exception as exc:
         raise PNGSourceError(SourceIssue(diagnostic_path, str(exc), type(exc).__name__, shape,
                                          shape[0] * shape[1] if shape else None,
@@ -310,7 +324,7 @@ def decode_png(path, *, png_max_image_pixels=None):
     """Standalone strict decoder returning (bool mask, original mode, policy)."""
     path = Path(path)
     with decoder_session(png_max_image_pixels) as policy:
-        mask, mode = _decode(path, str(path), policy)
+        mask, mode, _ = _decode(path, str(path), policy)
         return mask, mode, policy
 
 
@@ -412,7 +426,7 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
                     else:
                         stacks[stack], stack_paths[stack] = layer, rel(path)
                     try:
-                        mask, mode = _decode(path, rel(path), policy)
+                        mask, mode, file_hash = _decode(path, rel(path), policy)
                         source_binding = (model_dir.name, "cno" if is_cnt else "electrode",
                                           None if is_cnt else folder.name, stack, layer)
                         asset_id = canonical_id("asset", source_binding)
@@ -420,7 +434,7 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
                         assets.append(SourceAsset(
                             asset_id, model_dir.name, source_binding[1],
                             source_binding[2], source_binding[2], stack, layer, rel(path), path.name,
-                            hashlib.sha256(path.read_bytes()).hexdigest(), mask_hash(mask), mode,
+                            file_hash, mask_hash(mask), mode,
                             tuple(mask.shape), mask))
                     except PNGSourceError as exc:
                         model_errors.append(exc.issue)

@@ -411,3 +411,83 @@ tests/test_png_scale.py` → **212 passed**; `PYTHONDONTWRITEBYTECODE=1 .venv/bi
 The mixed resolved/unresolved fixture still matches the archived 105acea asset/frame/
 component/relation/endpoint/mask and Product input identities byte-for-byte; evidence
 is `fa2-identity.json` under the earlier FA identity scratch directory.
+
+## Inspect/export bundles (T3)
+
+`python -m psdl1.import_png` now implements the frozen inspect/export/verify CLI.
+Inspection needs no metadata or grid, writes `import-report.json` plus `preview.html`
+for valid models, and lists all source warnings/errors, exact per-model/union/unique
+vocabulary, duplicate geometry and resource estimates. These records are saved and
+surfaced before full-frame grid/Product allocations or export writes. Explicit
+`--inspect-grids` only compares supplied candidates; there is no automatic grid choice.
+The interim rounded transform records match the existing recipe; T4 consolidates them.
+
+Export requires complete explicit metadata and a candidate grid. One invalid model blocks
+the entire export pool; missing/invalid metadata/grid yields a diagnostic-only published
+bundle and nonzero exit. Valid unresolved CNT components remain in the global CNT union.
+Every generated NPY is bool, and full frame extent goes into the unchanged strict v1
+manifest's compatibility size field. Connection masks are materialized/written one at
+a time; the staged `load_manifest` and `validate_product` boundary is still eager and
+adds its documented float32/validation/grid allocations. Report Product input identities
+come from that unchanged staged loader.
+
+Output must be new and outside the source tree. A sibling `.staging-*` receives the
+report, local previews and assets; a pending manifest becomes `manifest.json` only after
+staged validation. Native atomic no-replace directory rename publishes the complete
+bundle (Darwin RENAME_EXCL/Linux RENAME_NOREPLACE/Windows refusing existing destinations).
+Even a concurrently created empty destination is refused. Failures preserve staging
+and report its location. The importer never removes/replaces an existing destination.
+
+`bundle-integrity.json` (`dl1_png_bundle_v1`) binds hashes of report/manifest/NPY/HTML/raster
+files; the report also binds manifest/assets and records Product input identities.
+`--verify-bundle` validates contained paths, file hashes, supported versions, exact listed
+files, manifest/report/asset links and bool mask headers without source PNGs or a full
+legacy load. It is corruption detection, not signed authenticity or electrical truth.
+A copied bundle remains verifiable offline. Strict sidecar fields stay outside the core
+manifest; the existing loader continues rejecting them if injected into it.
+
+The coordinator-authorized R-A3 C1 fix captures each PNG's compressed bytes once, then
+validates, decodes via BytesIO and hashes that immutable snapshot. Replacing a source
+file after validation cannot change its decoded geometry/provenance hash. Resource notes
+now separately disclose observed transient decoder cost (~17–18 bytes/pixel), compressed
+snapshot storage and retained bool source masks across all models. These notes do not
+bound peak RAM or approve real resources. Duplicate mask/model geometry produces explicit
+possible-alias/duplicate warnings; no source name or product is merged or silently omitted.
+Actual runtime Pillow version is recorded and a different version from pinned/tested
+12.3.0 is warned, without runtime replacement. Approved wheelhouse/build constraints and
+intentional PNG strictness/re-save remedy appear in USAGE.
+
+`status_summary` explicitly distinguishes extractor run (`ran/blocked`), extraction
+coverage (`complete/partial/unavailable`), model connectivity status (`available/partial/
+unavailable`) and unevaluated checkpoint vocabulary eligibility. Legacy per-model
+`extraction_status: complete` means the extractor ran, never coverage or certification.
+Electrical and real-data validation stay `not_performed`. This status distinction and
+all warnings appear in preview as well as report.
+
+Pillow raster previews provide a downscaled **full-frame** overview with actual XY display
+scale, local toggleable source layers, a reference-only core rectangle and resolved/
+unresolved/needs-confirmation markers. Every component has a bbox-local original-resolution
+image with original offset and candidate/skipped-layer evidence; these display crops never
+enter model input. CSS magnification and browser scrolling are display aids only. Source
+names are HTML-escaped; images and scripts are bundle-local, with no CDN/fetch/font assets.
+
+T3 validation: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider
+ tests/test_png_import.py tests/test_png_preview.py tests/test_png_source.py
+ tests/test_png_connections.py` → **233 passed**; full default suite
+`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -p no:warnings`
+→ **430 passed, 1 existing skip**. The real importer CLI exported >1000-pixel-axis synthetic
+frames; unchanged `load_manifest` and `python -m psdl1.data MANIFEST --report REPORT` passed.
+Every generated mask was bool and independently hand-specified payload/header bytes matched.
+Tests also covered publication interruption, existing/empty destination refusal, metadata
+pool completeness, source relocation, hash tampering, explicit optional grids and failed
+grid diagnostics, source warning/runtime-version display and immutable compressed snapshots.
+
+Synthetic manual preview evidence: `/tmp/dl1-png-preview-evidence/t3-inspection/preview.html`,
+with sealed `import-report.json`, `bundle-integrity.json` and Pillow rasters beside it.
+The frame is 1401×1603 and contains margin/direct resolved, skipped-layer needs-confirmation
+and ambiguous components. Full-frame marker/core placement and magnified source crops were
+visually inspected; original offsets/polarity/endpoint centres are correct. The montage
+`/tmp/dl1-png-preview-evidence/t3-visual-check.png` is outside the sealed bundle and solely
+inspection evidence. `--verify-bundle` passed for the preview bundle. C1/C3 decoder/test
+file changes were explicitly authorized by the coordinator's T3 scope addition; no core
+schema/model/NPY-loader/lock change or installation occurred.

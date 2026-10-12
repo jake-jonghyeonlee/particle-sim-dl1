@@ -135,7 +135,9 @@ class ResourceEstimate:
     unknown_reasons: tuple[str, ...] = ("extraction_not_run",)
     excludes: tuple[str, ...] = ("manifest", "report", "preview")
     overhead_note: str = ("Not peak RAM or runtime prediction; temporary arrays, labels, decoder "
-                          "buffers, Python objects, grid tensors and validation add overhead.")
+                          "buffers, Python objects, grid tensors and validation add overhead; "
+                          "PNG decoding can transiently use about 17–18 bytes/pixel plus its compressed "
+                          "snapshot, and inventory retains about one bool byte/pixel/asset across all models.")
 
 
 @dataclass(frozen=True)
@@ -240,6 +242,13 @@ class ImportReport:
     generated_manifest_sha256: str | None = None
     generated_asset_hashes: tuple[tuple[str, str], ...] = ()
     product_input_identities: tuple[tuple[str, str], ...] = ()
+    candidate_grid: int | None = None
+    pending_prerequisites: tuple[str, ...] = ()
+    diagnostics: tuple[SourceIssue, ...] = ()
+    duplicate_geometry: tuple[dict, ...] = ()
+    preview: tuple[dict, ...] = ()
+    status_summary: tuple[dict, ...] = ()
+    extraction_run_meaning: str = "extractor_ran; distinct_from_extraction_coverage_and_model_status"
 
 
 def require_report_version(report: dict) -> None:

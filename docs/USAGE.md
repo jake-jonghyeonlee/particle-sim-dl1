@@ -55,7 +55,7 @@ data/
 | 크기 | 그 제품의 `frame.shape_yx`와 같아야 한다. 읽을 때 크기를 바꾸지 않는다 |
 | 경로 | manifest 폴더 기준 상대 경로. 절대 경로, `..`, 폴더 밖 symlink는 거부 |
 
-이 reader에는 극성 선택이 없다. **검정이 형상인 이미지는 0/1을 뒤집어 저장한 뒤 넣어야 한다.** (layout 이미지의 극성은 아직 확인되지 않은 항목이다.)
+이 NPY reader에는 극성 선택이 없다. 검정 원천 PNG는 아래 PNG importer를 통해 검정=1인 bool NPY로 변환한다. PNG의 극성은 검정 형상 / 흰 배경으로 확정되어 있다.
 
 ### 3.3 `manifest.json` — schema `dl1_shape_v1_draft`
 
@@ -281,10 +281,102 @@ P1,P3,different
 
 - 실제 격자 크기(`candidate_grid`): 가장 가는 선폭 기준
 - CNT/VIA 끝점 정보가 들어오는 실제 형식
-- layout 이미지의 극성과 파일 형식(지금은 `.npy`, 0이 아닌 값이 형상)
+- 실제 PNG writer/mode 및 관측 범위 확인(검정 형상/흰 배경, 0.1 µm/pixel은 확정; 내부 `.npy`는 1이 형상)
 - 정답 형식과 수락 기준
 - 공개 가중치를 쓸지 여부와 licence
 
 ## 7. 수치 저장소와의 연결
 
 검색 결과 JSON은 `particle-sim-compare`의 `simcompare.dl_results`가 파일로 읽어 원본 CA·line/pixel 값 옆에 붙인다. DL 점수는 수치 값을 바꾸지 않는다. 절차는 그 저장소의 `docs/handoff/commands.md`에 있다.
+
+## 8. 실제 PNG 폴더 입력 — 검사 → 명시적 export
+
+PNG 원천은 `<root>/<model>/<electrode>/<seq>-<layer>.png`, CNT는
+`<root>/<model>/cno/<seq>_<layer>.png`다. 숫자는 모델 공통 위→아래 stack이며
+zero padding은 같은 숫자로 해석한다. 첫 `-`/`_` 뒤 전체 문자열이 정확한 layer명이다.
+검정=형상(1), 흰색=배경(0), 원본 pitch=**0.1 µm/pixel**이다. 위 NPY manifest의
+0.05 예시는 과거의 임의 합성 NPY 예시이며 실제 PNG pitch를 뜻하지 않는다.
+원점은 모델별 로컬 `[0,0]`, 전체 frame 범위는 `[W*0.1,H*0.1]` µm다.
+기존 `unit_size_um`에도 이 **전체 frame 범위**를 넣는다. 단일 unit 크기를 추정하지 않는다.
+중앙 core `[500,500,W-500,H-500]`는 참고 사각형이며 실제 주변 패턴을 제거하지 않는다.
+모델 입력은 전체 frame의 기존 공통 resize+pad다. 자동 crop/타일/별칭 mapping은 없다.
+
+PNG 기능은 optional `png` dependency를 쓴다. 승인된 폐쇄망 wheelhouse에 **Pillow
+12.3.0**의 해당 OS/Python wheel이 있어야 하며, package build를 한다면 hatchling의
+wheel도 필요하다(현재 runtime lock에 build wheel이 포함되었다는 뜻이 아니다).
+기존 NPY 경로는 Pillow 없이도 작동한다. importer는 실제 실행 중 Pillow 버전을
+보고서에 기록하며, 12.3.0과 다르면 경고한다. dependency pin을 runtime에서 강제
+교체하거나 네트워크로 설치하지 않는다.
+
+회색/색상/반투명 픽셀, grey/RGB의 모든 tRNS, 사용하지 않는 항목도 포함한
+non-255 palette alpha, IEND 뒤 바이트, 모든 chunk의 잘못된 CRC, APNG chunk
+(단일 frame APNG도 포함), 비정상 방향 metadata는 거부된다. 이런 실제 파일은
+**plain opaque black/white PNG로 다시 저장**한 뒤 검사한다. importer가 몰래 고치지 않는다.
+
+아래 경로와 변수는 사용자가 실제 값으로 정한다. grid 기본값/권장 숫자는 없다.
+출력은 입력 tree 밖의 **새 폴더**여야 한다. 기존 출력은 빈 폴더여도 덮어쓰지 않는다.
+
+```bash
+# lineage/grid 없이 원본 해상도 검사, 연결 후보/미해결/자원/이름 inventory와 preview
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$INSPECT_OUT"
+
+# 사용자가 정한 여러 grid를 비교만 한다: 자동 선택/승인이 아님
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$GRID_INSPECT_OUT" \
+  --inspect-grids "$GRID_A" "$GRID_B"
+
+# 명시적 metadata + 후보 grid로 기존 v1 manifest와 bool NPY를 자동 생성
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$EXPORT_OUT" \
+  --export --metadata "$METADATA_JSON" --candidate-grid "$CANDIDATE_GRID"
+
+# 원천 PNG가 없는 복사 bundle에서도 파일 hash / manifest-report-asset 연결 검사
+.venv/bin/python -m psdl1.import_png --verify-bundle "$EXPORT_OUT"
+.venv/bin/python -m psdl1.data "$EXPORT_OUT/manifest.json" --report "$VALIDATOR_REPORT"
+```
+
+metadata는 `metadata_schema_version: dl1_png_metadata_v1`과 `models` mapping을
+가진다. 각 정확한 모델 폴더명에 사용자가 `lineage_id`, `design_version`을 공급한다.
+[예시](../configs/png-metadata.example.json)의 값은 눈에 띄게 **합성 예시**이며
+실제 가족/버전 정보가 아니다. 폴더명에서 추정하지 않는다. 검사 중 부분 mapping은
+pending으로 보고한다. export에 metadata/grid가 빠지거나 한 모델이라도 입력 오류가
+있으면 진단 보고서/유효 모델 preview만 쓰고 nonzero로 종료한다. `manifest.json`이나
+부분 학습 pool은 생성하지 않는다. 미해결 CNT 관계 자체는 입력 오류가 아니며 global
+CNT에는 미해결 형상도 남는다. Label/split은 자동으로 만들거나 승인하지 않는다.
+
+`import-report.json`은 `dl1_png_import_v1` sidecar이며 core manifest에 임의 필드를
+추가하지 않는다. `bundle-integrity.json`은 보고서/manifest/NPY/preview의 파일 SHA-256을
+묶는다. 검사는 전기적 진실/서명 인증이 아닌 bundle 손상 탐지다. PNG 원천은 한 번
+읽은 compressed snapshot으로 검증·decode·hash하므로 import 중 파일 교체가 현재
+snapshot의 mask/hash를 바꾸지 않는다. 게시 전 sibling `.staging-*`에서 검증하고 새
+폴더로 원자적으로 게시한다. 실패한 staging은 자동 삭제하지 않고 stderr 경로로
+남긴다. 중단된 staging은 model-ready 최종 bundle로 취급하지 말고 새 출력 경로로 재실행한다.
+
+보고서의 모델별 `resource_estimate`와 정확한 role/layer 목록은 grid 평가/export
+크기의 배열을 만들기 전에 저장하고 stdout에 출력한다. N/E/K/R, 생성 mask 수,
+bool NPY payload/header 합계, loader의 retained float32 mask bytes 및 K개 모두 해결
+시나리오를 본다. 이는 peak RAM/runtime 예측이 아니다. 기존 v1의 관계당 전체 frame
+mask, grid tensors/검증 복사, decoder 임시 RGBA/boolean 배열(합성 관측 약 17–18
+bytes/pixel), compressed snapshot, **모든 모델의 모든 source bool mask 보관** 비용이
+더해진다. 실제 자원 적합성은 사용자가 판단한다; 자동 수치 limit를 추정하지 않는다.
+
+role은 전극 폴더명이고 layer는 suffix 그대로다. checkpoint 학습 vocabulary에 없는
+query 이름은 unavailable, 후보는 이유를 붙여 excluded, 직접 embedding은 명확한
+오류가 된다. 같은 이름은 embedding symbol을 공유하지만 물리/전기적 동등성이
+검증되었다는 뜻이 아니다. 이름 union/unique 목록만으로 checkpoint coverage를
+인증할 수 없다. 동일 mask/모델 geometry 경고는 내부 symlink alias나 중복 제품
+가능성을 보여주며 자동 merge/drop하지 않는다. NFC/NFD 이름도 정확하게 구분한다.
+
+세 상태의 뜻을 구분한다: `extractor_run: ran`은 extractor가 실행됨, extraction
+coverage `complete/partial/unavailable`은 규칙에 따라 해결한 범위, model connectivity
+status `available/partial/unavailable`은 기존 모델 status 입력이다.
+**complete means extraction coverage only; electrical verification not performed.**
+이 coverage는 실제 모델의 세 가지 connectivity embedding 입력에 반영된다. 같은 mask라도
+partial→complete이면 모델 입력/identity가 바뀔 수 있다. skipped-layer
+`needs_confirmation`은 preview/sidecar의 물리 확인 요청이며 추가 model status가 아니다.
+4-neighbour/nearest-overlap skipped-layer 규칙은 구현 해석이고 실제 전기 검증이 아니다.
+
+`preview.html`은 인터넷 없이 연다. 전체 frame 축(x 오른쪽/y 아래), 레이어 토글,
+reference-only core, 원본 bbox offset의 component display crop, 해결/미해결/확인 필요
+표시와 후보/건너뛴 전극·cno 목록을 보여준다. **Display crop은 사람이 보는 용도이며
+model input은 항상 전체 frame**이다. Inspector는 연결을 전기적으로 승인하는 control이 아니다.
+실제 데이터 호환성과 검색 품질/G6는 폐쇄망 결과로 별도 평가한다. 5–10개 다양한 제품
+pilot은 import/연결 검사 pilot일 뿐 학습 자료 수나 검색 성능의 승인 기준이 아니다.

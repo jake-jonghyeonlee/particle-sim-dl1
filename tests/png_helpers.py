@@ -73,3 +73,22 @@ def encode_adam7_binary(pattern, depth, colour):
                     value |= sample << (8 - depth * (i + 1))
                 rows.append(value)
     return bytes(rows)
+
+
+def write_import_fixture(root, *, model="SYNTHETIC-M", shape=(1001, 1203)):
+    """Four disjoint contacts: direct, skipped/confirmation, ambiguous and margin.
+
+    Expected relation centres are (601,601), (701,701), (21,21); the contact at
+    (801,801) overlaps two lower electrodes and stays unresolved.
+    """
+    def square(y, x):
+        return tuple((y + dy, x + dx) for dy in range(3) for dx in range(3))
+    direct, skipped, ambiguous, margin = square(600, 600), square(700, 700), square(800, 800), square(20, 20)
+    write_model(root, [
+        ("A", "1-U.png", skipped), ("A", "5-U5.png", direct + ambiguous + margin),
+        ("N", "3-N.png", ((900, 900),)),
+        ("B", "7-L.png", direct + skipped + ambiguous + margin),
+        ("D", "7-L.png", ambiguous),
+        ("cno", "4_C4.png", ()),
+        ("cno", "006_C6.png", direct + skipped + ambiguous + margin),
+    ], shape=shape, model=model)

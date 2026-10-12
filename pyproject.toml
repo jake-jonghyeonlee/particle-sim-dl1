@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 psdl1-validate = "psdl1.data:main"
+psdl1-import-png = "psdl1.import_png:main"
 
 [project.optional-dependencies]
 png = ["Pillow==12.3.0"]

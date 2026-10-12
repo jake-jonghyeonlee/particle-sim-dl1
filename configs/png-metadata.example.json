@@ -1,0 +1,9 @@
+{
+  "metadata_schema_version": "dl1_png_metadata_v1",
+  "models": {
+    "SYNTHETIC-EXAMPLE-MODEL-REPLACE-WITH-EXACT-SOURCE-NAME": {
+      "lineage_id": "SYNTHETIC-EXAMPLE-ONLY-REPLACE-WITH-USER-FAMILY",
+      "design_version": "SYNTHETIC-EXAMPLE-ONLY-REPLACE-WITH-USER-VERSION"
+    }
+  }
+}
