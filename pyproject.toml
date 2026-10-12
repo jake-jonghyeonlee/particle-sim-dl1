@@ -13,6 +13,7 @@ dependencies = [
 psdl1-validate = "psdl1.data:main"
 
 [project.optional-dependencies]
+png = ["Pillow==12.3.0"]
 local-weights = ["safetensors>=0.8"]
 timm = ["timm>=1.0"]
 

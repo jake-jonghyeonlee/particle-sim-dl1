@@ -99,3 +99,85 @@ The bridge example's stored check uses source shape `[16,24]`, grid 6, scale 0.2
 `candidate_grid` is required and is not inferred from physical pitch or an example configuration. Training uses that manifest value by default. A conflicting explicit grid requires `--allow-grid-override`; a thin-line/bridge failure requires the separate `--allow-grid-check-failure` flag. Both decisions and the evidence are recorded in checkpoint metadata. Reports remain diagnostics, not electrical preservation certificates. The input identity canonicalizes numeric metadata so integer/float JSON serialization of the same physical values has the same fingerprint.
 
 Inference checks the checkpoint grid against every manifest candidate grid. A mismatch requires `--allow-grid-override`, which retains the checkpoint grid and records both values; it does not approve the physical grid. Search and evaluation recompute thin-line and bridge diagnostics for query/candidate/held-out products at the applied grid. A failed query is unavailable and a failed candidate is excluded by default. `--allow-grid-check-failure` records a per-product bypass; the image baseline follows the same eligibility policy. Hand-computed grid reports without the loader's explicit `manifest_candidate_grid` field are diagnostics, not manifest provenance, and cannot supply an implicit trainer grid.
+
+## PNG source adapter contract (T1)
+
+The separate `png_source` adapter discovers `<root>/<model>/<electrode>/<seq>-<layer>.png`
+and `<root>/<model>/cno/<seq>_<layer>.png`. The first hyphen or underscore after a
+positive integer separates stack from the exact layer suffix; subsequent separators
+belong to the name. Zero padding normalizes the numeric stack, while original filenames
+and relative paths remain provenance. Stack numbers increase downwards and are model-wide.
+Same-stack conflicting names, duplicate electrode/layer bindings (including repeated
+bindings at another stack), malformed PNG names, shape mismatches, unsupported directory
+layouts and escaping symlinks invalidate the model. Unrelated files are inventory warnings.
+A repeated layer name at distinct stacks is reported and preserved, never merged; a
+binding collision blocks use in the existing v1 export. `cno` is reserved for CNT.
+
+Decoding requires optional `psdl1[png]` (Pillow 12.3.0, already in the lock snapshot);
+Pillow is imported lazily and the existing NPY path remains independent. Use approved
+offline wheels; this dependency declaration does not provide or download wheels.
+Single-frame modes 1/L/RGB/LA/RGBA/P are accepted only when decoded RGB is exactly black
+or white and alpha is fully opaque. Black becomes bool foreground 1; white becomes 0.
+Palette and transparency expansion is exact. Grey, colour, transparent pixels,
+16-bit/unsupported modes, nonidentity EXIF orientation, animated or corrupt PNG fail
+with file paths. No threshold, gamma adjustment, rotation, registration or resampling
+is performed. Empty observed foreground is valid.
+
+The installed Pillow finite pixel guard is retained. Its warning and hard error are
+both file errors, recording dimensions/pixels when available, exception class, Pillow
+version and effective limit. `png_max_image_pixels` is an explicit positive integer
+override, recorded together with the prior default and restored in `finally`; it never
+disables the guard. Decoding sessions are serial while the global override is active.
+An externally disabled Pillow guard requires an explicit finite override. Resource
+suitability is pending; no threshold here approves real data.
+
+The source frame uses shape `[H,W]`, pitch **0.1 µm/pixel**, local edge origin `[0,0]`,
+full extent `[W*0.1,H*0.1]` and centre coordinates `[(x+0.5)*0.1,(y+0.5)*0.1]`.
+Both W and H must exceed 1000. The reference-only core bbox is the half-open rectangle
+`[500,500,W-500,H-500]`, with core layout `[2,2]` and unknown single-unit extent.
+All real margin patterns remain in input. Alignment is a source assertion, not measured
+registration. `unit_size_um` in a future v1 export will carry the **full frame extent**,
+without claiming a single physical unit. No core crop or tiling is performed.
+
+Exact sorted role/layer sets are recorded per model, across-model unions and names unique
+to one model; repeated assets count once per model. Roles are electrode folder names.
+These inventories cannot certify checkpoint vocabulary coverage. Unknown symbols retain
+the existing embedding/search diagnostics; equal names share embedding symbols without
+proving electrical or functional equivalence. No aliases are inferred.
+
+Canonical identities use sorted UTF-8 JSON plus SHA-256, independent of source root and
+enumeration order. Asset binding identity contains model/kind/electrode/numeric stack/layer;
+frame identity contains the local geometry. Binary-mask hashes include shape and bool
+pixels, separately from source-file byte hashes. Component identity uses original bbox,
+frame shape and local binary geometry, with no full-frame component allocation. Original
+filename changes/re-encoding may change provenance without changing logical geometry.
+
+Metadata is a strict JSON object with exactly `metadata_schema_version` and `models`:
+
+```json
+{"metadata_schema_version":"dl1_png_metadata_v1","models":{"MODEL":{"lineage_id":"USER_FAMILY","design_version":"USER_VERSION"}}}
+```
+
+Each mapping entry contains exactly the two nonempty trimmed strings shown. Duplicate
+keys, unknown discovered-model names, wrong versions/types, extra fields and invalid
+strings fail. Inspection permits partial metadata and explicitly lists pending models;
+export requires all discovered models mapped. Nothing is inferred from folder names.
+
+`png_contract` freezes source, metadata, report, CLI-options and resource records. The
+sidecar version is `report_schema_version: dl1_png_import_v1`; readers reject other
+versions. Resource estimates begin unknown with reasons until extraction fills N/E/K/R,
+CNT indicator U, generated-mask count, bool payload/actual NPY-header/total bytes,
+retained float32 loader bytes and the all-components-resolved scenario. They exclude
+manifest/report/preview bytes and do not predict peak RAM or runtime. Invalid inputs
+never receive reassuring zero estimates. Electrical and real-data verification remain
+`not_performed`. The 4-neighbour/skipped-layer policy is an implementation interpretation,
+not an additional user-confirmed physical fact. T1 emits no connections.
+
+The frozen CLI spelling for subsequent T3 implementation is
+`python -m psdl1.import_png --root ROOT --out OUTPUT` for inspection,
+`--inspect-grids G [G ...]` for explicit optional grid evidence,
+`--png-max-image-pixels N` for the explicit finite decoder limit, and
+`--export --metadata METADATA_JSON --candidate-grid G` for model-ready export.
+`--verify-bundle BUNDLE` verifies a published bundle without sources. No grid is chosen
+by default. T1 supplies contracts/APIs; the importer CLI and export/preview are T3 work.
+Existing schema/model-input versions, NPY loader and requirements lock are unchanged.
