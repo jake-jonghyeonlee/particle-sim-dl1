@@ -266,3 +266,79 @@ For this fixture M=305, projected bool payload=1,220,000,000 bytes, headers=39,0
 NPY total=1,220,039,040 bytes and retained float32 masks=4,880,000,000 bytes. The K scenario
 has M=306, NPY total=1,224,039,168 bytes and float32 masks=4,896,000,000 bytes. A single
 synthetic bool NPY under test `tmp_path` independently checks the 128-byte header.
+
+## R-A strict decoder and cost corrections (FA)
+
+The independent R-A review of T1+T2 identified malformed streams that Pillow 12.3.0
+accepted, sometimes fabricating black foreground. The decoder now verifies PNG structure
+independently of Pillow before trusting pixels: signature, IHDR-first/unique, legal
+bit-depth/colour combinations, compression/filter methods 0, interlace 0 or Adam7,
+PLTE-before-IDAT where applicable, contiguous IDAT, critical chunk order, chunk CRCs,
+IEND-last and no trailing bytes. Unknown critical chunks fail. Concatenated IDAT is
+stream-inflated in bounded blocks; its output must have **exactly** the IHDR scanline
+byte count, including each nonempty Adam7 pass's filter bytes and packed row sizes.
+Short, long, incomplete or extra zlib streams and invalid scanline filter types fail
+with per-file paths. The check retains bounded blocks and row buffers, not several
+full-file or full-inflated-image copies. Pillow's pixel guard is checked before
+inflation and remains finite under the previously documented explicit override policy.
+
+Palette PNG requires PLTE and every actual pixel index must reference one of its entries;
+packed samples are checked in their original bit depth after exact PNG unfiltering.
+Padding bits at the end of a packed row are not pixels. Every non-palette tRNS chunk
+(including grayscale and RGB) is unsupported and rejected, even if its sample is unused.
+Palette tRNS is accepted only when **every supplied alpha is 255**, including unused
+entries; missing alpha entries imply 255. This intentionally conservative rule avoids
+Pillow's 2/4-bit grayscale transparency scaling ambiguity. Ordinary explicit-alpha
+LA/RGBA still requires every decoded pixel to be fully opaque. No valid opaque black/white
+mask geometry, identity or source file is changed.
+
+An empty electrode folder now gives a warning instead of disappearing silently.
+Case-insensitive variants of the reserved CNT directory, such as `CNO` or `Cno`, are
+errors naming exact `cno`; no case alias is created. Every directory directly under
+source root is treated as a model, so non-model directories such as `__MACOSX`, `.hidden`
+or `.ipynb_checkpoints` invalidate the inventory if they do not meet the source layout.
+Unrelated root files remain warnings. Names are compared byte-exactly: NFC and NFD
+spellings differ and no Unicode normalisation is applied. Non-NFC model/electrode/layer
+names produce path-specific warnings while their original names/identities are preserved;
+a move between filesystems may therefore change identities if names are rewritten.
+
+S23 now instruments `component_slice` itself: 302 comparisons must receive bbox-sized
+label windows sharing the source label array's memory, before any `==` allocation.
+Bypassing that helper for a full-frame `labels == label` fails the counter, and handing
+the helper a full-frame array fails its shape check. The diagonal component test includes
+both mirrored orientations. Each component's local binary mask is hashed **once** and
+its hash is reused in the existing canonical component ID; the resulting bytes/IDs are
+unchanged. S23's updated hash count is 603 (302 component hashes plus 301 common-contact
+hashes); the original T2 measurement/counts above are historical evidence.
+
+Representative-pixel selection uses NumPy int64 arithmetic only when Python-integer
+bounds prove that each numerator and the sum of squared terms fit in int64. Otherwise
+it uses exact Python integers over coordinate arrays without allocating a per-pixel
+Python tuple list. Both paths preserve y/x tie breaking and are compared on 300 seeded
+random masks against an independent `fractions.Fraction` centroid-distance reference.
+Extraction semantics and the 2-second S23 test-only guard are unchanged.
+
+FA validation evidence: all five short-stream B1 reproductions (63/32/1/0 of 64 one-bit
+rows and 3 of 4 eight-bit rows) reject; B2 white/black tRNS at depths 1/2/4/8 reject;
+B3 missing PLTE and undefined index 3 at depths 2/4/8 reject. All eight N5 cases, including
+trailing/concatenated PNG bytes, missing CRC/IEND, wrong IDAT CRC, invalid compression/
+filter/interlace methods and overlong inflated streams, reject. Valid opaque fixtures,
+exact Adam7 passes, palette PNG filters 0–4 and split IDAT streams pass.
+
+Both requested mutation checks ran only in scratch package copies with verified import
+paths (`/tmp/dl1-ra-fa-mutants.vkvl_2b9`), without modifying repository files:
+`local = (labels == box.label)[window]` made S23 fail (0 rather than 302 slice calls),
+and `previous[k][0] <= x1` made the mirrored diagonal test fail (one component instead
+of two); each isolated pytest invocation exited 1 with exactly one failed test.
+An archived source snapshot of `105acea9c475678cc160b85f398d68928729f90d` and the fixed
+candidate separately decoded/extracted the same synthetic ring plus unresolved component;
+asset/frame/component/relation/endpoint/mask hashes and Product input identity matched
+exactly (`/tmp/dl1-ra-fa-identity.qy9oc0i9`). Final S23 measurement after these changes was
+0.043456 seconds on the same documented machine/environment, under the unchanged 2-second
+guard. Temporary scratch outputs are review evidence, not committed input assets.
+
+FA acceptance commands: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p
+no:cacheprovider tests/test_png_source.py tests/test_png_connections.py
+tests/test_png_scale.py` → **155 passed**; `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python
+-m pytest -p no:cacheprovider -p no:warnings` → **350 passed, 1 existing skip**.
+The unchanged default suite remains offline; no package installation was performed.

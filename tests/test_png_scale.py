@@ -28,12 +28,14 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
                            ("cno", "6_C.png", pixels)], shape=(2000, 2000))
     model, = discover_source(tmp_path).models
     assert model.valid
-    operations = {"overlap": 0, "joint": 0, "representative": 0, "hash": 0, "full_labels": 0}
+    operations = {"slice": 0, "overlap": 0, "joint": 0, "representative": 0, "hash": 0, "full_labels": 0}
     original_overlap = extraction.overlap_pixels
     original_joint = extraction.common_intersection
     original_rep = extraction.representative_pixel
     original_hash = contract.mask_hash
     original_labels = extraction.label_components
+    original_slice = extraction.component_slice
+    source_labels = []
     def local_only(mask):
         assert mask.shape in {(2, 2), (200, 200), (3, 500)}
     def check_overlap(c, e):
@@ -57,7 +59,15 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
             assert m is model.cnt_assets[0].mask
         else:
             local_only(m)
-        return original_labels(m)
+        labels, boxes = original_labels(m)
+        if m.shape == (2000, 2000):
+            source_labels.append(labels)
+        return labels, boxes
+    def check_slice(label_window, label):
+        local_only(label_window)
+        assert np.shares_memory(label_window, source_labels[0])
+        operations["slice"] += 1
+        return original_slice(label_window, label)
     def forbidden_full_mask(c):
         pytest.fail("scale inspection materialized a full-frame connection mask")
     monkeypatch.setattr(extraction, "overlap_pixels", check_overlap)
@@ -67,6 +77,7 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
     monkeypatch.setattr(contract, "mask_hash", check_hash)
     monkeypatch.setattr(extraction, "label_components", check_labels)
     monkeypatch.setattr(extraction, "component_mask", forbidden_full_mask)
+    monkeypatch.setattr(extraction, "component_slice", check_slice)
     started = time.perf_counter()
     result = extraction.extract_model(model)
     elapsed = time.perf_counter() - started
@@ -76,7 +87,7 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
     assert elapsed < SCALE_REGRESSION_SECONDS
     assert result.summary.component_count == 302 and result.summary.resolved_relation_count == 301
     assert result.summary.unresolved_component_count == 1 and result.connectivity_observation == "partial"
-    assert operations == {"overlap": 604, "joint": 301, "representative": 301, "hash": 905, "full_labels": 1}
+    assert operations == {"slice": 302, "overlap": 604, "joint": 301, "representative": 301, "hash": 603, "full_labels": 1}
     expected_origins = origins[:-1] + [(1099, 1099), (1501, 1149)]
     assert [r.representative_xy_px for r in result.relations] == [(x, y) for y, x in expected_origins]
     for r, (y, x) in zip(result.relations, expected_origins):

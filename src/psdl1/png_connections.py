@@ -107,19 +107,31 @@ def common_intersection(component_mask, upper_slice, lower_slice):
 
 
 def representative_pixel(intersection):
-    """Local (x,y), exact rational-centroid distance; y/x ties, Python integers.
-
-    Python integers avoid overflow even for very large or widely spanning regions.
-    """
+    """Exact centroid distance with y/x ties; vectorize only with proven int64 bounds."""
     ys, xs = np.nonzero(intersection)
     count = len(xs)
     if not count:
         raise ValueError("representative pixel requires nonempty intersection")
-    points = [(int(y), int(x)) for y, x in zip(ys, xs)]
-    sum_y, sum_x = sum(y for y, _ in points), sum(x for _, x in points)
-    y, x = min(points, key=lambda p: ((count * p[0] - sum_y) ** 2 +
-                                    (count * p[1] - sum_x) ** 2, p[0], p[1]))
-    return x, y
+    maximum = np.iinfo(np.int64).max
+    # count*max coordinate bounds each sum, product and centroid numerator;
+    # the sum of squared bounds then bounds every compared distance.
+    bound_y, bound_x = count * int(ys.max()), count * int(xs.max())
+    if bound_y ** 2 + bound_x ** 2 <= maximum:
+        dy = ys.astype(np.int64) * count - ys.sum(dtype=np.int64)
+        dx = xs.astype(np.int64) * count - xs.sum(dtype=np.int64)
+        index = int(np.argmin(dy * dy + dx * dx))  # nonzero order is y then x
+        return int(xs[index]), int(ys[index])
+    sum_y = sum(map(int, ys))
+    sum_x = sum(map(int, xs))
+    index = min(range(count), key=lambda i: (
+        (count * int(ys[i]) - sum_y) ** 2 + (count * int(xs[i]) - sum_x) ** 2,
+        int(ys[i]), int(xs[i])))
+    return int(xs[index]), int(ys[index])
+
+
+def component_slice(label_window, label):
+    """Compare only an already sliced label window; instrument this boundary."""
+    return label_window == label
 
 
 def _skipped(model, low, high):
@@ -154,10 +166,11 @@ def _selected_pair_reasons(upper, lower, equal):
 def _extract_component(model, cnt, labels, box, electrode_by_id):
     x0, y0, x1, y1 = box.bbox_xyxy_px
     window = np.s_[y0:y1, x0:x1]
-    local = labels[window] == box.label  # never labels == label on the full frame
+    local = component_slice(labels[window], box.label)
     local.flags.writeable = False
+    local_hash = mask_hash(local)
     cid = component_id(model.model_id, cnt.stack, cnt.layer, cnt.binding,
-                       cnt.shape_yx, box.bbox_xyxy_px, local)
+                       cnt.shape_yx, box.bbox_xyxy_px, local, local_mask_sha256=local_hash)
     candidates = []
     for asset in sorted(model.electrodes, key=lambda a: (a.stack, a.electrode, a.layer)):
         count = overlap_pixels(local, asset.mask[window])
@@ -202,7 +215,7 @@ def _extract_component(model, cnt, labels, box, electrode_by_id):
                     original_xy, intersection_count, mask_hash(joint), skipped_upper, skipped_lower,
                     skipped_upper.present or skipped_lower.present)
     return ExtractedComponent(cid, cnt.asset_id, cnt.relative_path, cnt.stack, cnt.layer,
-                              cnt.shape_yx, box.bbox_xyxy_px, box.pixel_count, mask_hash(local), local,
+                              cnt.shape_yx, box.bbox_xyxy_px, box.pixel_count, local_hash, local,
                               above, below, equal, upper, lower, ignored, reasons,
                               intersection_count, regions, relation)
 

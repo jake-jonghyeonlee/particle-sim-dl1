@@ -26,3 +26,23 @@ def write_model(root, assets, *, shape=(1001, 1203), model="M"):
     """Assets are hand-written (folder, filename, foreground y/x pixels)."""
     for folder, filename, pixels in assets:
         write_png(root, f"{model}/{folder}/{filename}", shape=shape, pixels=pixels)
+
+
+def png_chunk(kind, payload, *, corrupt_crc=False):
+    """Hand-built PNG chunk, independent of the decoder and Pillow writer."""
+    import struct
+    import zlib
+    crc = zlib.crc32(kind + payload) ^ int(corrupt_crc)
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
+
+
+def raw_png(width, height, depth, colour, raw, *, interlace=0, compression=0, filtering=0,
+            before_idat=(), idat_parts=None, after_idat=()):
+    import struct
+    import zlib
+    header = struct.pack(">IIBBBBB", width, height, depth, colour, compression, filtering, interlace)
+    parts = (zlib.compress(raw),) if idat_parts is None else idat_parts
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header) +
+            b"".join(png_chunk(kind, data) for kind, data in before_idat) +
+            b"".join(png_chunk(b"IDAT", data) for data in parts) +
+            b"".join(png_chunk(kind, data) for kind, data in after_idat) + png_chunk(b"IEND", b""))

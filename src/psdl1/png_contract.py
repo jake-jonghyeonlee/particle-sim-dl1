@@ -41,10 +41,10 @@ def mask_hash(mask: np.ndarray) -> str:
 
 def component_id(model: str, stack: int, layer: str, binding: tuple,
                  shape_yx: tuple[int, int], bbox_xyxy_px: tuple[int, int, int, int],
-                 local_mask: np.ndarray) -> str:
+                 local_mask: np.ndarray, *, local_mask_sha256: str | None = None) -> str:
     """Hash bbox-local geometry without allocating a full-frame component mask."""
     return canonical_id("component", [model, stack, layer, binding, shape_yx,
-                                      bbox_xyxy_px, mask_hash(local_mask)])
+                                      bbox_xyxy_px, local_mask_sha256 if local_mask_sha256 is not None else mask_hash(local_mask)])
 
 
 @dataclass(frozen=True)

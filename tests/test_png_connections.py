@@ -143,6 +143,11 @@ def test_component_rule_and_multicontact_pending(tmp_path):
     labels, boxes = label_components(mask)
     assert labels.tolist() == [[1, 0, 0], [0, 2, 2], [0, 0, 0]]
     assert [(b.bbox_xyxy_px, b.pixel_count) for b in boxes] == [((0, 0, 1, 1), 1), ((1, 1, 3, 2), 2)]
+    mirrored = np.array([[False, True], [True, False]])
+    mirrored_labels, mirrored_boxes = label_components(mirrored)
+    assert mirrored_labels.tolist() == [[0, 1], [2, 0]]
+    assert [(b.bbox_xyxy_px, b.pixel_count) for b in mirrored_boxes] == [
+        ((1, 0, 2, 1), 1), ((0, 1, 1, 2), 1)]
     _, result = run_model(tmp_path, [
         ("A", "1-U.png", ((10, 20), (10, 22))),
         ("B", "8-L.png", ((10, 20), (10, 22))),
@@ -292,3 +297,39 @@ def test_label_run_unions_bbox_and_canonical_first_pixel_order():
         (3, (3, 3, 4, 4), 1, (3, 3)), (4, (5, 3, 6, 4), 1, (3, 5))]
     labels, boxes = label_components(np.zeros((2, 3), dtype=bool))
     assert labels.tolist() == [[0, 0, 0], [0, 0, 0]] and boxes == ()
+
+
+def test_representative_pixel_matches_fraction_reference_randomized(monkeypatch):
+    from fractions import Fraction
+    import psdl1.png_connections as module
+    rng = np.random.default_rng(482)
+    def reference(mask):
+        points = [(x, y) for y in range(mask.shape[0]) for x in range(mask.shape[1]) if mask[y, x]]
+        cx = Fraction(sum(p[0] for p in points), len(points))
+        cy = Fraction(sum(p[1] for p in points), len(points))
+        return min(points, key=lambda p: ((p[0] - cx) ** 2 + (p[1] - cy) ** 2, p[1], p[0]))
+    masks = []
+    for _ in range(300):
+        shape = tuple(int(x) for x in rng.integers(1, 16, size=2))
+        mask = rng.random(shape) < rng.uniform(0.05, 0.95)
+        mask[0, 0] = True
+        masks.append(mask)
+    expected = [reference(mask) for mask in masks]
+    assert [representative_pixel(mask) for mask in masks] == expected
+    # Force the exact-integer fallback at small sizes, without allocating an
+    # enormous image: lower the proof bound only, never modify coordinate values.
+    class SmallInt64:
+        max = 1
+    monkeypatch.setattr(module.np, "iinfo", lambda dtype: SmallInt64())
+    assert [representative_pixel(mask) for mask in masks] == expected
+
+
+def test_component_id_precomputed_hash_preserves_identity():
+    from psdl1.png_contract import component_id, mask_hash
+    mask = np.array([[True, False], [True, True]])
+    args = ("M", 6, "C", ("M", "cno", None, 6, "C"), (1001, 1203), (20, 30, 22, 32), mask)
+    # Both call routes must retain the exact published pre-FA canonical identity.
+    expected = "component_" + hashlib.sha256(json.dumps([
+        "component", ["M", 6, "C", ["M", "cno", None, 6, "C"], [1001, 1203], [20, 30, 22, 32],
+                      mask_hash(mask)]], separators=(",", ":")).encode()).hexdigest()
+    assert component_id(*args) == component_id(*args, local_mask_sha256=mask_hash(mask)) == expected

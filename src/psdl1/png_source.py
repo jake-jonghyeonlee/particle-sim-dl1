@@ -12,6 +12,8 @@ import re
 import struct
 import threading
 import warnings
+import unicodedata
+import zlib
 
 import numpy as np
 
@@ -81,6 +83,183 @@ def _header_shape(path):
     return None
 
 
+
+class _PNGScanlines:
+    """Stream inflated bytes into scanlines; retain at most two packed rows.
+
+    Palette rows are unfiltered in raw sample units before index validation.
+    Other colour types need only a valid filter byte and exact scanline lengths.
+    """
+    def __init__(self, width, height, depth, colour, interlace):
+        self.depth, self.colour = depth, colour
+        channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colour]
+        geometry = ((0, 0, 1, 1),) if not interlace else (
+            (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+            (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+        self.passes = []
+        for x, y, dx, dy in geometry:
+            w = max(0, (width - x + dx - 1) // dx)
+            h = max(0, (height - y + dy - 1) // dy)
+            if w and h:
+                self.passes.append((w, h, (w * channels * depth + 7) // 8))
+        self.expected = sum(h * (row_bytes + 1) for _, h, row_bytes in self.passes)
+        self.received = self.pass_index = self.row_index = 0
+        self.row = bytearray()
+        self.previous = None
+        self.palette_entries = None
+
+    def feed(self, data):
+        self.received += len(data)
+        if self.received > self.expected:
+            raise ValueError("IDAT scanline byte count is longer than IHDR requires")
+        offset = 0
+        while offset < len(data):
+            width, height, size = self.passes[self.pass_index]
+            take = min(size + 1 - len(self.row), len(data) - offset)
+            self.row.extend(data[offset:offset + take])
+            offset += take
+            if len(self.row) == size + 1:
+                filter_type = self.row[0]
+                if filter_type > 4:
+                    raise ValueError("invalid PNG scanline filter type")
+                if self.colour == 3:
+                    packed = bytearray(self.row[1:])
+                    prior = self.previous
+                    for i in range(len(packed)) if filter_type else ():
+                        value = packed[i]
+                        left = packed[i - 1] if i else 0
+                        above = prior[i] if prior is not None else 0
+                        upper_left = prior[i - 1] if prior is not None and i else 0
+                        if filter_type == 1:
+                            value += left
+                        elif filter_type == 2:
+                            value += above
+                        elif filter_type == 3:
+                            value += (left + above) // 2
+                        elif filter_type == 4:
+                            predictor = left + above - upper_left
+                            dl, da, du = abs(predictor - left), abs(predictor - above), abs(predictor - upper_left)
+                            value += left if dl <= da and dl <= du else above if da <= du else upper_left
+                        packed[i] = value & 255
+                    sample_mask = (1 << self.depth) - 1
+                    if self.depth == 8:
+                        invalid_index = max(packed) >= self.palette_entries
+                    else:
+                        invalid_index = any(
+                            (packed[(pixel * self.depth) // 8] >>
+                             (8 - self.depth - (pixel * self.depth) % 8)) & sample_mask >= self.palette_entries
+                            for pixel in range(width))
+                    if invalid_index:
+                        raise ValueError("palette pixel index has no PLTE entry")
+                    self.previous = packed
+                self.row.clear()
+                self.row_index += 1
+                if self.row_index == height:
+                    self.pass_index += 1
+                    self.row_index = 0
+                    self.previous = None
+
+    def finish(self):
+        if self.received != self.expected or self.row:
+            raise ValueError(f"IDAT scanline byte count is short: expected {self.expected}, received {self.received}")
+
+
+def _validate_png_structure(path):
+    """Independent chunk/CRC/critical-order/zlib/sample validation, no Pillow internals.
+
+    Compressed chunks and inflate output are consumed in bounded blocks. No full
+    compressed stream or full inflated image is retained by this check.
+    """
+    seen_ihdr = seen_plte = seen_idat = ended_idat = seen_trns = False
+    inflater = zlib.decompressobj()
+    scanlines = None
+    colour = depth = None
+
+    def inflate(block):
+        while block:
+            if inflater.eof:
+                raise ValueError("extra compressed bytes after IDAT zlib stream")
+            output = inflater.decompress(block, 65536)
+            scanlines.feed(output)
+            if inflater.unused_data:
+                raise ValueError("extra compressed bytes after IDAT zlib stream")
+            block = inflater.unconsumed_tail
+
+    with path.open("rb") as handle:
+        if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("invalid PNG signature")
+        while True:
+            header = handle.read(8)
+            if len(header) != 8:
+                raise ValueError("PNG missing/truncated chunk or IEND")
+            length, kind = struct.unpack(">I4s", header)
+            if length > 0x7fffffff or not all(65 <= c <= 90 or 97 <= c <= 122 for c in kind) or kind[2] & 32:
+                raise ValueError("invalid PNG chunk length/type")
+            if not seen_ihdr and kind != b"IHDR":
+                raise ValueError("IHDR must be the first PNG chunk")
+            if kind == b"IHDR" and (seen_ihdr or length != 13):
+                raise ValueError("PNG requires exactly one 13-byte IHDR first")
+            if kind == b"PLTE" and (seen_plte or seen_idat or colour in {0, 4} or
+                                    not 0 < length <= 768 or length % 3):
+                raise ValueError("invalid PLTE length/order/colour type")
+            if kind == b"tRNS":
+                if colour != 3:
+                    raise ValueError("non-palette tRNS is nonopaque/unsupported")
+                if seen_trns or seen_idat or not seen_plte or not 0 < length <= scanlines.palette_entries:
+                    raise ValueError("invalid palette tRNS length/order")
+            if kind == b"IDAT":
+                if ended_idat or colour == 3 and not seen_plte:
+                    raise ValueError("IDAT order invalid or palette PNG missing PLTE")
+                seen_idat = True
+            elif seen_idat:
+                ended_idat = True
+            if kind == b"IEND" and (length or not seen_idat):
+                raise ValueError("invalid IEND length/order or missing IDAT")
+            if not kind[0] & 32 and kind not in {b"IHDR", b"PLTE", b"IDAT", b"IEND"}:
+                raise ValueError("unknown critical PNG chunk")
+            crc = zlib.crc32(kind)
+            payload = bytearray()  # only bounded IHDR/PLTE/tRNS metadata retained
+            remaining = length
+            while remaining:
+                block = handle.read(min(remaining, 65536))
+                if not block:
+                    raise ValueError("truncated PNG chunk payload")
+                remaining -= len(block)
+                crc = zlib.crc32(block, crc)
+                if kind == b"IDAT":
+                    inflate(block)
+                elif kind in {b"IHDR", b"PLTE", b"tRNS"}:
+                    payload.extend(block)
+            expected_crc = handle.read(4)
+            if len(expected_crc) != 4 or struct.unpack(">I", expected_crc)[0] != crc:
+                raise ValueError(f"PNG {kind.decode()} CRC mismatch/truncation")
+            if kind == b"IHDR":
+                width, height, depth, colour, compression, filtering, interlace = struct.unpack(">IIBBBBB", payload)
+                allowed = {0: {1, 2, 4, 8}, 2: {8}, 3: {1, 2, 4, 8}, 4: {8}, 6: {8}}
+                if not 0 < width <= 0x7fffffff or not 0 < height <= 0x7fffffff or depth not in allowed.get(colour, set()):
+                    raise ValueError("invalid/unsupported IHDR dimensions/bit depth/colour type")
+                if compression != 0 or filtering != 0 or interlace not in {0, 1}:
+                    raise ValueError("unsupported IHDR compression/filter/interlace method")
+                scanlines = _PNGScanlines(width, height, depth, colour, interlace)
+                seen_ihdr = True
+            elif kind == b"PLTE":
+                entries = length // 3
+                if colour == 3 and entries > 1 << depth:
+                    raise ValueError("PLTE entries exceed palette bit depth")
+                scanlines.palette_entries = entries
+                seen_plte = True
+            elif kind == b"tRNS":
+                if any(alpha != 255 for alpha in payload):
+                    raise ValueError("nonopaque palette tRNS is unsupported (including unused entries)")
+                seen_trns = True
+            elif kind == b"IEND":
+                if not inflater.eof:
+                    raise ValueError("truncated/incomplete IDAT zlib stream")
+                scanlines.finish()
+                if handle.read(1):
+                    raise ValueError("trailing bytes after IEND")
+                return
+
 def _decode(path, diagnostic_path, policy):
     Image, _ = _pillow()
     shape = None
@@ -100,7 +279,8 @@ def _decode(path, diagnostic_path, policy):
             mode = image.mode
             if mode not in {"1", "L", "RGB", "LA", "RGBA", "P"}:
                 raise ValueError(f"unsupported PNG mode/bit depth: {mode}")
-            image.load()  # fail on corrupt/truncated pixel streams before conversion
+            _validate_png_structure(path)
+            image.load()  # structure and exact stream lengths already checked
             # Exact palette/alpha expansion only; never luminance conversion.
             rgba = np.asarray(image.convert("RGBA"))
             if not np.all(rgba[..., 3] == 255):
@@ -151,6 +331,10 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
         else:
             emitted_ids[value] = source_path
 
+    def warn_name(name, path, warning_list):
+        if not unicodedata.is_normalized("NFC", name):
+            warning_list.append(SourceIssue(rel(path), "name is not NFC-normalised; byte-exact identity preserved"))
+
     def unexpected(path, issues, warning_list):
         # Classify PNG at any unsupported depth as an error; unrelated files warn.
         if path.is_dir():
@@ -173,6 +357,7 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
                 unexpected(model_dir, errors, notices)
                 continue
             model_errors, model_warnings, assets = [], [], []
+            warn_name(model_dir.name, model_dir, model_warnings)
             try:
                 identifier(model_dir.name, "model")
             except ValueError as exc:
@@ -189,19 +374,26 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
                     identifier(folder.name, "electrode")
                 except ValueError as exc:
                     model_errors.append(SourceIssue(rel(folder), str(exc)))
+                warn_name(folder.name, folder, model_warnings)
+                if folder.name != "cno" and folder.name.casefold() == "cno":
+                    model_errors.append(SourceIssue(rel(folder), "reserved CNT folder is exactly 'cno'; rename this case variant explicitly"))
+                    continue
                 is_cnt = folder.name == "cno"
                 cno_present |= is_cnt
+                png_count = 0
                 for path in sorted(folder.iterdir()):
                     if not safe(path, model_errors):
                         continue
                     if path.is_dir() or path.suffix.lower() != ".png":
                         unexpected(path, model_errors, model_warnings)
                         continue
+                    png_count += 1
                     try:
                         stack, layer = parse_png_name(path.name)
                     except ValueError as exc:
                         model_errors.append(SourceIssue(rel(path), str(exc)))
                         continue
+                    warn_name(layer, path, model_warnings)
                     binding = (folder.name, stack, layer) if is_cnt else (folder.name, layer)
                     if binding in bindings:
                         model_errors.append(SourceIssue(rel(path), f"duplicate normalized binding; also {bindings[binding]}"))
@@ -225,6 +417,8 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
                             tuple(mask.shape), mask))
                     except PNGSourceError as exc:
                         model_errors.append(exc.issue)
+                if not is_cnt and not png_count:
+                    model_warnings.append(SourceIssue(rel(folder), "electrode folder contains no PNG assets"))
             assets.sort(key=lambda a: (a.stack, a.kind, a.electrode or "", a.layer, a.relative_path))
             frame = None
             if assets:

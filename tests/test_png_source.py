@@ -336,3 +336,239 @@ def test_emitted_identity_collision_fails_and_repeated_cnt_layer_is_preserved(tm
     inventory = discover_source(tmp_path)
     assert not inventory.valid
     assert any("colliding" in e.reason for e in inventory.models[0].errors)
+
+
+@pytest.mark.parametrize("rows", [63, 32, 1, 0])
+def test_ra_b1_short_complete_zlib_greyscale_1bit(tmp_path, rows):
+    from png_helpers import raw_png
+    # 64x64 depth=1 needs exactly 64*(1 filter + 8 packed pixels) = 576 bytes.
+    path = tmp_path / f"short-{rows}.png"
+    path.write_bytes(raw_png(64, 64, 1, 0, (b"\0" + b"\xff" * 8) * rows))
+    with pytest.raises(PNGSourceError, match="scanline|truncated") as error:
+        decode_png(path)
+    assert str(path) in str(error.value)
+
+
+def test_ra_b1_short_complete_zlib_greyscale_8bit(tmp_path):
+    from png_helpers import raw_png
+    path = tmp_path / "short-L.png"
+    path.write_bytes(raw_png(4, 4, 8, 0, b"\0\xff\xff\0\0" * 3))
+    with pytest.raises(PNGSourceError, match="scanline") as error:
+        decode_png(path)
+    assert str(path) in str(error.value)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4, 8])
+@pytest.mark.parametrize("transparent_sample", ["white", "black"])
+def test_ra_b2_raw_greyscale_trns_rejected(tmp_path, depth, transparent_sample):
+    import struct
+    from png_helpers import raw_png
+    # Samples [0,max,max,0], packed independently at each declared bit depth.
+    packed = {1: b"\x60", 2: b"\x3c", 4: b"\x0f\xf0", 8: b"\x00\xff\xff\x00"}[depth]
+    sample = (1 << depth) - 1 if transparent_sample == "white" else 0
+    path = tmp_path / f"trns-{depth}-{transparent_sample}.png"
+    path.write_bytes(raw_png(4, 1, depth, 0, b"\0" + packed,
+                            before_idat=((b"tRNS", struct.pack(">H", sample)),)))
+    with pytest.raises(PNGSourceError, match="tRNS") as error:
+        decode_png(path)
+    assert str(path) in str(error.value)
+
+
+def test_ra_b2_nonpalette_rgb_trns_rejected_even_if_unused(tmp_path):
+    import struct
+    from png_helpers import raw_png
+    path = tmp_path / "rgb-trns.png"
+    path.write_bytes(raw_png(1, 1, 8, 2, b"\0\xff\xff\xff",
+                            before_idat=((b"tRNS", struct.pack(">HHH", 1, 2, 3)),)))
+    with pytest.raises(PNGSourceError, match="tRNS"):
+        decode_png(path)
+
+
+@pytest.mark.parametrize("depth", [2, 4, 8])
+def test_ra_b3_palette_out_of_range_index(tmp_path, depth):
+    from png_helpers import raw_png
+    # PLTE[0]=white, PLTE[1]=black; raw indices [1,0,3,1]. Index 3 is undefined.
+    packed = {2: b"\x4d", 4: b"\x10\x31", 8: b"\x01\x00\x03\x01"}[depth]
+    path = tmp_path / f"palette-{depth}.png"
+    path.write_bytes(raw_png(4, 1, depth, 3, b"\0" + packed,
+                            before_idat=((b"PLTE", b"\xff\xff\xff\0\0\0"),)))
+    with pytest.raises(PNGSourceError, match="PLTE entry") as error:
+        decode_png(path)
+    assert str(path) in str(error.value)
+
+
+def test_ra_b3_missing_palette(tmp_path):
+    from png_helpers import raw_png
+    path = tmp_path / "missing-PLTE.png"
+    path.write_bytes(raw_png(4, 1, 8, 3, b"\0\1\0\0\1"))
+    with pytest.raises(PNGSourceError, match="PLTE") as error:
+        decode_png(path)
+    assert str(path) in str(error.value)
+
+
+@pytest.mark.parametrize("case", ["after_iend", "concatenated_png", "missing_crc_iend", "wrong_idat_crc",
+                                  "interlace2", "compression1", "filter_method1", "overlong_stream"])
+def test_ra_n5_lenient_structures_now_rejected(tmp_path, case):
+    from png_helpers import raw_png, png_chunk
+    import zlib
+    valid = raw_png(4, 1, 8, 0, b"\0\0\xff\xff\0")
+    if case == "after_iend": data = valid + b"trailing"
+    elif case == "concatenated_png": data = valid + valid
+    elif case == "missing_crc_iend": data = valid[:-16]
+    elif case == "wrong_idat_crc":
+        data = valid[:33] + png_chunk(b"IDAT", zlib.compress(b"\0\0\xff\xff\0"), corrupt_crc=True) + valid[-12:]
+    elif case == "interlace2": data = raw_png(4, 1, 8, 0, b"\0\0\xff\xff\0", interlace=2)
+    elif case == "compression1": data = raw_png(4, 1, 8, 0, b"\0\0\xff\xff\0", compression=1)
+    elif case == "filter_method1": data = raw_png(4, 1, 8, 0, b"\0\0\xff\xff\0", filtering=1)
+    else: data = raw_png(4, 1, 8, 0, b"\0\0\xff\xff\0EXTRA")
+    path = tmp_path / f"{case}.png"; path.write_bytes(data)
+    with pytest.raises(PNGSourceError) as error:
+        decode_png(path)
+    assert str(path) in str(error.value)
+
+
+@pytest.mark.parametrize("case", ["ihdr_not_first", "duplicate_ihdr", "missing_iend", "unknown_critical",
+                                  "plte_after_idat", "noncontiguous_idat", "duplicate_plte", "iend_payload",
+                                  "bad_filter_byte", "invalid_colour_depth", "invalid_plte_length",
+                                  "extra_zlib_stream", "incomplete_zlib", "bad_ancillary_crc"])
+def test_png_critical_order_and_stream_integrity(tmp_path, case):
+    import struct
+    import zlib
+    from png_helpers import raw_png, png_chunk
+    raw = b"\0\0\xff\xff\0"
+    valid = raw_png(4, 1, 8, 0, raw)
+    if case == "ihdr_not_first": data = valid[:8] + png_chunk(b"tEXt", b"x\0y") + valid[8:]
+    elif case == "duplicate_ihdr": data = valid[:33] + valid[8:33] + valid[33:]
+    elif case == "missing_iend": data = valid[:-12]
+    elif case == "unknown_critical": data = valid[:33] + png_chunk(b"ABCD", b"") + valid[33:]
+    elif case == "plte_after_idat": data = raw_png(4, 1, 8, 2, b"\0" + b"\xff" * 12, after_idat=((b"PLTE", b"\0\0\0"),))
+    elif case == "noncontiguous_idat":
+        stream = zlib.compress(raw)
+        data = valid[:33] + png_chunk(b"IDAT", stream[:3]) + png_chunk(b"tEXt", b"x\0y") + png_chunk(b"IDAT", stream[3:]) + valid[-12:]
+    elif case == "duplicate_plte": data = raw_png(1, 1, 8, 3, b"\0\0", before_idat=((b"PLTE", b"\0\0\0"),) * 2)
+    elif case == "iend_payload": data = valid[:-12] + png_chunk(b"IEND", b"x")
+    elif case == "bad_filter_byte": data = raw_png(4, 1, 8, 0, b"\5\0\xff\xff\0")
+    elif case == "invalid_colour_depth": data = raw_png(4, 1, 4, 2, raw)
+    elif case == "invalid_plte_length": data = raw_png(1, 1, 8, 3, b"\0\0", before_idat=((b"PLTE", b"\0\0"),))
+    elif case == "extra_zlib_stream": data = raw_png(4, 1, 8, 0, raw, idat_parts=(zlib.compress(raw) + zlib.compress(raw),))
+    elif case == "incomplete_zlib": data = raw_png(4, 1, 8, 0, raw, idat_parts=(zlib.compress(raw)[:-1],))
+    else: data = valid[:33] + png_chunk(b"tEXt", b"x\0y", corrupt_crc=True) + valid[33:]
+    path = tmp_path / f"{case}.png"; path.write_bytes(data)
+    with pytest.raises(PNGSourceError) as error: decode_png(path)
+    assert str(path) in str(error.value)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4, 8])
+def test_valid_raw_greyscale_depths_have_unchanged_polarity(tmp_path, depth):
+    from png_helpers import raw_png
+    packed = {1: b"\x60", 2: b"\x3c", 4: b"\x0f\xf0", 8: b"\x00\xff\xff\x00"}[depth]
+    path = tmp_path / f"valid-{depth}.png"
+    path.write_bytes(raw_png(4, 1, depth, 0, b"\0" + packed))
+    mask, _, _ = decode_png(path)
+    assert mask.tolist() == [[True, False, False, True]]
+
+
+@pytest.mark.parametrize("colour", [0, 3])
+@pytest.mark.parametrize("stream", ["exact", "short", "long"])
+def test_adam7_per_pass_scanline_counts(tmp_path, colour, stream):
+    from png_helpers import raw_png
+    white = 255 if colour == 0 else 1
+    # Independently drawn 3x3 checkerboard, Adam7 nonempty passes 1,4,5,6,7.
+    # Each row begins with filter 0; expected pass byte counts are 2,2,3,4,4.
+    raw = bytes([0, 0, 0, 0, 0, 0, 0, 0, white, 0, white, 0, white, 0, white])
+    assert len(raw) == 15
+    if stream == "short": raw = raw[:-1]
+    elif stream == "long": raw += b"x"
+    palette = ((b"PLTE", b"\0\0\0\xff\xff\xff"),) if colour == 3 else ()
+    path = tmp_path / f"adam7-{colour}-{stream}.png"
+    path.write_bytes(raw_png(3, 3, 8, colour, raw, interlace=1, before_idat=palette))
+    if stream == "exact":
+        mask, _, _ = decode_png(path)
+        assert mask.tolist() == [[True, False, True], [False, True, False], [True, False, True]]
+    else:
+        with pytest.raises(PNGSourceError, match="scanline"): decode_png(path)
+
+
+@pytest.mark.parametrize("filter_type,first,second", [
+    (0, b"\0\1\0\1", b"\1\0\1\0"),
+    (1, b"\0\1\xff\1", b"\1\xff\1\xff"),
+    (2, b"\0\1\0\1", b"\1\xff\1\xff"),
+    (3, b"\0\1\0\1", b"\1\xff\1\xff"),
+    (4, b"\0\1\xff\1", b"\1\xff\1\xff"),
+])
+def test_palette_indices_checked_after_each_png_unfilter(tmp_path, filter_type, first, second):
+    from png_helpers import raw_png
+    path = tmp_path / f"filter-{filter_type}.png"
+    path.write_bytes(raw_png(4, 2, 8, 3, bytes([filter_type]) + first + bytes([filter_type]) + second,
+                            before_idat=((b"PLTE", b"\0\0\0\xff\xff\xff"),)))
+    mask, _, _ = decode_png(path)
+    assert mask.tolist() == [[True, False, True, False], [False, True, False, True]]
+
+
+@pytest.mark.parametrize("depth,packed", [(1, b"\x90"), (2, b"\x41"), (4, b"\x10\x01"), (8, b"\1\0\0\1")])
+def test_palette_exact_indices_and_fully_opaque_trns(tmp_path, depth, packed):
+    from png_helpers import raw_png
+    path = tmp_path / f"palette-valid-{depth}.png"
+    path.write_bytes(raw_png(4, 1, depth, 3, b"\0" + packed,
+                            before_idat=((b"PLTE", b"\xff\xff\xff\0\0\0"), (b"tRNS", b"\xff\xff"))))
+    mask, _, _ = decode_png(path)
+    assert mask.tolist() == [[True, False, False, True]]
+
+
+def test_unused_transparent_palette_entry_rejected(tmp_path):
+    from png_helpers import raw_png
+    path = tmp_path / "unused-alpha.png"
+    path.write_bytes(raw_png(1, 1, 8, 3, b"\0\0", before_idat=(
+        (b"PLTE", b"\xff\xff\xff\0\0\0"), (b"tRNS", b"\xff\0"))))
+    with pytest.raises(PNGSourceError, match="tRNS"): decode_png(path)
+
+
+def test_valid_stream_split_across_many_idat_chunks(tmp_path):
+    import zlib
+    from png_helpers import raw_png
+    raw = b"\0\0\xff\xff\0"
+    stream = zlib.compress(raw)
+    path = tmp_path / "split-idat.png"
+    path.write_bytes(raw_png(4, 1, 8, 0, raw, idat_parts=(b"",) + tuple(bytes([b]) for b in stream) + (b"",)))
+    assert decode_png(path)[0].tolist() == [[True, False, False, True]]
+
+
+def test_inventory_empty_electrode_and_nonmodel_directories(tmp_path):
+    root = tmp_path / "source"
+    write_png(root, "M/A/1-X.png")
+    (root / "M/B").mkdir()
+    result = discover_source(root)
+    assert result.valid
+    assert any(e.path == "M/B" and "no PNG" in e.reason for e in result.models[0].warnings)
+    (root / "__MACOSX").mkdir()
+    result = discover_source(root)
+    assert not result.valid
+    bad = next(m for m in result.models if m.model_id == "__MACOSX")
+    assert any("no decoded electrode" in e.reason for e in bad.errors)
+
+
+@pytest.mark.parametrize("reserved", ["CNO", "Cno", "cNo"])
+def test_inventory_case_variant_of_reserved_cno_is_error(tmp_path, reserved):
+    write_png(tmp_path, "M/A/1-X.png")
+    write_png(tmp_path, f"M/{reserved}/6_C.png")
+    result = discover_source(tmp_path)
+    assert not result.valid
+    assert any(e.path == f"M/{reserved}" and "reserved" in e.reason and "'cno'" in e.reason
+               for e in result.models[0].errors)
+    assert result.models[0].roles == ("A",)
+
+
+def test_inventory_non_nfc_names_warn_without_normalising(tmp_path):
+    import unicodedata
+    nfc, nfd = "é", "e\u0301"
+    assert unicodedata.normalize("NFC", nfd) == nfc
+    write_png(tmp_path, f"M/{nfd}/1-{nfd}.png")
+    write_png(tmp_path, f"Q/{nfc}/1-{nfc}.png")
+    result = discover_source(tmp_path)
+    assert result.valid
+    assert result.models[0].roles == result.models[0].layers == (nfd,)
+    assert result.models[1].roles == result.models[1].layers == (nfc,)
+    assert result.role_union == tuple(sorted([nfc, nfd]))
+    assert any("not NFC" in e.reason for e in result.models[0].warnings)
+    assert result.models[0].assets[0].asset_id != result.models[1].assets[0].asset_id
+    assert canonical_id("element", ["M", nfc]) != canonical_id("element", ["M", nfd])
