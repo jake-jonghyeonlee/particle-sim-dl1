@@ -6,7 +6,7 @@ DL1 aims to find products with similar original shapes and electrode connectivit
 
 The real minimum linewidth/grid choice and the source CNT/VIA endpoint metadata format remain open within G5. G6 label-format and closed-network acceptance criteria remain open. The exact encoder, endpoint feature representation, and training recipe are candidates; no real search performance or connectivity preservation has been established. G3 repository naming remains pending.
 
-Inputs contain only original shape, valid coverage, and supplied connectivity metadata; hotspot, CA, and fab fields are rejected. Products share physical pixel pitch (about 0.05 µm in the user data), have different pixel counts, and share a frame across their layers. See [docs/data_contract.md](docs/data_contract.md) for the accepted T8 draft schema. All reports distinguish the approved input method from pending real grid/linewidth, source endpoint format, and G6.
+Inputs contain only original shape, valid coverage, and supplied connectivity metadata; hotspot, CA, and fab fields are rejected. PNG products use **0.1 µm/pixel**, have different pixel counts, and share a full frame across their layers. Historical NPY examples retain their explicit pitch. For PNG export, `unit_size_um` means `[W*0.1,H*0.1]` µm of full frame extent, including the four real margins; no single unit or simulation-domain size is inferred. See [docs/data_contract.md](docs/data_contract.md) for the accepted T8 draft schema. All reports distinguish the approved input method from pending real grid/linewidth, source endpoint format, and G6.
 
 The T9 model consumes T8 spatial valid coverage as a fourth image channel and source relations as features bound to the corresponding element representations. Connection features retain each endpoint's normalized padded-image coordinate, CNT/VIA kind, observation flag, and mask coverage. Connectivity availability is separate from image values. A global CNT image without source endpoint metadata remains **unavailable**, never CNN-verified. No layer is independently centred. The fixed-grid image is a candidate representation and cannot certify connectivity.
 
@@ -47,7 +47,7 @@ uv pip install --no-index --find-links /approved/wheels -e .
 .venv/bin/python -m pytest -p no:warnings --run-training
 ```
 
-Default tests use direct forward/loss/optimizer-state fixtures and skip dataset training. Socket network calls fail in tests. `pretrained=False` is always used for backbone construction; optional weights load from a local `.pt`, `.pth`, or `.safetensors` state dict with strict shape/finite checks and no online fallback. For the product encoder, local backbone files must match its four input channels. Record an imported artifact's exact hash, source and license before use; none was accepted here.
+Default tests include bounded synthetic forward/loss/optimizer and one-step importer/training-driver integration fixtures; the existing 40-epoch dataset smoke stays opt-in. Socket network calls fail in tests. `pretrained=False` is always used for backbone construction; optional weights load from a local `.pt`, `.pth`, or `.safetensors` state dict with strict shape/finite checks and no online fallback. For the product encoder, local backbone files must match its four input channels. Record an imported artifact's exact hash, source and license before use; none was accepted here.
 
 The local checkpoint path (`--ckpt` / `--resume`) loads this project's own versioned checkpoints. `--weights` accepts compatible backbone-only project/timm-format files, with four input channels and no classifier head for the product encoder. These paths have **not been verified against public ConvNeXt V2 weight files**; no conversion is performed. Pretrained remains off by default. Optional safetensors support is declared in the `local-weights` dependency group and must be obtained through the approved offline wheel process.
 
@@ -56,3 +56,47 @@ Search processes bounded chunks with canonical single-product forwards so paddin
 Search and evaluation report the numeric checkpoint `grid` and `grid_selection` with manifest candidate grids. Any mismatch requires `--allow-grid-override`; inference keeps the checkpoint grid and records the exception. Their default grid gate blocks thin-line/vanishing-bridge queries and excludes failing candidates, including held-out evaluation products and the baseline. Only `--allow-grid-check-failure` bypasses it, with per-product evidence in JSON. Both flags are separate, default off, and do not approve a real grid or minimum linewidth.
 
 Canonical single-product forwards preserve order/chunk-size reproducibility. `batch_size` controls candidate chunks rather than forward batch size; evaluation caches each product embedding once per command to avoid repeated forwards across queries, trading O(N × embedding dimension) memory for fewer forwards. Multi-product forward acceleration remains deferred because it changes arithmetic. The opt-in 40-epoch synthetic CNN smoke now uses an explicitly chosen synthetic grid 64, passes the strict grid gate with no bypass, and retains all loss/ranking/separation assertions; this fixture choice is not a real-data grid recommendation.
+
+## PNG workflow, offline
+
+Use `psdl1[png]` with approved local **Pillow 12.3.0** wheels (and hatchling/build
+requirements when building the package). The optional PNG dependency is imported
+lazily: existing NPY/checkpoint inference needs no Pillow. `requirements.lock` is
+unchanged and does not guarantee a portable wheelhouse; no online fallback exists.
+
+```bash
+# Paths and candidate grids must be supplied by the user; destinations must be new.
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$INSPECT_OUT"
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$GRID_INSPECT_OUT" \
+  --inspect-grids "$GRID_A" "$GRID_B"
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$EXPORT_OUT" \
+  --export --metadata "$METADATA_JSON" --candidate-grid "$CANDIDATE_GRID"
+.venv/bin/python -m psdl1.import_png --verify-bundle "$EXPORT_OUT"
+.venv/bin/python -m psdl1.data "$EXPORT_OUT/manifest.json" --report "$VALIDATOR_REPORT"
+```
+
+Inspection writes a versioned report and offline full-frame preview without metadata
+or a grid. Explicit grid inspection compares candidates without approving/selecting
+one. Export requires exact per-model lineage/design metadata (see the conspicuously
+synthetic example in `configs/png-metadata.example.json`) and an explicit candidate
+grid; a bad model blocks the entire export pool. No labels, split, aliases or grid
+are inferred. Full-frame masks, original-resolution CNT relations and all unresolved
+CNT foreground survive export. No model-input crop/tiling is performed; context
+windows in the preview are display aids only.
+
+Resource and name inventories precede heavy export/grid allocations. Review N/E/K/R,
+bool export bytes, retained float32 loader bytes and the all-components-resolved
+scenario before use. Decoder temporaries, all retained source masks and per-relation
+full-frame masks add memory; estimates do not certify peak RAM or runtime. Exact role
+and layer names must be in the checkpoint's training vocabulary: unknown queries are
+unavailable, candidates excluded, and direct embedding fails with the missing names.
+A shared symbol does not establish physical equivalence.
+
+**complete means extraction coverage only; electrical verification not performed.**
+Coverage reaches the model's connectivity embedding (`unavailable/partial/available`)
+and affects input identity. 4-neighbour and skipped-layer rules are implementation
+interpretations. Real grid/minimum linewidth, source-format compatibility and G6
+labels/quality acceptance remain pending. A **5–10 diverse product pilot** is an
+integration/connection-inspection pilot, never a required training corpus size or
+retrieval-quality acceptance. See USAGE for strict PNG re-save remedies and preview
+layer/endpoint interpretation.

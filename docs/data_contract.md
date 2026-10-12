@@ -44,7 +44,7 @@ A product may also supply optional `cnt` as a global original-frame CNT mask. It
 
 - Product, lineage, design, frame, electrode, role, actual-layer, element, and connection IDs are nonempty trimmed strings. Product IDs are unique within the manifest; element IDs, connection IDs, and role-layer bindings are unique within each product. Lineage may be shared by related products. The draft represents one element per role × actual layer; finer source segmentation requires an explicit contract revision.
 - All masks are nonempty, finite, numeric 2-D `.npy` arrays. Binary 0/1 (including bool) or binary 0/255 are accepted and converted to 0/1; negatives, probabilities, NaN, infinities, mixed 1/255 encoding, and intensity masks are rejected. Empty foreground is an observed zero mask, not a missing file.
-- A frame uses `um`, `yx`, isotropic positive pixel pitch, positive integer `shape_yx`, and a finite `origin_xy_um`. The origin is the upper-left cell edge; the domain is half open. Size order is width,height and shape order is height,width. `unit_size_um` equals shape × pitch within `atol=1e-9, rtol=1e-9`. Products within a manifest share pitch at the same tolerances; the user value of about 0.05 is not hard-coded. Original layers, CNT/VIA masks, and valid masks must match the frame; the loader never resizes mismatched assets.
+- A frame uses `um`, `yx`, isotropic positive pixel pitch, positive integer `shape_yx`, and a finite `origin_xy_um`. The origin is the upper-left cell edge; the domain is half open. Size order is width,height and shape order is height,width. `unit_size_um` equals shape × pitch within `atol=1e-9, rtol=1e-9`. Products within a manifest share pitch at the same tolerances; legacy synthetic pitches such as 0.05 are not hard-coded; PNG import explicitly uses 0.1 µm/pixel. Original layers, CNT/VIA masks, and valid masks must match the frame; the loader never resizes mismatched assets.
 - Every asset must exist as a root-relative `.npy` file. Absolute paths (including absolute paths inside the root), parent traversal, Windows absolute paths, backslash separators, and symlinks escaping the root are rejected. Duplicate JSON keys, unknown fields, and missing required fields are rejected.
 - `observation` is `observed` with a mask path or `missing` with `mask: null`. Missing elements and connection images remain explicit; they are never called an observed zero. A missing element prevents tensor preparation. Missing connection masks retain their relation and observation status in the structured result; its image slot is zero only as a placeholder alongside that status. Valid holes retain the unknown coverage and mask out shape channels; observed endpoint pixels cannot be in holes.
 - A `CNT` or `VIA` relation has exactly two endpoints bound to distinct element IDs and coordinates in the original shared frame. Coordinates must be finite and inside the half-open frame. Observed endpoints must occupy valid electrode and connection pixels. Missing observations still require known endpoint references and valid in-frame coordinates; this draft cannot accept unknown endpoint geometry. It does not infer endpoint coordinates, intermediate layers, electrical labels, or wiring from a mask.
@@ -491,3 +491,60 @@ visually inspected; original offsets/polarity/endpoint centres are correct. The 
 inspection evidence. `--verify-bundle` passed for the preview bundle. C1/C3 decoder/test
 file changes were explicitly authorized by the coordinator's T3 scope addition; no core
 schema/model/NPY-loader/lock change or installation occurred.
+
+
+## Shared full-frame transform and T4 integration — 2026-10-12
+
+`data.frame_transform` centralizes the existing rounded area resize and central pad:
+`nh=round(H*G/max(H,W))`, `nw=round(W*G/max(H,W))`, each at least 1;
+`left=(G-nw)//2`, `top=(G-nh)//2`, `sx=nw/W`, `sy=nh/H`.
+The full original frame, including real margins, feeds self/rest/global CNT/valid and
+connection-mask channels with this single transform. Rounding can make `sx != sy`.
+Pixel index `(x,y)` maps continuously to the grid edge coordinate
+`((x+0.5)*sx+left,(y+0.5)*sy+top)`; its inverse subtracts the pad, divides by
+actual XY scale, then subtracts 0.5. This round trip concerns coordinates, never
+reversible image downsampling. Synthetic float64 coordinate round trips use absolute
+tolerance 2e-13; independent float32 feature comparisons use absolute tolerance 1e-7
+(and baseline compatibility compares exact bytes). Physical endpoints first subtract original edge origin
+and divide by original pitch, then apply rounded content dimensions/pad and divide by G.
+The legacy multiply/divide operation order is retained for bit-identical float32 model
+features. `MODEL_INPUT_VERSION` and `SCHEMA_VERSION` remain unchanged.
+
+Every validator/grid/inspect/export report exposes the same transform record: source
+and rounded shapes, padding LTRB, actual XY scale and effective content pitch
+`[0.1/sx,0.1/sy]` µm for PNGs. Padding has no physical extent. For H=1001,W=1203,G=32,
+content is 27×32 and padding is `[0,2,0,3]`; no nominal-only scale or core crop is used.
+Candidate G values must be explicit; grid checks retain their heuristic gates and never
+certify connectivity. Existing checkpoint inference remains compatible with baseline
+03bf3e33c7107af75297aa298fa323e24018f28d, while changed-code resume is rejected before
+optimizer/RNG restoration. This compatibility evidence is synthetic and specific to the
+unchanged schema/model-input contract, not a real-data guarantee.
+
+Preview context views add a 64-source-pixel display margin around each CNT bbox,
+clamped to the original frame. Reports preserve the tight bbox crop plus context bbox,
+source offset/shape and a separate integer nearest-neighbour display scale. Native
+context images keep one source pixel per image pixel. Selected upper electrodes are
+blue, selected lower rose, others gray; black outlines CNT, yellow shows J, and a
+visible green crosshair marks the shared endpoint. Unresolved rows show every candidate
+on each selected layer and its reason. Top-to-bottom layer text marks skipped electrode
+and cno layers separately. These windows/upscales never become model input. The offline
+HTML retains full-frame overview, margin components, core reference and confirmation
+status; fixed semantic colours do not depend on asset enumeration.
+
+For closed-network use, supply approved local Pillow and build wheels and inspect
+resource estimates before allocating a bundle. PNG pitch is 0.1 µm/pixel and exported
+`unit_size_um` is full frame extent, not an inferred unit. Exact vocabulary names are
+required by each checkpoint; no alias mapping exists. Complete is extraction coverage
+only and electrical verification is not performed, although coverage feeds the existing
+connectivity embedding. Real grid/linewidth, real writer/source compatibility, labels,
+G6 quality thresholds and resource approval remain pending. The 5–10 diverse product
+pilot is solely for integration/connection inspection.
+
+T4 validation on 2026-10-12: required targeted integration/compatibility command →
+**46 passed**, focused updated grid/preview/inspect-transform checks → **7 passed**,
+full default suite → **446 passed, 1 existing skip**. Exact commands, fixture recipe,
+baseline checkpoint/tensor evidence and pending review limits are preserved as a new
+entry in [validation.md](validation.md). Synthetic offline context preview is
+`/tmp/dl1-png-preview-evidence/t4-inspection/preview.html`; its 23-file bundle hash
+verification passed. The montage beside the bundle was visually checked. No real-data,
+electrical verification or retrieval-quality claim follows.

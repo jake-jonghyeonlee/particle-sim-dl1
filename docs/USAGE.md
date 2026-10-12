@@ -100,7 +100,7 @@ data/
 | `candidate_grid` | unit 전체를 맞출 격자 한 변의 칸 수 | 필수. 기본값이 없고 추정하지 않는다. 가장 가는 선이 약 2칸 이상 남도록 사용자가 정한다 |
 | `product_id` | 제품 이름 | manifest 안에서 유일 |
 | `lineage_id` | 같은 계열을 묶는 이름 | 같은 계열의 변형(크기만 다른 것 등)은 같은 값. 분할 누수 방지에 쓴다 |
-| `unit_size_um` | unit 크기 [가로, 세로] | `shape_yx × pixel_pitch_um`과 같아야 한다 |
+| `unit_size_um` | 전체 frame 범위 [가로, 세로] (PNG에서 단일 unit 추정 안 함) | `shape_yx × pixel_pitch_um`과 같아야 한다 |
 | `frame.pixel_pitch_um` | 1픽셀의 µm | manifest 안 모든 제품이 같아야 한다 |
 | `frame.shape_yx` | [세로, 가로] 픽셀 수 | 제품마다 달라도 된다 |
 | `frame.origin_xy_um` | 왼쪽 위 모서리 좌표 | |
@@ -380,3 +380,23 @@ reference-only core, 원본 bbox offset의 component display crop, 해결/미해
 model input은 항상 전체 frame**이다. Inspector는 연결을 전기적으로 승인하는 control이 아니다.
 실제 데이터 호환성과 검색 품질/G6는 폐쇄망 결과로 별도 평가한다. 5–10개 다양한 제품
 pilot은 import/연결 검사 pilot일 뿐 학습 자료 수나 검색 성능의 승인 기준이 아니다.
+
+
+### 공통 transform과 사람이 보는 context
+
+검사/export/validator grid 보고서와 train 끝점 feature는 같은 `frame_transform`을 쓴다.
+원본 H×W를 G에 맞춰 반올림한 nh×nw로 area resize하고 중앙 pad한다. 실제
+`sx=nw/W`, `sy=nh/H`는 반올림 때문에 서로 다를 수 있다. 보고서에는 shape,
+padding LTRB, 실제 XY scale, content의 effective pitch가 함께 있다. Pixel centre는
+`((x+0.5)*sx+left,(y+0.5)*sy+top)`로 연속 좌표 변환하며 inverse도 제공한다.
+이는 좌표의 round trip이고 이미지 축소를 복원한다는 뜻이 아니다. 전체 원본 frame의
+self/rest/CNT/valid/관계 mask에 같은 변환을 적용하고, 기존 float32 feature 산술을 유지한다.
+
+Preview는 각 CNT bbox에 64px 주변 맥락을 더해 frame 경계에 맞춰 보여준다.
+원본 context image는 1 source pixel/image pixel이며 작은 화면은 정수 배율
+nearest-neighbour 확대 파일을 따로 제공한다. bbox/offset/배율은 보고서에 기록된다.
+파랑=선택 위쪽 전극, rose=선택 아래쪽 전극(같은 선택 layer의 후보 모두), 회색=기타 전극,
+검정=CNT outline, 노랑=공통 교집합 J, 녹색 crosshair=공유 끝점이다. 미해결 이유와
+위→아래 layer 목록, 건너뛴 전극·cno 목록을 함께 확인한다. Crop/확대는 사람이 보는
+표시 용도이고 모델 입력은 그대로 전체 frame이다. 원본 해상도에서 해결한 관계가
+작은 grid에서 사라져도 원본 보고서에 남으며 train/search의 기존 gate가 차단한다.

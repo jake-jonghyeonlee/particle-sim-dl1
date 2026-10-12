@@ -18,7 +18,7 @@ Without an explicit relation, a pair is UNKNOWN. Positive self relations supply 
 
 ## Model and grid
 
-`prepare_product` is consumed without changing T8 files. Images retain the self/CNT-VIA/rest candidate channels and a fourth spatial-valid coverage channel. The encoder binds role/layer to each element. Source relations use the two bound element representations plus normalized padded-image endpoint XY, kind, observation flag and normalized mask mean coverage, pooled symmetrically across endpoint and connection order. An unavailable/partial/source-complete indicator preserves missing connectivity metadata. This is a candidate feature design; availability is never a CNN connectivity verdict.
+`prepare_product` preserves the original T8 channel and feature contract. Images retain the self/CNT-VIA/rest candidate channels and a fourth spatial-valid coverage channel. The encoder binds role/layer to each element. Source relations use the two bound element representations plus normalized padded-image endpoint XY, kind, observation flag and normalized mask mean coverage, pooled symmetrically across endpoint and connection order. An unavailable/partial/source-complete indicator preserves missing connectivity metadata. This is a candidate feature design; availability is never a CNN connectivity verdict.
 
 Training takes `candidate_grid` from the manifest. Neither CLI nor Python API guesses a default. `--grid` may match the candidate; a different value is rejected unless `--allow-grid-override` is explicitly supplied. The checkpoint records manifest/selected grids, source and the override flag. Direct API callers without manifest reports must supply a grid explicitly.
 
@@ -59,7 +59,7 @@ Resume uses the same total target epoch count semantics: `--epochs 150` continue
 
 Recovery is at the last completed epoch. Work from an interrupted partial epoch is repeated using the saved RNG/optimizer; no partial-step resume is claimed. Checkpoint reads use `weights_only=True`, reject incompatible versions/fingerprints, and verify state contents. Defaults use CPU; CUDA training is supported with its RNG states. Bitwise equality across different hardware/backends is not promised.
 
-Default unit tests perform direct forward/loss and optimizer-state fixtures only. The existing 40-epoch synthetic dataset smoke is explicit `--run-training`; its size-variant assertions are not lineage-held-out evidence. Real training and closed-network acceptance remain user-owned.
+Default tests include bounded synthetic forward/loss/optimizer fixtures and a one-step PNG training-driver integration with explicit synthetic metadata, labels and split. The existing 40-epoch synthetic dataset smoke is explicit `--run-training`; its size-variant assertions are not lineage-held-out evidence. Real training and closed-network acceptance remain user-owned.
 
 The checkpoint loader (`--ckpt` / `--resume`) accepts this project's own versioned checkpoints. Optional `--weights` accepts compatible backbone-only project/timm-format states with four input channels and no classifier head. **Loading public ConvNeXt V2 weight files has not been verified**; no stem expansion or classifier conversion is performed, and pretrained remains off by default. The optional `local-weights` dependency group explicitly declares safetensors; use approved local wheels without online fallback.
 
@@ -70,3 +70,29 @@ Preparation caching removes repeated validation/hash/resize for both views and s
 Search and evaluation report the numeric checkpoint `grid` and `grid_selection` with manifest candidate grids. Any mismatch requires `--allow-grid-override`; inference keeps the checkpoint grid and records the exception. Their default grid gate blocks thin-line/vanishing-bridge queries and excludes failing candidates, including held-out evaluation products and the baseline. Only `--allow-grid-check-failure` bypasses it, with per-product evidence in JSON. Both flags are separate, default off, and do not approve a real grid or minimum linewidth.
 
 Canonical single-product forwards preserve order/chunk-size reproducibility. `batch_size` controls candidate chunks rather than forward batch size; evaluation caches each product embedding once per command to avoid repeated forwards across queries, trading O(N × embedding dimension) memory for fewer forwards. Multi-product forward acceleration remains deferred because it changes arithmetic. The opt-in 40-epoch synthetic CNN smoke now uses an explicitly chosen synthetic grid 64, passes the strict grid gate with no bypass, and retains all loss/ranking/separation assertions; this fixture choice is not a real-data grid recommendation.
+
+
+## Imported PNG bundles
+
+Follow [USAGE](USAGE.md#8-실제-png-폴더-입력--검사--명시적-export) to inspect, explicitly
+export and validate the unchanged `dl1_shape_v1_draft` manifest. Optional Pillow 12.3.0
+and package build wheels must be locally approved; no downloads or online pretrained
+fallback occur. PNGs use 0.1 µm/pixel and `unit_size_um` means full frame extent.
+No core crop/tiling or label/split/grid inference occurs. Review resource N/E/K/R and
+full-frame relation-mask/retained float32 load estimates before loading a pool.
+
+Image preparation, endpoint features and importer reports now call one shared rounded
+full-frame transform; original relations/coordinates are preserved before resampling.
+Grid gates remain strict by default. Train vocabulary uses byte-exact electrode/layer
+names only; unseen query/candidate names are diagnosed and never aliased.
+**complete means extraction coverage only; electrical verification not performed.**
+That coverage enters the connectivity embedding and identity; confirmation flags are
+sidecar inspection evidence, not a new model status. Real linewidth/grid, source-format
+validation and G6 labels/quality remain pending. Start with the 5–10 diverse product
+integration/connection-inspection pilot before deciding real-data training/quality gates;
+that pilot is not a training sample-size or retrieval-quality claim.
+
+Baseline-format checkpoints with the unchanged model-input version still support
+inference. Resume requires exact code hash, so a checkpoint produced before the PNG
+implementation/shared helper is rejected for resume; begin a new explicitly configured
+run rather than bypassing provenance.

@@ -13,7 +13,7 @@ from PIL import Image
 import pytest
 
 from png_helpers import write_import_fixture, write_png
-from psdl1.data import load_manifest, input_identity
+from psdl1.data import load_manifest, input_identity, frame_transform
 import psdl1.import_png as importer
 from psdl1.png_contract import ImportOptions
 
@@ -207,6 +207,9 @@ def test_explicit_inspect_grid_evidence_without_export(tmp_path, monkeypatch):
     assert checks[0]["transform"]["padding_ltrb"] == [0, 1, 0, 2]
     assert checks[1]["transform"]["resized_shape_yx"] == [27, 32]
     assert checks[1]["transform"]["padding_ltrb"] == [0, 2, 0, 3]
+    for evidence in checks:
+        assert evidence["transform"] == frame_transform((1001, 1203), evidence["grid_check"]["grid"], 0.1).to_record()
+        assert evidence["grid_check"]["transform"] == evidence["transform"]
     assert all(e["purpose"] == "inspect_only_not_approved" and not e["grid_check"]["connectivity_preserving"] for e in checks)
     assert report(out)["metadata"]["models"] == [] and not (out / "manifest.json").exists()
 

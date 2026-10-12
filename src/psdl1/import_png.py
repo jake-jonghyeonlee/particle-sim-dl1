@@ -11,7 +11,7 @@ import tempfile
 
 import numpy as np
 
-from .data import grid_check, input_identity, load_manifest
+from .data import frame_transform, grid_check, input_identity, load_manifest
 from .png_connections import element_id, extract_inventory, iter_connections, to_product
 from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_id,
                            require_report_version)
@@ -154,19 +154,6 @@ def _publish_noreplace(stage, destination):
         raise OSError(code, os.strerror(code), str(destination))
 
 
-def _transform(shape, grid):
-    """Interim exact existing recipe; T4 replaces this with the shared helper."""
-    h, w = shape
-    nh, nw = max(1, round(h * grid / max(h, w))), max(1, round(w * grid / max(h, w)))
-    left, top = (grid - nw) // 2, (grid - nh) // 2
-    sx, sy = nw / w, nh / h
-    return {"source_shape_yx": [h, w], "grid": grid, "resized_shape_yx": [nh, nw],
-            "padding_ltrb": [left, top, grid - nw - left, grid - nh - top], "scale_xy": [sx, sy],
-            "original_pixel_pitch_um": 0.1, "effective_content_pitch_xy_um": [0.1 / sx, 0.1 / sy],
-            "comparison_scope": "full_frame", "padding_physical_extent": "none",
-            "mapping": "grid_edge_xy=((x+0.5)*sx+left,(y+0.5)*sy+top)"}
-
-
 def _duplicates(inventory):
     groups = {}
     for model in inventory.models:
@@ -301,7 +288,7 @@ def run_import(options, *, event_sink=None):
                         product = to_product(model, result)
                         for grid in sorted(set(options.inspect_grids)):
                             evidence.append({"model_id": model.model_id, "purpose": "inspect_only_not_approved",
-                                             "transform": _transform(model.frame.shape_yx, grid), "grid_check": grid_check(product, grid)})
+                                             "transform": frame_transform(model.frame.shape_yx, grid, model.frame.pixel_pitch_um).to_record(), "grid_check": grid_check(product, grid)})
                     except Exception as exc:
                         grid_error = True
                         diagnostics.append(SourceIssue(model.model_id, "inspect grid evaluation failed: " + str(exc), type(exc).__name__))
@@ -330,7 +317,7 @@ def run_import(options, *, event_sink=None):
                     validate_product(product)
                 identities = tuple(sorted((p.product_id, input_identity(p)) for p in loaded))
                 export_evidence = tuple({"model_id": p.product_id, "purpose": "export_candidate_not_approved",
-                                         "transform": _transform(p.frame.shape_yx, options.candidate_grid), "grid_check": p.grid_check}
+                                         "transform": frame_transform(p.frame.shape_yx, options.candidate_grid, p.frame.pixel_pitch_um).to_record(), "grid_check": p.grid_check}
                                         for p in loaded)
                 del loaded
                 pending_manifest.rename(stage / "manifest.json")

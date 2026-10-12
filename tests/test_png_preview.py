@@ -90,3 +90,37 @@ def test_source_warnings_and_runtime_version_are_visible(tmp_path, monkeypatch):
     html = (out / "preview.html").read_text()
     assert "99.0.TEST" in html and "notes.txt" in html and "electrode folder contains no PNG" in html
     assert "17–18 bytes/pixel" in doc["inventory"]["models"][0]["resource_estimate"]["overhead_note"]
+
+
+def test_preview_context_semantics_and_nearest_display_scale(tmp_path):
+    from png_helpers import write_wide_import_fixture
+    import numpy as np
+    root = tmp_path / "source"; write_wide_import_fixture(root)
+    out = tmp_path / "out"
+    assert run_import(ImportOptions(root, out))[1] == 0
+    doc = json.loads((out / "import-report.json").read_text())
+    crops = doc["preview"][0]["component_crops"]
+    assert [c["context_bbox_xyxy_px"] for c in crops] == [[0, 0, 120, 120], [520, 520, 680, 680],
+                                                           [720, 720, 880, 880], [920, 920, 1080, 1080]]
+    assert [c["context_source_offset_xy_px"] for c in crops] == [[0, 0], [520, 520], [720, 720], [920, 920]]
+    assert [c["display_integer_scale"] for c in crops] == [4, 3, 3, 3]
+    for c in crops:
+        assert c["context_margin_px"] == 64 and c["context_source_pixels_per_image_pixel"] == 1
+        assert c["display_resampling"] == "nearest" and c["model_input"] is False
+        with Image.open(out / c["context_image"]) as original, Image.open(out / c["display_image"]) as enlarged:
+            assert original.size == tuple(reversed(c["context_shape_yx"]))
+            scale = c["display_integer_scale"]
+            np.testing.assert_array_equal(np.asarray(enlarged), np.repeat(np.repeat(np.asarray(original), scale, axis=0), scale, axis=1))
+            # Shared endpoint is a visible multi-pixel marker, never a lone cell.
+            if c["state"] != "unresolved":
+                green = np.all(np.asarray(original) == [8, 123, 76], axis=-1)
+                assert green.sum() >= 40
+    with Image.open(out / crops[1]["context_image"]) as direct:
+        assert direct.getpixel((10, 80)) == (117, 168, 207)  # upper-only blue
+        assert direct.getpixel((80, 10)) == (205, 148, 162)  # lower-only rose
+    html = (out / "preview.html").read_text()
+    assert "blue=selected upper electrodes" in html and "rose=selected lower electrodes" in html
+    assert "all candidates on each selected layer" in html and "gray=other electrodes" in html
+    assert "black=CNT outline" in html and "yellow=common intersection J" in html and "green crosshair=shared endpoint" in html
+    assert "Involved layers, top to bottom: 1:U / A → 3:N / N [skipped, non-overlapping] → 4:C4 / cno [skipped, non-overlapping] → 5:U5 / A [skipped, non-overlapping] → 6:C6 / cno → 7:L / B" in html
+    assert "lower: B@7:L, D@7:L" in html and "multiple_lower_electrodes_on_selected_layer" in html

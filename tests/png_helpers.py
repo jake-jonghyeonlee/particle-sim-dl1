@@ -92,3 +92,33 @@ def write_import_fixture(root, *, model="SYNTHETIC-M", shape=(1001, 1203)):
         ("cno", "4_C4.png", ()),
         ("cno", "006_C6.png", direct + skipped + ambiguous + margin),
     ], shape=shape, model=model)
+
+
+def write_wide_import_fixture(root, *, model="SYNTHETIC-WIDE"):
+    """Hand-designed 32px CNT pads and 80px traces in a 1401×1603 frame.
+
+    CNT bboxes: margin [24,24,56,56], direct [584,584,616,616],
+    skipped [784,784,816,816], ambiguous [984,984,1016,1016].
+    Representative centres (ties y then x): (39,39), (599,599), (799,799).
+    """
+    shape = (1401, 1603)
+    pads = [(24, 24, 56, 56), (584, 584, 616, 616),
+            (784, 784, 816, 816), (984, 984, 1016, 1016)]
+    def rectangles(boxes):
+        result = np.zeros(shape, dtype=bool)
+        for x0, y0, x1, y1 in boxes: result[y0:y1, x0:x1] = True
+        return result
+    traces = [(0, 0, 220, 80), (440, 560, 720, 640),
+              (640, 760, 920, 840), (840, 960, 1120, 1040)]
+    lower_traces = [(0, 0, 80, 220), (560, 440, 640, 720),
+                    (760, 640, 840, 920), (960, 840, 1040, 1120)]
+    assets = [("A", "1-U.png", [traces[2]]),
+              ("A", "5-U5.png", [traces[i] for i in (0, 1, 3)]),
+              ("N", "3-N.png", [(1200, 1200, 1320, 1280)]),
+              ("B", "7-L.png", lower_traces), ("D", "7-L.png", [lower_traces[3]]),
+              ("cno", "4_C4.png", []), ("cno", "6_C6.png", pads)]
+    for folder, name, boxes in assets:
+        path = Path(root) / model / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.where(rectangles(boxes), 0, 255).astype(np.uint8)).save(path)
+    return pads

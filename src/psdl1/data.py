@@ -24,15 +24,72 @@ def _grid(grid):
     return grid
 
 
+@dataclass(frozen=True)
+class FrameTransform:
+    """Shared rounded full-frame geometry; raster loss is not reversible."""
+    shape_yx: tuple[int, int]
+    grid: int
+    resized_shape_yx: tuple[int, int]
+    padding_ltrb: tuple[int, int, int, int]
+    pixel_pitch_um: float | None = None
+
+    @property
+    def scale_xy(self):
+        h, w = self.shape_yx
+        nh, nw = self.resized_shape_yx
+        return nw / w, nh / h
+
+    def pixel_to_grid(self, x, y):
+        """Source pixel-centre indices to continuous grid-edge coordinates."""
+        sx, sy = self.scale_xy
+        left, top, _, _ = self.padding_ltrb
+        return (x + 0.5) * sx + left, (y + 0.5) * sy + top
+
+    def grid_to_pixel(self, gx, gy):
+        sx, sy = self.scale_xy
+        left, top, _, _ = self.padding_ltrb
+        return (gx - left) / sx - 0.5, (gy - top) / sy - 0.5
+
+    def source_edge_to_normalized(self, x, y):
+        """Keep legacy multiply/divide order exactly for model feature bytes."""
+        h, w = self.shape_yx
+        nh, nw = self.resized_shape_yx
+        left, top, _, _ = self.padding_ltrb
+        return ((x * nw / w + left) / self.grid, (y * nh / h + top) / self.grid)
+
+    def to_record(self):
+        sx, sy = self.scale_xy
+        return {"source_shape_yx": list(self.shape_yx), "grid": self.grid,
+                "resized_shape_yx": list(self.resized_shape_yx), "padding_ltrb": list(self.padding_ltrb),
+                "scale_xy": [sx, sy], "original_pixel_pitch_um": self.pixel_pitch_um,
+                "effective_content_pitch_xy_um": None if self.pixel_pitch_um is None else [self.pixel_pitch_um / sx, self.pixel_pitch_um / sy],
+                "comparison_scope": "full_frame", "padding_physical_extent": "none",
+                "mapping": "grid_edge_xy=((x+0.5)*sx+left,(y+0.5)*sy+top)"}
+
+
+def frame_transform(shape_yx, grid, pixel_pitch_um=None):
+    """One unchanged area-resize/central-pad recipe; never guess a grid."""
+    _grid(grid)
+    if len(shape_yx) != 2 or any(type(v) is not int or v <= 0 for v in shape_yx):
+        raise ValueError("transform requires positive integer shape_yx")
+    if pixel_pitch_um is not None:
+        numbers([pixel_pitch_um], 1, "pixel_pitch_um", positive=True)
+    h, w = shape_yx
+    nh, nw = max(1, round(h * grid / max(h, w))), max(1, round(w * grid / max(h, w)))
+    left, top = (grid - nw) // 2, (grid - nh) // 2
+    return FrameTransform(tuple(shape_yx), grid, (nh, nw),
+                          (left, top, grid - nw - left, grid - nh - top), pixel_pitch_um)
+
+
 def normalize_unit(mask: np.ndarray, grid: int) -> np.ndarray:
     """Common full-frame area resize + central pad, never per-element centring."""
     _grid(grid)
     m = torch.from_numpy(binary_mask(mask))
-    h, w = m.shape
-    nh, nw = max(1, round(h * grid / max(h, w))), max(1, round(w * grid / max(h, w)))
+    transform = frame_transform(tuple(m.shape), grid)
+    nh, nw = transform.resized_shape_yx
     resized = F.interpolate(m[None, None], size=(nh, nw), mode="area")[0, 0]
     out = torch.zeros(grid, grid)
-    top, left = (grid - nh) // 2, (grid - nw) // 2
+    left, top, _, _ = transform.padding_ltrb
     out[top:top + nh, left:left + nw] = resized
     return out.numpy()
 
@@ -117,6 +174,7 @@ def grid_check(product: Product, grid: int):
     if any(e["observation"] == "missing" for e in evidence) or not valid.all():
         reasons.append("missing_observations_or_valid_holes")
     return {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
+            "transform": frame_transform(shape, grid, product.frame.pixel_pitch_um if product.frame else product.unit_size_um[0] / shape[1]).to_record(),
             "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
             "approval": approval_status(), "connectivity_status": product.connectivity_status,
             "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",

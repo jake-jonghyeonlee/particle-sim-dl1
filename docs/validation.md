@@ -149,3 +149,80 @@ Caching is scoped to one evaluation command and requires O(N × embedding dimens
 | `git diff --check` | Passed |
 
 The default suite uses encoder/optimizer fixtures only; the existing synthetic CNN smoke remains opt-in. All tests retain the socket-network ban. Changes are left in the working tree without a commit; independent review of this candidate remains the coordinator's responsibility.
+
+## PNG T4 integration candidate — 2026-10-12
+
+Baseline: accepted T3 `e2d329333d6e240dc4af0abb1af324b96efa379f` on
+`feat/png-input`. This is implementation evidence for independent R-B review, not an
+independent PASS or real-data/quality claim. All earlier validation records above are
+historical and retained. No real layout, supplied label corpus, remote request,
+package install or pretrained artifact was used. The existing 40-epoch smoke was not
+opted into; its default skip remains. The coordinator explicitly added preview/context
+files to T4 ownership; core schema/model/checkpoint/search/evaluation/split/loss files
+and `requirements.lock` remained unchanged.
+
+| Exact command | Result |
+| --- | --- |
+| `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider tests/test_png_integration.py tests/test_png_transform.py tests/test_png_compatibility.py tests/test_checkpoint.py tests/test_search.py tests/test_offline.py` | 46 passed, 0 failed, 42.68 s |
+| `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider tests/test_png_integration.py::test_grid_loss_gates_and_original_relations_survive tests/test_png_transform.py::test_shared_transform_matches_float32_endpoint_features_at_corners tests/test_png_preview.py tests/test_png_import.py::test_explicit_inspect_grid_evidence_without_export` | 7 passed, 0 failed, 3.91 s |
+| `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -p no:warnings` | 446 passed, 1 existing skip, 0 failed, 78.11 s |
+| `git diff --check` | Passed |
+
+S17/S18 retain independently specified patterns in all four 500px margins, overlapping
+self/rest masks, unresolved global CNT and source relation masks. Hand-computed H=1001,
+W=1203/G=32 gives 27×32 content and padding `[0,2,0,3]`; corner/interior continuous
+round trips use absolute float64 tolerance 2e-13 and float32 endpoint comparison 1e-7.
+S26 inspect/export/validator transform records equal the shared helper's record and
+structured endpoint coordinates agree with the same rounded dimensions/pad.
+
+S19 exports two >1000px-axis synthetic products through the actual importer CLI and
+validates them through unchanged `load_manifest`/`validate_product` plus the actual
+`python -m psdl1.data` CLI. A tiny forward/loss/optimizer fixture and one-step training
+driver use explicit synthetic lineage/design IDs, a labelled synthetic negative and a
+lineage-safe split; the saved checkpoint records that split, a passing strict grid gate
+and exactly one optimizer step. Actual `python -m psdl1.search` and real-encoder API
+search return available finite results, stable across candidate order/chunk size.
+No assertion treats those rankings as quality/generalization evidence. S21 resolves a
+one-pixel CNT at original coordinate `(601,601)`, then proves the small-grid training/
+search gates block by default and record an explicit bypass. S24 tests unseen query,
+candidate and direct-embed role/layer diagnostics on a passing grid. S27 hooks the real
+connectivity embedding and observes `[0,1,2]` for unavailable/partial/complete coverage;
+identity changes with coverage, while electrical verification remains not performed.
+
+S20 snapshots **03bf3e33c7107af75297aa298fa323e24018f28d** with `git archive | tar -x`
+into test temp storage, without a worktree/checkout/branch. Baseline and candidate run
+in separate subprocesses, cwd outside the repositories and explicit PYTHONPATH, and
+assert `psdl1.data.__file__` under the expected source tree. Both use seed 47, identical
+7×11 bool NPY fixtures, 0.05 synthetic legacy pitch, origin `[1,-2]`, grid 16 and a
+16-dimensional tiny encoder with 8-dimensional output. Content is 10×16 with top/bottom
+pad 3; hand-specified endpoint features start `[0,1,0.5,0.5,0.5,0.5,0,1]`.
+Every normalized image, collated tensor, valid/relation tensor, endpoint feature and
+embedding matches **byte-for-byte**, with equal input identity/config. Checkpoint format
+`dl1_checkpoint_v1`, schema `dl1_shape_v1_draft` and model input
+`dl1_structured_v2_padded_endpoints` stay unchanged; wrong schema/model-input/fingerprint
+rejects, baseline checkpoint inference matches exactly, and changed-code resume rejects
+before RNG restoration. Snapshot/checkpoint/golden outputs stay in `tmp_path`, not Git.
+
+S22 blocks Pillow imports in a subprocess while running NPY load/checkpoint inference,
+then asserts PNG fails with optional-dependency guidance; documentation keeps offline
+Pillow/build-wheel prerequisites, 0.1 PNG pitch, full frame extent, no crop, exact
+vocabulary and pending G6/pilot limits. Tests retain the socket-network ban.
+
+Preview evidence: `/tmp/dl1-png-preview-evidence/t4-inspection/preview.html`, plus its
+sealed report/integrity manifest and local Pillow rasters. A 1401×1603 frame contains
+80px crossing traces, 32px CNT pads, direct/margin resolved contacts, skipped-layer
+confirmation and ambiguous same-layer lower candidates. The 64px padded context bboxes
+are `[0,0,120,120]`, `[520,520,680,680]`, `[720,720,880,880]`,
+`[920,920,1080,1080]`; native context keeps one source pixel/image pixel and display
+scales are `[4,3,3,3]` with nearest-neighbour pixels verified exactly. A visual montage
+at `/tmp/dl1-png-preview-evidence/t4-visual-check.png` was inspected for axes, reference
+core, margin visibility, semantic upper/lower colours, CNT outlines/J and multi-pixel
+endpoint markers. Bundle verification returned `verified` for all 23 listed files.
+The earlier draft preview is preserved at `t4-inspection-initial`; no existing bundle
+was overwritten. Display context never enters model input.
+
+Complete means extraction coverage only; electrical verification not performed.
+Real grid/minimum linewidth, source compatibility, labels/splits, electrical truth,
+resources and retrieval-quality acceptance require closed-network decisions/evidence.
+The 5–10 diverse product pilot is strictly integration/connection inspection. Independent
+R-B review of the final exact candidate remains the coordinator's next gate.

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .checkpoint import code_hash, file_hash, json_hash, resume_checkpoint, save_checkpoint, validate_config
-from .data import Product, build_vocab, collate, grid_check, input_identity, load_manifest, prepare_product, unit_feature
+from .data import Product, build_vocab, collate, frame_transform, grid_check, input_identity, load_manifest, prepare_product, unit_feature
 from .losses import NEGATIVE, masked_contrastive_loss, relation_coverage, relation_matrix, validate_relations
 from .model import ProductEncoder
 from .split import training_only_split, validate_split
@@ -87,16 +87,14 @@ def structured_batch(products, grid, roles, layers, *, augmentation="none", gene
     cv = torch.zeros(len(products), k, dtype=torch.bool)
     for b, (p, item) in enumerate(zip(products, prepared)):
         by_id = {e.key: i for i, e in enumerate(p.elements)}
+        transform = frame_transform(p.frame.shape_yx, grid, p.frame.pixel_pitch_um) if item.connections else None
         for j, c in enumerate(item.connections):
             a, z = c.endpoints
             # Exactly the image resize/pad recipe, in normalized candidate-grid XY.
-            h, w = p.frame.shape_yx
-            nh, nw = max(1, round(h * grid / max(h, w))), max(1, round(w * grid / max(h, w)))
-            left, top = (grid - nw) // 2, (grid - nh) // 2
             def position(endpoint):
                 x = (endpoint.xy_um[0] - p.frame.origin_xy_um[0]) / p.frame.pixel_pitch_um
                 y = (endpoint.xy_um[1] - p.frame.origin_xy_um[1]) / p.frame.pixel_pitch_um
-                return ((x * nw / w + left) / grid, (y * nh / h + top) / grid)
+                return transform.source_edge_to_normalized(x, y)
             ax, ay = position(a)
             zx, zy = position(z)
             cf[b, j] = torch.tensor([by_id[a.element_id], by_id[z.element_id], ax, ay, zx, zy,

@@ -8,6 +8,9 @@ from .png_contract import canonical_id, require_report_version
 
 # Display palette and overview size are UI choices, never a model grid/alias map.
 DISPLAY_MAX_EDGE = 900
+CONTEXT_MARGIN_PX = 64
+SEMANTIC_COLOURS = {"upper": (33, 115, 178), "lower": (175, 83, 105),
+                    "other": (140, 140, 140), "intersection": (255, 210, 40), "cnt": (20, 20, 20)}
 COLOURS = [(33, 115, 178), (115, 78, 172), (27, 145, 108), (175, 83, 105), (122, 103, 49)]
 
 
@@ -36,6 +39,57 @@ def _skipped_text(skipped):
     electrode = "; ".join(f"{l.stack}:{l.layer} [{', '.join(l.source_paths)}]" for l in skipped.electrode_layers) or "none"
     cno = "; ".join(f"{l.stack}:{l.layer} [{', '.join(l.source_paths)}]" for l in skipped.cno_layers) or "none"
     return escape("electrode layers: " + electrode + " | cno layers: " + cno)
+
+
+def _context_image(model, component):
+    """Display-only source window; semantic colours never depend on enumeration."""
+    from PIL import Image, ImageDraw
+    h, w = model.frame.shape_yx
+    x0, y0, x1, y1 = component.bbox_xyxy_px
+    box = (max(0, x0 - CONTEXT_MARGIN_PX), max(0, y0 - CONTEXT_MARGIN_PX),
+           min(w, x1 + CONTEXT_MARGIN_PX), min(h, y1 + CONTEXT_MARGIN_PX))
+    a, b, z, d = box
+    upper = {c.asset_id for c in component.selected_upper_candidates}
+    lower = {c.asset_id for c in component.selected_lower_candidates}
+    image = Image.new("RGBA", (z - a, d - b), "white")
+    for asset in model.electrodes:
+        key = "upper" if asset.asset_id in upper else "lower" if asset.asset_id in lower else "other"
+        image.alpha_composite(_layer_image(asset.mask[b:d, a:z], image.size, SEMANTIC_COLOURS[key]))
+    # J and outline are computed only in the component's bbox, then placed in
+    # this display context. No padded display mask is sent to the model.
+    local = component.mask
+    if len(upper) == len(lower) == 1:
+        assets = {asset.asset_id: asset for asset in model.electrodes}
+        j = local & assets[next(iter(upper))].mask[y0:y1, x0:x1] & assets[next(iter(lower))].mask[y0:y1, x0:x1]
+        patch = _layer_image(j, (x1 - x0, y1 - y0), SEMANTIC_COLOURS["intersection"])
+        image.alpha_composite(patch, (x0 - a, y0 - b))
+    padded = np.pad(local, 1)
+    interior = padded[1:-1, 1:-1] & padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
+    outline = Image.new("RGBA", (x1 - x0, y1 - y0), SEMANTIC_COLOURS["cnt"] + (0,))
+    outline.putalpha(Image.fromarray((local & ~interior).astype(np.uint8) * 255))
+    image.alpha_composite(outline, (x0 - a, y0 - b))
+    if component.relation is not None:
+        x, y = component.relation.representative_xy_px
+        marker = ImageDraw.Draw(image)
+        marker.ellipse((x-a-5, y-b-5, x-a+5, y-b+5), fill="white", outline="#087b4c", width=2)
+        marker.line((x-a-7, y-b, x-a+7, y-b), fill="#087b4c", width=2)
+        marker.line((x-a, y-b-7, x-a, y-b+7), fill="#087b4c", width=2)
+    return image.convert("RGB"), box
+
+
+def _stack_text(model, component):
+    r = component.relation
+    skipped = set()
+    if r is not None:
+        for side in (r.skipped_upper_layers, r.skipped_lower_layers):
+            for layer in side.electrode_layers + side.cno_layers:
+                skipped.update(layer.asset_ids)
+    involved = {c.asset_id for c in component.above_candidates + component.below_candidates + component.equal_stack_candidates}
+    involved.add(component.source_asset_id)
+    involved.update(skipped)
+    lines = [f"{a.stack}:{a.layer} / {a.electrode or 'cno'}" + (" [skipped, non-overlapping]" if a.asset_id in skipped else "")
+             for a in sorted(model.assets, key=lambda a: (a.stack, a.layer, a.electrode or 'cno')) if a.asset_id in involved]
+    return '<p>Involved layers, top to bottom: ' + escape(' → '.join(lines)) + '</p>'
 
 
 def write_preview(stage, inventory, extraction, *, report=None):
@@ -98,6 +152,12 @@ def write_preview(stage, inventory, extraction, *, report=None):
                 ImageDraw.Draw(crop).point((cx, cy), fill="#bb7100" if r.needs_confirmation else "#087b4c")
             crop_relative = "preview/" + component.component_id + "-crop.png"
             crop.convert("RGB").save(stage / crop_relative)
+            context, context_box = _context_image(model, component)
+            context_relative = "preview/" + component.component_id + "-context.png"
+            context.save(stage / context_relative)
+            display_factor = max(1, min(4, 512 // max(context.size)))
+            enlarged_relative = "preview/" + component.component_id + "-context-display.png"
+            context.resize((context.width * display_factor, context.height * display_factor), Image.Resampling.NEAREST).save(stage / enlarged_relative)
             anchor = "component-" + component.component_id
             above = ", ".join(f"{c.electrode}@{c.stack}:{c.layer}" for c in component.selected_upper_candidates) or "none"
             below = ", ".join(f"{c.electrode}@{c.stack}:{c.layer}" for c in component.selected_lower_candidates) or "none"
@@ -107,6 +167,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
                 details += f'<p>Endpoint source XY: {escape(str(r.representative_xy_px))}; µm: {escape(str(r.endpoints[0].xy_um))}; both endpoints share this centre.</p>'
                 details += '<p>Skipped upper — ' + _skipped_text(r.skipped_upper_layers) + '</p>'
                 details += '<p>Skipped lower — ' + _skipped_text(r.skipped_lower_layers) + '</p>'
+            details += _stack_text(model, component)
             ignored = "; ".join(f"{c.candidate.electrode}@{c.candidate.stack}:{c.candidate.layer}: {c.reason}" for c in component.ignored_lower_candidates) or "none"
             details += f'<p>Ignored lower candidates: {escape(ignored)}</p>'
             details += '<details><summary>All overlapping source candidates</summary><p>' + escape(str([
@@ -115,11 +176,17 @@ def write_preview(stage, inventory, extraction, *, report=None):
             component_sections.append(f'<article class="{state}" id="{anchor}"><h3>{number}. {state.replace("_", " ")}</h3>'
                                       f'<code>{component.component_id}</code><p>Source bbox XYXY: {component.bbox_xyxy_px}; '
                                       f'crop offset XY=({x0},{y0}); 1 source pixel / display image pixel.</p>'
-                                      f'<a href="{crop_relative}"><img class="crop" src="{crop_relative}" '
+                                      f'<p>Context window XYXY={context_box}; source offset {context_box[0]},{context_box[1]}; nearest-neighbour display ×{display_factor}.</p>'
+                                      f'<a href="{context_relative}"><img class="crop" src="{enlarged_relative}" '
                                       f'alt="Original-resolution component {number} at source offset {x0},{y0}"></a>{details}</article>')
             crops.append({"component_id": component.component_id, "image": crop_relative, "bbox_xyxy_px": list(component.bbox_xyxy_px),
                           "source_offset_xy_px": [x0, y0], "shape_yx": [y1 - y0, x1 - x0], "source_pixels_per_image_pixel": 1,
-                          "state": state, "model_input": False})
+                          "state": state, "model_input": False,
+                          "context_image": context_relative, "context_bbox_xyxy_px": list(context_box),
+                          "context_source_offset_xy_px": list(context_box[:2]),
+                          "context_shape_yx": [context.height, context.width], "context_margin_px": CONTEXT_MARGIN_PX,
+                          "context_source_pixels_per_image_pixel": 1, "display_image": enlarged_relative,
+                          "display_integer_scale": display_factor, "display_resampling": "nearest"})
         annotation_relative = "preview/" + model_key + "-annotations.png"
         annotation.save(stage / annotation_relative)
         overview.paste(annotation, (0, 0), annotation)
@@ -151,7 +218,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
             'p{line-height:1.5}h2{margin-top:0}a{color:#185e9f}</style><header><h1>DL1 PNG source inspection</h1>'
             '<p><strong>automatic extraction; electrical verification not performed</strong></p>'
             '<p>Display crops are for inspection only, not model input. Model input always retains the full frame and real margins.</p>'
-            '<p>complete means extraction coverage only; electrical verification not performed. 4-neighbour and skipped-layer rules are implementation interpretations.</p></header>'
+            '<p>Context legend: blue=selected upper electrodes; rose=selected lower electrodes (all candidates on each selected layer); gray=other electrodes; black=CNT outline; yellow=common intersection J; green crosshair=shared endpoint.</p><p>complete means extraction coverage only; electrical verification not performed. 4-neighbour and skipped-layer rules are implementation interpretations.</p></header>'
             '<main><details open><summary>Source warnings and possible duplicates</summary><ul>' + warnings_html + '</ul></details>' + ''.join(sections) + '</main>'
             '<script>document.querySelectorAll("[data-layer]").forEach(x=>x.addEventListener("change",()=>{document.getElementById(x.dataset.layer).hidden=!x.checked;}));</script></html>')
     (stage / "preview.html").write_text(html, encoding="utf-8")
