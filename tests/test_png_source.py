@@ -346,6 +346,7 @@ def test_ra_b1_short_complete_zlib_greyscale_1bit(tmp_path, rows):
     path.write_bytes(raw_png(64, 64, 1, 0, (b"\0" + b"\xff" * 8) * rows))
     with pytest.raises(PNGSourceError, match="scanline|truncated") as error:
         decode_png(path)
+    assert error.value.issue.reason.startswith("IDAT scanline byte count is short:")
     assert str(path) in str(error.value)
 
 
@@ -355,6 +356,7 @@ def test_ra_b1_short_complete_zlib_greyscale_8bit(tmp_path):
     path.write_bytes(raw_png(4, 4, 8, 0, b"\0\xff\xff\0\0" * 3))
     with pytest.raises(PNGSourceError, match="scanline") as error:
         decode_png(path)
+    assert error.value.issue.reason.startswith("IDAT scanline byte count is short:")
     assert str(path) in str(error.value)
 
 
@@ -371,6 +373,7 @@ def test_ra_b2_raw_greyscale_trns_rejected(tmp_path, depth, transparent_sample):
                             before_idat=((b"tRNS", struct.pack(">H", sample)),)))
     with pytest.raises(PNGSourceError, match="tRNS") as error:
         decode_png(path)
+    assert error.value.issue.reason == "non-palette tRNS is nonopaque/unsupported"
     assert str(path) in str(error.value)
 
 
@@ -394,15 +397,17 @@ def test_ra_b3_palette_out_of_range_index(tmp_path, depth):
                             before_idat=((b"PLTE", b"\xff\xff\xff\0\0\0"),)))
     with pytest.raises(PNGSourceError, match="PLTE entry") as error:
         decode_png(path)
+    assert error.value.issue.reason == "palette pixel index has no PLTE entry"
     assert str(path) in str(error.value)
 
 
 def test_ra_b3_missing_palette(tmp_path):
     from png_helpers import raw_png
-    path = tmp_path / "missing-PLTE.png"
+    path = tmp_path / "undefined.png"
     path.write_bytes(raw_png(4, 1, 8, 3, b"\0\1\0\0\1"))
     with pytest.raises(PNGSourceError, match="PLTE") as error:
         decode_png(path)
+    assert error.value.issue.reason == "IDAT order invalid or palette PNG missing PLTE"
     assert str(path) in str(error.value)
 
 
@@ -424,6 +429,14 @@ def test_ra_n5_lenient_structures_now_rejected(tmp_path, case):
     path = tmp_path / f"{case}.png"; path.write_bytes(data)
     with pytest.raises(PNGSourceError) as error:
         decode_png(path)
+    reasons = {
+        "after_iend": "trailing bytes after IEND", "concatenated_png": "trailing bytes after IEND",
+        "missing_crc_iend": "PNG IDAT CRC mismatch/truncation", "wrong_idat_crc": "PNG IDAT CRC mismatch/truncation",
+        "interlace2": "unsupported IHDR compression/filter/interlace method",
+        "compression1": "unsupported IHDR compression/filter/interlace method",
+        "filter_method1": "unsupported IHDR compression/filter/interlace method",
+        "overlong_stream": "IDAT scanline byte count is longer than IHDR requires"}
+    assert error.value.issue.reason == reasons[case]
     assert str(path) in str(error.value)
 
 
@@ -455,6 +468,15 @@ def test_png_critical_order_and_stream_integrity(tmp_path, case):
     else: data = valid[:33] + png_chunk(b"tEXt", b"x\0y", corrupt_crc=True) + valid[33:]
     path = tmp_path / f"{case}.png"; path.write_bytes(data)
     with pytest.raises(PNGSourceError) as error: decode_png(path)
+    reasons = {
+        "ihdr_not_first": "IHDR must be the first PNG chunk", "duplicate_ihdr": "PNG requires exactly one 13-byte IHDR first",
+        "missing_iend": "PNG missing/truncated chunk or IEND", "unknown_critical": "unknown critical PNG chunk",
+        "plte_after_idat": "invalid PLTE length/order/colour type", "noncontiguous_idat": "IDAT order invalid or palette PNG missing PLTE",
+        "duplicate_plte": "invalid PLTE length/order/colour type", "iend_payload": "invalid IEND length/order or missing IDAT",
+        "bad_filter_byte": "invalid PNG scanline filter type", "invalid_colour_depth": "invalid/unsupported IHDR dimensions/bit depth/colour type",
+        "invalid_plte_length": "invalid PLTE length/order/colour type", "extra_zlib_stream": "extra compressed bytes after IDAT zlib stream",
+        "incomplete_zlib": "truncated/incomplete IDAT zlib stream", "bad_ancillary_crc": "PNG tEXt CRC mismatch/truncation"}
+    assert error.value.issue.reason == reasons[case]
     assert str(path) in str(error.value)
 
 
@@ -572,3 +594,111 @@ def test_inventory_non_nfc_names_warn_without_normalising(tmp_path):
     assert any("not NFC" in e.reason for e in result.models[0].warnings)
     assert result.models[0].assets[0].asset_id != result.models[1].assets[0].asset_id
     assert canonical_id("element", ["M", nfc]) != canonical_id("element", ["M", nfd])
+
+
+@pytest.mark.parametrize("case", ["8x4", "8x7_offset", "1x1_offset", "full_single_frame", "4x4_offset",
+                                  "zero_frames", "two_actl", "actl_after_idat", "fctl_only", "fdat_only"])
+def test_ra2_apng_rejected_with_validator_reason_before_pillow(tmp_path, monkeypatch, case):
+    import struct
+    import zlib
+    from png_helpers import raw_png
+    from psdl1.png_source import _validate_png_structure
+    size = {"8x4": (8, 4, 0, 0), "8x7_offset": (8, 7, 0, 1), "1x1_offset": (1, 1, 7, 7),
+            "4x4_offset": (4, 4, 2, 2)}.get(case, (8, 8, 0, 0))
+    control = (b"fcTL", struct.pack(">IIIIIHHBB", 0, *size, 1, 100, 0, 0))
+    actl = (b"acTL", struct.pack(">II", 0 if case == "zero_frames" else 1, 0))
+    before = (actl, control)
+    after = ()
+    if case == "zero_frames": after = ((b"fdAT", struct.pack(">I", 1) + zlib.compress(b"\0\xff")),)
+    elif case == "two_actl": before = (actl, actl, control)
+    elif case == "actl_after_idat": before, after = (), (actl,)
+    elif case == "fctl_only": before = (control,)
+    elif case == "fdat_only": before, after = (), ((b"fdAT", b"\0\0\0\1"),)
+    path = tmp_path / f"{case}.png"
+    path.write_bytes(raw_png(8, 8, 8, 0, (b"\0" + b"\xff" * 8) * 8,
+                            before_idat=before, after_idat=after))
+    with pytest.raises(ValueError) as direct:
+        _validate_png_structure(path)
+    assert str(direct.value) == "APNG is unsupported"
+    def forbidden_pillow_open(*args, **kwargs):
+        pytest.fail("Pillow was called before structural rejection")
+    monkeypatch.setattr(Image, "open", forbidden_pillow_open)
+    with pytest.raises(PNGSourceError) as error:
+        decode_png(path)
+    assert error.value.issue.reason == "APNG is unsupported"
+
+
+@pytest.mark.parametrize("colour,depth", [(0, 1), (0, 2), (0, 4), (0, 8), (2, 8),
+                                         (3, 1), (3, 2), (3, 4), (3, 8), (4, 8), (6, 8)])
+@pytest.mark.parametrize("shape", [(9, 9), (11, 13)])
+def test_adam7_every_pass_nonempty_for_supported_types(tmp_path, colour, depth, shape):
+    from png_helpers import encode_adam7_binary, raw_png
+    # Independently specified repeating geometry; every Adam7 pass is nonempty.
+    pattern = np.array([[(x + 2 * y) % 3 == 0 for x in range(shape[1])] for y in range(shape[0])])
+    raw = encode_adam7_binary(pattern, depth, colour)
+    palette = ((b"PLTE", b"\0\0\0\xff\xff\xff"),) if colour == 3 else ()
+    path = tmp_path / f"adam7-{colour}-{depth}-{shape}.png"
+    path.write_bytes(raw_png(shape[1], shape[0], depth, colour, raw, interlace=1, before_idat=palette))
+    assert decode_png(path)[0].tolist() == pattern.tolist()
+
+
+@pytest.mark.parametrize("depth,packed,expected,palette", [
+    (1, b"\x1f", [True, True, True], b"\0\0\0"),  # set padding bits are not pixels
+    (2, b"\x47", [True, False, True], b"\xff\xff\xff\0\0\0"),
+    (4, b"\x10\x1f", [True, False, True], b"\xff\xff\xff\0\0\0"),
+])
+def test_packed_index_shift_order_and_padding_are_not_symmetric(tmp_path, depth, packed, expected, palette):
+    from png_helpers import raw_png
+    path = tmp_path / f"asymmetric-packed-{depth}.png"
+    path.write_bytes(raw_png(3, 1, depth, 3, b"\0" + packed, before_idat=((b"PLTE", palette),)))
+    assert decode_png(path)[0].tolist() == [expected]
+
+
+def test_paeth_tie_prefers_left_over_upper_left(tmp_path):
+    from png_helpers import raw_png
+    # Second row, column 1: left=3, above=0, upper-left=1. Paeth p=2,
+    # distances (1,2,1), so LEFT 3 wins the tie; upper-left 1 is white.
+    path = tmp_path / "paeth-tie.png"
+    palette = b"\xff\xff\xff" * 3 + b"\0\0\0"
+    path.write_bytes(raw_png(2, 2, 8, 3, b"\0\1\0\4\2\0", before_idat=((b"PLTE", palette),)))
+    assert decode_png(path)[0].tolist() == [[False, False], [True, True]]
+    bad = tmp_path / "paeth-tie-undefined.png"
+    # Correct left predictor 3 plus residual 1 gives undefined index 4;
+    # wrong upper-left predictor 1 gives valid index 2 and hides the defect.
+    bad.write_bytes(raw_png(2, 2, 8, 3, b"\0\1\0\4\2\1", before_idat=((b"PLTE", palette),)))
+    with pytest.raises(PNGSourceError) as error:
+        decode_png(bad)
+    assert error.value.issue.reason == "palette pixel index has no PLTE entry"
+
+
+@pytest.mark.parametrize("mode,bits", [("1", None), ("L", None), ("RGB", None), ("LA", None), ("RGBA", None),
+                                      ("P", 1), ("P", 2), ("P", 4), ("P", 8)])
+@pytest.mark.parametrize("compression", [0, 9])
+def test_pillow_plain_modes_with_ancillary_chunks_still_accepted(tmp_path, mode, bits, compression):
+    from PIL.PngImagePlugin import PngInfo
+    info = PngInfo()
+    info.add_text("purpose", "opaque synthetic fixture")
+    info.add_text("compressed", "black-white", zip=True)
+    info.add_itxt("unicode", "검증 fixture")
+    exif = Image.Exif(); exif[274] = 1
+    options = {"pnginfo": info, "exif": exif, "dpi": (72, 72)}
+    if bits is not None: options["bits"] = bits
+    path = write_png(tmp_path, f"plain-{mode}-{bits}-{compression}.png", shape=(19, 17),
+                     mode=mode, pixels=((1, 2), (18, 16)), compress_level=compression, **options)
+    mask, _, _ = decode_png(path)
+    assert np.argwhere(mask).tolist() == [[1, 2], [18, 16]]
+
+
+def test_pillow_large_multiple_idat_and_ancillary_chunks_accepted(tmp_path):
+    import struct
+    from PIL.PngImagePlugin import PngInfo
+    info = PngInfo(); info.add_text("kind", "plain")
+    path = write_png(tmp_path, "multiple.png", shape=(1500, 1700), mode="P", bits=1,
+                     pixels=((0, 0), (1499, 1699)), compress_level=0, pnginfo=info)
+    data = path.read_bytes(); offset = 8; idats = 0
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        idats += data[offset + 4:offset + 8] == b"IDAT"
+        offset += length + 12
+    assert idats > 1
+    assert np.argwhere(decode_png(path)[0]).tolist() == [[0, 0], [1499, 1699]]

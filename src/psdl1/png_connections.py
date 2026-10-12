@@ -113,20 +113,36 @@ def representative_pixel(intersection):
     if not count:
         raise ValueError("representative pixel requires nonempty intersection")
     maximum = np.iinfo(np.int64).max
-    # count*max coordinate bounds each sum, product and centroid numerator;
-    # the sum of squared bounds then bounds every compared distance.
-    bound_y, bound_x = count * int(ys.max()), count * int(xs.max())
-    if bound_y ** 2 + bound_x ** 2 <= maximum:
-        dy = ys.astype(np.int64) * count - ys.sum(dtype=np.int64)
-        dx = xs.astype(np.int64) * count - xs.sum(dtype=np.int64)
-        index = int(np.argmin(dy * dy + dx * dx))  # nonzero order is y then x
+    max_y, max_x = int(ys.max()), int(xs.max())
+    py_y = None if count * max_y <= maximum else ys.tolist()
+    py_x = None if count * max_x <= maximum else xs.tolist()
+    sum_y = int(ys.sum(dtype=np.int64)) if py_y is None else sum(py_y)
+    sum_x = int(xs.sum(dtype=np.int64)) if py_x is None else sum(py_x)
+    mean_y, rem_y = divmod(sum_y, count)
+    mean_x, rem_x = divmod(sum_x, count)
+    bound_y = max(abs(int(ys.min()) - mean_y), abs(max_y - mean_y))
+    bound_x = max(abs(int(xs.min()) - mean_x), abs(max_x - mean_x))
+    # Drop the constant centroid remainder squares from all distances and cancel
+    # one factor of count. Each intermediate and absolute score is <= bound.
+    bound = count * (bound_y ** 2 + bound_x ** 2) + 2 * rem_y * bound_y + 2 * rem_x * bound_x
+    if bound <= maximum:
+        dy = ys.astype(np.int64) - mean_y
+        dx = xs.astype(np.int64) - mean_x
+        scores = count * (dy * dy + dx * dx) - 2 * rem_y * dy - 2 * rem_x * dx
+        index = int(np.argmin(scores))  # nonzero order is y then x
         return int(xs[index]), int(ys[index])
-    sum_y = sum(map(int, ys))
-    sum_x = sum(map(int, xs))
-    index = min(range(count), key=lambda i: (
-        (count * int(ys[i]) - sum_y) ** 2 + (count * int(xs[i]) - sum_x) ** 2,
-        int(ys[i]), int(xs[i])))
-    return int(xs[index]), int(ys[index])
+    # Convert each coordinate once; no tuple list and no repeated NumPy scalar
+    # conversion inside the exact key. This is also used beyond the int64 proof.
+    best_score = None
+    best_x = best_y = 0
+    py_y = ys.tolist() if py_y is None else py_y
+    py_x = xs.tolist() if py_x is None else py_x
+    for y, x in zip(py_y, py_x):
+        dy, dx = y - mean_y, x - mean_x
+        score = count * (dy * dy + dx * dx) - 2 * rem_y * dy - 2 * rem_x * dx
+        if best_score is None or score < best_score:
+            best_score, best_x, best_y = score, x, y
+    return best_x, best_y
 
 
 def component_slice(label_window, label):

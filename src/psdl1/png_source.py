@@ -122,7 +122,7 @@ class _PNGScanlines:
                 filter_type = self.row[0]
                 if filter_type > 4:
                     raise ValueError("invalid PNG scanline filter type")
-                if self.colour == 3:
+                if self.colour == 3 and self.palette_entries != 1 << self.depth:
                     packed = bytearray(self.row[1:])
                     prior = self.previous
                     for i in range(len(packed)) if filter_type else ():
@@ -141,14 +141,13 @@ class _PNGScanlines:
                             dl, da, du = abs(predictor - left), abs(predictor - above), abs(predictor - upper_left)
                             value += left if dl <= da and dl <= du else above if da <= du else upper_left
                         packed[i] = value & 255
-                    sample_mask = (1 << self.depth) - 1
+                    values = np.frombuffer(packed, dtype=np.uint8)
                     if self.depth == 8:
-                        invalid_index = max(packed) >= self.palette_entries
+                        invalid_index = bool(np.any(values >= self.palette_entries))
                     else:
-                        invalid_index = any(
-                            (packed[(pixel * self.depth) // 8] >>
-                             (8 - self.depth - (pixel * self.depth) % 8)) & sample_mask >= self.palette_entries
-                            for pixel in range(width))
+                        shifts = np.arange(8 - self.depth, -1, -self.depth, dtype=np.uint8)
+                        samples = ((values[:, None] >> shifts) & ((1 << self.depth) - 1)).ravel()[:width]
+                        invalid_index = bool(np.any(samples >= self.palette_entries))
                     if invalid_index:
                         raise ValueError("palette pixel index has no PLTE entry")
                     self.previous = packed
@@ -164,7 +163,7 @@ class _PNGScanlines:
             raise ValueError(f"IDAT scanline byte count is short: expected {self.expected}, received {self.received}")
 
 
-def _validate_png_structure(path):
+def _validate_png_structure(path, *, policy=None):
     """Independent chunk/CRC/critical-order/zlib/sample validation, no Pillow internals.
 
     Compressed chunks and inflate output are consumed in bounded blocks. No full
@@ -193,6 +192,8 @@ def _validate_png_structure(path):
             if len(header) != 8:
                 raise ValueError("PNG missing/truncated chunk or IEND")
             length, kind = struct.unpack(">I4s", header)
+            if kind in {b"acTL", b"fcTL", b"fdAT"}:
+                raise ValueError("APNG is unsupported")
             if length > 0x7fffffff or not all(65 <= c <= 90 or 97 <= c <= 122 for c in kind) or kind[2] & 32:
                 raise ValueError("invalid PNG chunk length/type")
             if not seen_ihdr and kind != b"IHDR":
@@ -240,6 +241,14 @@ def _validate_png_structure(path):
                     raise ValueError("invalid/unsupported IHDR dimensions/bit depth/colour type")
                 if compression != 0 or filtering != 0 or interlace not in {0, 1}:
                     raise ValueError("unsupported IHDR compression/filter/interlace method")
+                if policy is not None:
+                    Image, _ = _pillow()
+                    pixels = width * height
+                    limit = policy.effective_max_image_pixels
+                    if pixels > 2 * limit:
+                        raise Image.DecompressionBombError(f"Image size ({pixels} pixels) exceeds limit of {2 * limit} pixels")
+                    if pixels > limit:
+                        raise Image.DecompressionBombWarning(f"Image size ({pixels} pixels) exceeds limit of {limit} pixels")
                 scanlines = _PNGScanlines(width, height, depth, colour, interlace)
                 seen_ihdr = True
             elif kind == b"PLTE":
@@ -265,10 +274,9 @@ def _decode(path, diagnostic_path, policy):
     shape = None
     try:
         shape = _header_shape(path)
-        with path.open("rb") as handle:
-            header = handle.read(26)
-        if shape is not None and len(header) >= 26 and header[24] > 8:
-            raise ValueError(f"unsupported PNG bit depth: {header[24]}")
+        # Validate structure and the finite pixel guard before Pillow can decode
+        # (PNG getexif() may itself trigger image.load()).
+        _validate_png_structure(path, policy=policy)
         with Image.open(path) as image:
             if image.format != "PNG":
                 raise ValueError("file is not PNG")
@@ -279,8 +287,7 @@ def _decode(path, diagnostic_path, policy):
             mode = image.mode
             if mode not in {"1", "L", "RGB", "LA", "RGBA", "P"}:
                 raise ValueError(f"unsupported PNG mode/bit depth: {mode}")
-            _validate_png_structure(path)
-            image.load()  # structure and exact stream lengths already checked
+            image.load()
             # Exact palette/alpha expansion only; never luminance conversion.
             rgba = np.asarray(image.convert("RGBA"))
             if not np.all(rgba[..., 3] == 255):

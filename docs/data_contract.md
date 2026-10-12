@@ -342,3 +342,72 @@ no:cacheprovider tests/test_png_source.py tests/test_png_connections.py
 tests/test_png_scale.py` → **155 passed**; `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python
 -m pytest -p no:cacheprovider -p no:warnings` → **350 passed, 1 existing skip**.
 The unchanged default suite remains offline; no package installation was performed.
+
+## R-A2 APNG, arithmetic and validation corrections (FA2)
+
+Intentional strictness may reject real files: **any tRNS on grayscale/RGB**, any non-255
+palette alpha (even unused entries), bytes after IEND, a bad CRC on any chunk (including
+ancillary chunks), any APNG `acTL`/`fcTL`/`fdAT` chunk, and non-identity orientation
+metadata. The remedy is to re-save the source as a **plain opaque black/white PNG**.
+The adapter never silently strips these features, thresholds pixels or rewrites sources.
+
+The structure validator now runs before `Image.open`, `getexif` or `load`; PNG `getexif`
+can trigger decoding, so the previous ordering was too late. The finite Pillow pixel
+threshold is checked from validated IHDR dimensions before IDAT inflation using the
+same warning/error thresholds and exception classes; no decoder pixel guard is disabled.
+Every APNG chunk produces the validator reason `APNG is unsupported`, including valid
+single-frame APNG and malformed frame regions. This prevents Pillow from interpreting
+only an fcTL subregion and fabricating black pixels in the rest of an otherwise valid
+IHDR/IDAT frame. B1–B3, N5 and critical-order tests now assert the validator's actual
+reason field; the missing-PLTE test uses a neutral filename and exact reason.
+
+Palette validation skips sample reconstruction/range scanning when PLTE contains every
+possible index (`2**bit_depth` entries), since no encoded index can be undefined. Smaller
+palettes use NumPy extraction on unfiltered packed row bytes, respecting MSB-first order
+and excluding padding bits. Tests cover non-symmetric depth-1/2/4 bytes, set padding bits,
+Paeth ties where left and upper-left differ, and all seven nonempty Adam7 passes at 9×9
+and 13×11 for every supported colour type/bit depth. Ordinary Pillow-written opaque
+1/L/RGB/LA/RGBA/P files, text/EXIF/physical-resolution ancillary chunks, multiple IDAT and
+non-APNG interlaced fixtures remain accepted with exact expected masks.
+
+Representative distances now centre coordinates on the integer centroid mean. For
+count n, integer mean q and remainder r, compare `n*(dy²+dx²)-2*ry*dy-2*rx*dx`; omitted
+constant remainder squares cannot affect ordering. A Python-integer bound on the sum
+of absolute terms proves all int64 intermediates and scores safe before NumPy runs.
+The exact fallback converts coordinates into separate integer lists (no per-pixel tuple
+list), compares the same scores with Python integers and retains y/x ties. The Fraction
+reference comparison still covers both paths; an injected sparse coordinate case places
+the proof bound just 1,505,827,713 above int64 maximum and forbids the unsafe NumPy path.
+A separate hand-specified component fixture ties its stored hash/ID to its actual
+nonrectangular mask; complementing or altering that mask must change the hash and ID.
+
+Before/after timings on the same Mac16,11 / Apple M4 Pro, macOS 26.5.2 arm64,
+Python 3.12.13 / NumPy 2.5.3 / Pillow 12.3.0:
+
+| Operation / synthetic fixture | Before FA2 | After FA2 |
+| --- | ---: | ---: |
+| Validator only, 6000×6000 1-bit indexed PNG with full two-entry palette | 3.376316 s | 0.003168 s |
+| Representative pixel, full 2000×2000 intersection | 1.716412 s | 0.037479 s |
+| Forced exact fallback, same intersection | — | 0.588391 s |
+| Archived 105acea representative implementation, same intersection | 1.223155 s | — |
+
+All representative results were exactly `[999,999]`. These are one-run synthetic
+measurements, not real resource acceptance limits; S23's separate 2-second guard is
+unchanged. Timing inputs/results live in `/tmp/dl1-ra2-timing.k5pf1d1e`.
+
+Six requested mutants ran solely in verified scratch package imports at
+`/tmp/dl1-ra2-fa2-mutants.kcyzcoir`: Adam7 pass-2 column 4→5 caused 5 failures;
+reversed packed shifts caused 3; swapped Paeth ties, removed PLTE requirement,
+hashing `~local`, and int64 proof replaced by `True` each caused 1. Every mutant pytest
+invocation exited 1; repository files were never mutated for these checks. The APNG
+matrix includes smaller/offset fcTL regions, full-size single-frame APNG, zero-frame
+acTL with fcTL/fdAT, duplicate acTL and acTL after IDAT, plus isolated fcTL/fdAT;
+each rejects with the exact APNG reason before any Pillow open.
+
+FA2 acceptance: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p
+no:cacheprovider tests/test_png_source.py tests/test_png_connections.py
+tests/test_png_scale.py` → **212 passed**; `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python
+-m pytest -p no:cacheprovider -p no:warnings` → **407 passed, 1 existing skip**.
+The mixed resolved/unresolved fixture still matches the archived 105acea asset/frame/
+component/relation/endpoint/mask and Product input identities byte-for-byte; evidence
+is `fa2-identity.json` under the earlier FA identity scratch directory.

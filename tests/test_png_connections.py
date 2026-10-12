@@ -333,3 +333,50 @@ def test_component_id_precomputed_hash_preserves_identity():
         "component", ["M", 6, "C", ["M", "cno", None, 6, "C"], [1001, 1203], [20, 30, 22, 32],
                       mask_hash(mask)]], separators=(",", ":")).encode()).hexdigest()
     assert component_id(*args) == component_id(*args, local_mask_sha256=mask_hash(mask)) == expected
+
+
+def test_extracted_component_hash_and_id_describe_actual_mask(tmp_path):
+    # Nonrectangular component: replacing its hash input by ~local must fail.
+    pixels = ((10, 20), (10, 21), (11, 20))
+    _, result = run_model(tmp_path, [("A", "1-U.png", pixels), ("B", "8-L.png", pixels),
+                                   ("cno", "6_C.png", pixels)])
+    c, = result.components
+    actual = np.array([[True, True], [True, False]])
+    assert np.array_equal(c.mask, actual)
+    def independent_hash(mask):
+        h = hashlib.sha256(b'{"shape_yx":[2,2]}')
+        h.update(np.asarray(mask, dtype=bool).tobytes())
+        return h.hexdigest()
+    expected_hash = independent_hash(actual)
+    assert c.mask_sha256 == expected_hash
+    payload = ["component", ["M", 6, "C", ["M", "cno", None, 6, "C"], [1001, 1203],
+                             [20, 10, 22, 12], expected_hash]]
+    expected_id = "component_" + hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+    assert c.component_id == expected_id
+    assert independent_hash(~actual) != c.mask_sha256
+    altered = actual.copy(); altered[0, 1] = False
+    assert independent_hash(altered) != c.mask_sha256
+    from psdl1.png_contract import component_id
+    assert component_id("M", 6, "C", ("M", "cno", None, 6, "C"), (1001, 1203),
+                        (20, 10, 22, 12), ~actual) != c.component_id
+
+
+def test_int64_proof_near_overflow_takes_exact_fallback(monkeypatch):
+    from fractions import Fraction
+    import psdl1.png_connections as module
+    # Sparse coordinates injected at the arithmetic boundary avoid a multi-GB
+    # image allocation. Expanded score bound is just beyond signed int64.
+    ys = np.array([0, 2_630_119_584, 2_630_119_585], dtype=np.int64)
+    xs = np.array([0, 0, 0], dtype=np.int64)
+    mean_y, rem_y = divmod(sum(map(int, ys)), 3)
+    max_delta = max(abs(int(y) - mean_y) for y in ys)
+    bound = 3 * max_delta ** 2 + 2 * rem_y * max_delta
+    assert np.iinfo(np.int64).max < bound < np.iinfo(np.int64).max + 100_000_000_000
+    cy = Fraction(sum(map(int, ys)), 3)
+    expected_y = min(map(int, ys), key=lambda y: ((Fraction(y) - cy) ** 2, y))
+    assert expected_y == 2_630_119_584
+    monkeypatch.setattr(module.np, "nonzero", lambda mask: (ys, xs))
+    def forbidden_argmin(scores):
+        pytest.fail("unsafe near-overflow coordinates took int64 path")
+    monkeypatch.setattr(module.np, "argmin", forbidden_argmin)
+    assert representative_pixel(np.ones((1, 1), dtype=bool)) == (0, expected_y)
