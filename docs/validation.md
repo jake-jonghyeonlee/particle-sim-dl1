@@ -226,3 +226,105 @@ Real grid/minimum linewidth, source compatibility, labels/splits, electrical tru
 resources and retrieval-quality acceptance require closed-network decisions/evidence.
 The 5–10 diverse product pilot is strictly integration/connection inspection. Independent
 R-B review of the final exact candidate remains the coordinator's next gate.
+
+## R-B finding response candidate — 2026-10-12
+
+Baseline: clean `feat/png-input@01240f9f61541fa328976a5e543c60276cc1fff7`, which the
+independent R-B review marked FAIL for the file-identity containment bypass B1.
+This is the implementation response to B1 and N1–N8/N11, not an independent review
+verdict. Historical validation above is retained. Strict manifest/model/checkpoint
+versions, NPY load/preparation/endpoint numerics, extraction semantics and emitted
+identities/hashes are unchanged; read-only core files and dependency lock are untouched.
+The report/integrity shape changes are explicitly `dl1_png_import_v2` and
+`dl1_png_bundle_v2`; older sidecars are cleanly rejected rather than silently reinterpreted.
+
+| Exact command | Result |
+| --- | --- |
+| `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider tests/test_png_import.py tests/test_png_preview.py tests/test_png_integration.py tests/test_png_source.py` | 249 passed, 0 failed, 65.74 s |
+| `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider tests/test_png_import.py::test_publish_fallback_claim_and_manifest_last tests/test_png_import.py::test_publish_fallback_failure_never_leaves_consumable_manifest tests/test_png_import.py::test_fallback_raced_claim_preserves_destination tests/test_png_import.py::test_rb_S15_multi_stage_failure_and_pending_manifest tests/test_png_import.py::test_publication_interruption_and_no_overwrite` | 14 passed, 0 failed, 6.34 s |
+| `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -p no:warnings` | 484 passed, 1 existing opt-in skip, 0 failed, 76.00 s |
+| `git diff --check` | Passed |
+
+Only macOS/APFS was exercised on a real host. The case and Unicode-normalisation tests
+**all ran; none skipped** on this filesystem. Every review reproduction is now exit 2
+and the complete surrounding file/directory snapshot (including source bytes and file
+mtime) is unchanged before/after the refused invocation:
+
+| Review B1 row | Observed refusal / new entries |
+| --- | --- |
+| root `Src`, out `SRC/M1/o6` | Refused, 0 entries created |
+| root `src`, out `Src/M1/o8` | Refused, 0 entries created |
+| root NFC `입력`, out NFD spelling of `입력/M1/o` | Refused, 0 entries created |
+| root `Src`, out `src/o5` | Refused, 0 entries created |
+| root `Src`, out `SRC/M1/A/o7` | Refused, 0 entries created |
+
+Exact-case root/model/electrode paths, `Src/../Src`, a relative destination from inside
+the root, source/output symlink spellings, `out == root` and reverse nesting are also
+refused with an unchanged snapshot. A missing/file source root or invalid candidate-grid
+argument creates no new output parents or stage. Invalid models/metadata still produce
+the authorized diagnostic bundle after inspection.
+
+Fallback tests force the native symbol away, ENOSYS and EINVAL, and a simulated Windows
+platform where libc must not be loaded. All select and seal
+`exclusive_directory_claim_manifest_last`. Exclusive claim refuses existing/raced
+outputs without changing their contents; copy ordering proves manifest is last.
+A fault or KeyboardInterrupt immediately after copying the final manifest removes its
+consumable name from destination and stage and records failed/interrupted status.
+Native Darwin `darwin_rename_excl` was exercised normally. Linux/Windows actual-host
+publication remains untested; the fallback exposes a partially copied directory and is
+not atomic directory visibility, as USAGE now states.
+
+S15 injects faults at validation, seal, verify, publish, KeyboardInterrupt during seal
+and a report write leaving `.writing`. Every failure stage has a pending manifest and
+failed/interrupted report; the abandoned writing file does not mask the original error.
+S14 detects unlisted/missing files, extra empty/nested directories and a re-sealed report
+whose manifest hash link is wrong. Malformed reports/manifests produce clean CLI nonzero
+diagnostics without traceback, including omission of publication/algorithm/run fields;
+verification requires the complete frozen v2 top-level field set. Electrode/CNT layer unions and unique lists are separate,
+raw run status is `ran/blocked/not_run`, metadata errors are location independent, and
+exported lineage/design values are exactly the explicit metadata values.
+
+S16 now independently specifies asymmetric bbox `[130,710,137,719]`, crop offset
+`[130,710]`, endpoint local `(3,4)`, context offset `[66,646]` and crosshair `(67,68)`.
+Overview green marker pixels lie in x `[94,105]`, y `[529,540]`, independently computed
+from the source centre `(133,714)` and actual full-frame display scales. Hostile names
+include a resolved CNT component and an invalid model; invalid headings, selected
+candidate lines and stack text must all remain escaped. No production preview coordinate
+or extraction change was required.
+
+Required mutations were each applied only in isolated copies outside both repositories.
+The final-code rerun command was `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python
+/tmp/dl1-rb-mutations.py`; the driver invokes the installed repository venv with each
+scratch `src` on explicit PYTHONPATH, asserts its import path, then runs
+`-m pytest -p no:cacheprovider -p no:warnings` with the targeted test below. Every case
+exited 1 with exactly one failed test (no collection/import error). Evidence and individual
+outputs: `/tmp/dl1-rb-fix-mutants.ju29ta_c/results.json` and each mutant's `result.txt`.
+
+| Mutant | Test that fails |
+| --- | --- |
+| Removed unlisted-files check | `test_rb_S14_unlisted_missing_entries_and_manifest_report_hash_link[extra-file]` |
+| Removed manifest/report hash link | `test_rb_S14_unlisted_missing_entries_and_manifest_report_hash_link[manifest-report-link]` |
+| Manifest final name before validation | `test_rb_S15_multi_stage_failure_and_pending_manifest[seal]` |
+| Swapped x/y crop offset | `test_rb_S16_asymmetric_offsets_marker_endpoint_and_crosshair` |
+| Swapped x/y overview marker | Same asymmetric test |
+| Swapped x/y crop endpoint | Same asymmetric test |
+| Crosshair shifted 10 px | Same asymmetric test |
+| Removed invalid-model heading escape | `test_rb_S16_escapes_invalid_model_candidates_and_stack` |
+| Removed selected-candidate line escape | Same escaping test |
+| Removed stack-line escape | Same escaping test |
+| Folder name used as lineage_id | `test_auto_manifest_export_and_pending_prerequisites` |
+
+The `imported` integration fixture is now module-scoped and new corruption/publication
+checks reuse a single immutable CLI export instead of rebuilding it per parameter.
+The suite gained 38 tests while elapsed full-suite time was 76.00 s versus the recorded
+T4 78.11 s on this machine; this is a local observation, not a portable timing promise.
+No assertion was weakened and no opt-in training smoke, install or download ran.
+Independent refreshed R-B review and real-data/electrical/G6 decisions remain pending.
+
+
+A preliminary full run passed 481 tests with one existing skip in 74.49 s. The final
+field-completeness guard added three missing-field cases afterwards, so the required
+command was rerun on the final code (484 passed above). The preceding targeted run
+was 246 passed in 67.39 s; the final targeted rerun was 249 passed as recorded above.
+This repeat was due to the new guard/tests, not an unchanged-candidate repetition.
+Environment: macOS 26.5.2 arm64 / Python 3.12.13 / Pillow 12.3.0 / NumPy 2.5.3.

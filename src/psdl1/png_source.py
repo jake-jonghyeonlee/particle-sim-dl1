@@ -510,7 +510,8 @@ def load_metadata(path, model_names, *, require_complete=False) -> MetadataRecor
                                              identifier(values["design_version"], "design_version")))
             result = MetadataRecord(tuple(entries), tuple(sorted(known - set(mapping))))
         except (ValueError, OSError) as exc:
-            raise ValueError(f"{path}: {exc}") from exc
+            reason = exc.strerror if isinstance(exc, OSError) else str(exc)
+            raise ValueError(f"metadata: {reason}") from exc
     if require_complete and result.pending_models:
         raise ValueError("missing explicit metadata for models: " + ", ".join(result.pending_models))
     return result
@@ -520,7 +521,27 @@ def report_payload(report: ImportReport) -> dict:
     """JSON-safe sidecar evidence, intentionally excluding in-memory source masks."""
     def encode(value):
         if is_dataclass(value):
-            return {f.name: encode(getattr(value, f.name)) for f in fields(value) if f.name != "mask"}
+            result = {f.name: encode(getattr(value, f.name)) for f in fields(value) if f.name != "mask"}
+            if "extraction_status" in result:
+                status = result.pop("extraction_status")
+                result["extractor_run_status"] = "ran" if status in {"complete", "extractor_ran"} else status
+            if isinstance(value, ModelSource):
+                # Preserve combined legacy names for audit, explicitly distinguish
+                # the electrode vocabulary from CNT plane names in v2 reports.
+                result["electrode_layers"] = list(value.electrode_layers)
+                result["cno_layers"] = list(value.cno_layers)
+                result["all_source_layers"] = result.pop("layers")
+            if isinstance(value, SourceInventory):
+                for name in ("layer_union", "unique_layers"):
+                    result["all_source_" + name] = result.pop(name)
+                for kind in ("electrode", "cno"):
+                    counts = {}
+                    for model in value.models:
+                        for name in getattr(model, kind + "_layers"):
+                            counts[name] = counts.get(name, 0) + 1
+                    result[kind + "_layer_union"] = sorted(counts)
+                    result["unique_" + kind + "_layers"] = sorted(n for n, count in counts.items() if count == 1)
+            return result
         if isinstance(value, (tuple, list)):
             return [encode(v) for v in value]
         if isinstance(value, dict):

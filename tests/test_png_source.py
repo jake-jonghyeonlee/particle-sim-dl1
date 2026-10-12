@@ -746,3 +746,28 @@ def test_pixel_guard_precedes_inflate_and_pillow_open(monkeypatch, tmp_path):
         decode_png(path, png_max_image_pixels=100)
     assert error.value.issue.exception_class == "DecompressionBombError"
     assert error.value.issue.pixels == 10_000_000_000
+
+
+def test_rb_report_separates_model_and_cnt_vocabulary_and_versions(tmp_path):
+    for relative in ["M/A/1-X.png", "M/B/2-Y.png", "M/cno/3-ONLY-M-CNT.png",
+                     "Q/A/1-X.png", "Q/D/2-Z.png", "Q/cno/3-ONLY-Q-CNT.png"]:
+        write_png(tmp_path, relative)
+    inv = discover_source(tmp_path)
+    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"])))
+    inventory = payload["inventory"]
+    assert inventory["models"][0]["electrode_layers"] == ["X", "Y"]
+    assert inventory["models"][0]["cno_layers"] == ["ONLY-M-CNT"]
+    assert inventory["models"][1]["electrode_layers"] == ["X", "Z"]
+    assert inventory["models"][1]["cno_layers"] == ["ONLY-Q-CNT"]
+    assert inventory["electrode_layer_union"] == ["X", "Y", "Z"]
+    assert inventory["unique_electrode_layers"] == ["Y", "Z"]
+    assert inventory["cno_layer_union"] == ["ONLY-M-CNT", "ONLY-Q-CNT"]
+    assert inventory["unique_cno_layers"] == ["ONLY-M-CNT", "ONLY-Q-CNT"]
+    assert inventory["all_source_layer_union"] == ["ONLY-M-CNT", "ONLY-Q-CNT", "X", "Y", "Z"]
+    assert "layer_union" not in inventory and "unique_layers" not in inventory
+    assert payload["report_schema_version"] == "dl1_png_import_v2"
+    assert payload["extractor_run_status"] == "not_run" and "extraction_status" not in payload
+    require_report_version(payload)
+    for version in ["dl1_png_import_v1", "unsupported", None]:
+        with pytest.raises(ValueError, match="unsupported"):
+            require_report_version({**payload, "report_schema_version": version})

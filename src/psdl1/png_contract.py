@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-REPORT_SCHEMA_VERSION = "dl1_png_import_v1"
+REPORT_SCHEMA_VERSION = "dl1_png_import_v2"
 METADATA_SCHEMA_VERSION = "dl1_png_metadata_v1"
 ALGORITHM_ID = "nearest_overlap_common_intersection"
 ALGORITHM_VERSION = "1"
@@ -155,6 +155,14 @@ class ModelSource:
     resource_estimate: ResourceEstimate = field(default_factory=ResourceEstimate)
 
     @property
+    def electrode_layers(self) -> tuple[str, ...]:
+        return tuple(sorted({a.layer for a in self.electrodes}))
+
+    @property
+    def cno_layers(self) -> tuple[str, ...]:
+        return tuple(sorted({a.layer for a in self.cnt_assets}))
+
+    @property
     def valid(self) -> bool:
         return not self.errors and self.frame is not None
 
@@ -236,6 +244,7 @@ class ImportReport:
     extraction_status: str = "not_run"
     export_status: str = "not_requested"
     grid_readiness: str = "pending_explicit_grid"
+    publication_method: str | None = None
     # T2/T3 supply JSON-serializable extraction/grid/publication evidence.
     extraction: tuple["ModelExtraction", ...] = ()
     grid_evidence: tuple[dict, ...] = ()
@@ -252,7 +261,7 @@ class ImportReport:
 
 
 def require_report_version(report: dict) -> None:
-    if report.get("report_schema_version") != REPORT_SCHEMA_VERSION:
+    if not isinstance(report, dict) or report.get("report_schema_version") != REPORT_SCHEMA_VERSION:
         raise ValueError("unsupported PNG report_schema_version")
 
 

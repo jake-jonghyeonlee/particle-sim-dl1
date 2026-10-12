@@ -1,6 +1,7 @@
 """Offline PNG inspection/export; strict v1 manifest plus versioned provenance."""
 import argparse
 import ctypes
+import errno
 from dataclasses import replace
 import hashlib
 import json
@@ -18,7 +19,7 @@ from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_i
 from .png_source import decoder_session, discover_source, load_metadata, report_payload
 from .schema import SCHEMA_VERSION, validate_product
 
-BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v1"
+BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v2"
 
 
 def file_sha256(path):
@@ -71,10 +72,11 @@ def _seal_bundle(stage):
     files = {p.relative_to(stage).as_posix(): file_sha256(p)
              for p in sorted(stage.rglob("*")) if p.is_file() and p.name != "bundle-integrity.json"}
     _write_json(stage / "bundle-integrity.json", {"bundle_schema_version": BUNDLE_SCHEMA_VERSION,
-                                                  "hash_algorithm": "sha256", "files": files})
+                                                  "hash_algorithm": "sha256", "files": files,
+                                                  "directories": sorted(p.relative_to(stage).as_posix() for p in stage.rglob("*") if p.is_dir())})
 
 
-def verify_bundle(bundle):
+def _verify_bundle(bundle):
     """Verify contained file hashes and manifest/report/asset links, without PNG sources.
 
     This detects corruption; hashes are not signatures or proof of electrical truth.
@@ -82,7 +84,7 @@ def verify_bundle(bundle):
     """
     root = Path(bundle).resolve(strict=True)
     integrity = _read_json(bundle_path(root, "bundle-integrity.json"))
-    if not isinstance(integrity, dict) or set(integrity) != {"bundle_schema_version", "hash_algorithm", "files"}:
+    if not isinstance(integrity, dict) or set(integrity) != {"bundle_schema_version", "hash_algorithm", "files", "directories"}:
         raise ValueError("invalid bundle integrity fields")
     if integrity["bundle_schema_version"] != BUNDLE_SCHEMA_VERSION or integrity["hash_algorithm"] != "sha256":
         raise ValueError("unsupported bundle integrity version/algorithm")
@@ -91,13 +93,31 @@ def verify_bundle(bundle):
         raise ValueError("bundle integrity requires import-report.json")
     for relative, expected in files.items():
         path = bundle_path(root, relative)
+        if not path.is_file():
+            raise ValueError(f"missing or non-file bundle entry: {relative}")
         if not isinstance(expected, str) or len(expected) != 64 or file_sha256(path) != expected:
             raise ValueError(f"bundle hash mismatch: {relative}")
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
-    if actual != set(files) | {"bundle-integrity.json"}:
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*")}
+    directories = integrity["directories"]
+    if not isinstance(directories, list) or any(not isinstance(d, str) for d in directories) or len(set(directories)) != len(directories):
+        raise ValueError("invalid bundle directory listing")
+    for relative in directories:
+        path = bundle_path(root, relative)
+        if not path.is_dir():
+            raise ValueError("missing bundle directory")
+    if actual != set(files) | set(directories) | {"bundle-integrity.json"}:
         raise ValueError("unlisted or missing bundle files")
     report = _read_json(bundle_path(root, "import-report.json"))
     require_report_version(report)
+    expected_fields = (set(ImportReport.__dataclass_fields__) - {"extraction_status"}) | {"extractor_run_status"}
+    if set(report) != expected_fields:
+        raise ValueError("invalid or incomplete import report fields")
+    for key, kind in (("inventory", dict), ("metadata", dict), ("extraction", list), ("preview", list),
+                      ("status_summary", list), ("diagnostics", list)):
+        if not isinstance(report.get(key), kind):
+            raise ValueError("invalid or incomplete import report: " + key)
+    if report.get("export_status") not in {"exported", "not_requested", "blocked"}:
+        raise ValueError("invalid or incomplete import report export_status")
     if report["export_status"] == "exported":
         if files.get("manifest.json") != report["generated_manifest_sha256"]:
             raise ValueError("manifest/report hash link mismatch")
@@ -129,29 +149,140 @@ def verify_bundle(bundle):
             "verification_meaning": "bundle_hash_integrity_not_electrical_verification"}
 
 
-def _publish_noreplace(stage, destination):
-    """Atomic directory rename with native no-replace semantics, including races."""
+def verify_bundle(bundle):
+    """Malformed evidence always produces a clean diagnostic, never a traceback."""
+    try:
+        return _verify_bundle(bundle)
+    except (KeyError, TypeError, AttributeError, IndexError, OverflowError) as exc:
+        raise ValueError("invalid or incomplete bundle evidence: " + str(exc)) from exc
+
+
+def _native_publish_noreplace(stage, destination):
+    """Native atomic no-replace operation; capability errors trigger a fallback."""
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise AttributeError("no native atomic no-replace directory publication API")
+    libc = ctypes.CDLL(None, use_errno=True)
     if sys.platform == "darwin":
-        libc = ctypes.CDLL(None, use_errno=True)
         rename = libc.renamex_np
         rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
         rename.restype = ctypes.c_int
-        # Darwin stdio.h: RENAME_EXCL (0x00000004).
         result = rename(os.fsencode(stage), os.fsencode(destination), 0x00000004)
     elif sys.platform.startswith("linux"):
-        libc = ctypes.CDLL(None, use_errno=True)
         rename = libc.renameat2
         rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         rename.restype = ctypes.c_int
-        result = rename(-100, os.fsencode(stage), -100, os.fsencode(destination), 1)  # RENAME_NOREPLACE
-    elif os.name == "nt":
-        os.rename(stage, destination)  # Windows rename refuses an existing destination.
-        return
+        result = rename(-100, os.fsencode(stage), -100, os.fsencode(destination), 1)
     else:
-        raise OSError("atomic no-replace publication is unsupported on this platform")
+        raise AttributeError("no native atomic no-replace directory publication API")
     if result:
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code), str(destination))
+
+
+def _publication_record(stage, method):
+    if (stage / "import-report.json").is_file():
+        payload = _read_json(stage / "import-report.json")
+        payload["publication_method"] = method
+        _write_json(stage / "import-report.json", payload)
+        _seal_bundle(stage)
+        verify_bundle(stage)
+
+
+def _disable_manifest(directory):
+    final = directory / "manifest.json"
+    if final.exists():
+        pending = directory / "manifest.pending.json"
+        if pending.exists():
+            pending = directory / "manifest.failed.json"
+        final.rename(pending)
+
+
+def _failure_evidence(directory, report, exc):
+    """Best effort, without reusing a possibly abandoned .writing file."""
+    _disable_manifest(directory)
+    payload = report_payload(report) if report is not None else _read_json(directory / "import-report.json")
+    if report is not None:
+        try:
+            payload["publication_method"] = _read_json(directory / "import-report.json").get("publication_method")
+        except (ValueError, OSError, AttributeError):
+            pass
+    payload["export_status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+    payload.setdefault("diagnostics", []).append({"path": ".", "reason": str(exc), "exception_class": type(exc).__name__})
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".failure-report-", suffix=".writing",
+                                     dir=directory, delete=False) as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+        handle.write("\n")
+    os.replace(handle.name, directory / "import-report.json")
+
+
+def _copy_exclusive(source, target):
+    with source.open("rb") as incoming, target.open("xb") as outgoing:
+        for block in iter(lambda: incoming.read(65536), b""):
+            outgoing.write(block)
+
+
+def _publish_claimed(stage, destination):
+    """Exclusive mkdir claim; manifest last, no final manifest left on failure.
+
+    This fallback is not atomic directory visibility: readers may see a partial
+    diagnostic directory. It never replaces an existing destination.
+    """
+    destination.mkdir()  # the claim itself is atomic and refuses every existing path
+    try:
+        for source in sorted(stage.rglob("*")):
+            relative = source.relative_to(stage)
+            if source.is_dir():
+                (destination / relative).mkdir()
+            elif relative.as_posix() != "manifest.json":
+                _copy_exclusive(source, destination / relative)
+        if (stage / "manifest.json").is_file():
+            _copy_exclusive(stage / "manifest.json", destination / "manifest.json")
+        verify_bundle(destination)
+    except BaseException as exc:
+        try:
+            _failure_evidence(destination, None, exc)
+        except Exception:
+            # Disabling the consumable manifest has priority over report writing.
+            _disable_manifest(destination)
+        raise
+
+
+def _publish_noreplace(stage, destination):
+    try:
+        if os.path.lexists(destination):
+            raise FileExistsError("output destination already exists")
+        method = "darwin_rename_excl" if sys.platform == "darwin" else "linux_renameat2_noreplace"
+        _publication_record(stage, method)
+        try:
+            _native_publish_noreplace(stage, destination)
+            return method
+        except AttributeError:
+            pass
+        except OSError as exc:
+            if exc.errno not in {errno.ENOSYS, errno.EINVAL}:
+                raise
+        method = "exclusive_directory_claim_manifest_last"
+        _publication_record(stage, method)
+        _publish_claimed(stage, destination)
+        return method
+    except BaseException as exc:
+        try:
+            _failure_evidence(stage, None, exc)
+        except Exception as evidence_error:
+            exc.add_note("failure evidence could not be updated: " + str(evidence_error))
+        raise
+
+
+def _refuse_overlapping_trees(root, out):
+    # resolve() does not canonicalise case or Unicode on APFS. Compare existing
+    # ancestor identities before making even a parent or staging directory.
+    for ancestor in (out, *out.parents):
+        if ancestor.exists() and os.path.samefile(ancestor, root):
+            raise ValueError("output must be outside the input tree")
+    if out.exists():
+        for ancestor in (root, *root.parents):
+            if os.path.samefile(ancestor, out):
+                raise ValueError("input root must be outside the output destination")
 
 
 def _duplicates(inventory):
@@ -222,14 +353,16 @@ def run_import(options, *, event_sink=None):
         raise ValueError("--root and --out are required for inspection/export")
     root = options.root.resolve(strict=True)
     out = options.out.resolve()
+    if not root.is_dir():
+        raise ValueError("source root must be a directory")
+    _refuse_overlapping_trees(root, out)
     if os.path.lexists(options.out):
         raise FileExistsError("output destination already exists; choose a new --out")
     if out == root or out.is_relative_to(root):
         raise ValueError("output must be outside the input tree")
     if options.candidate_grid is not None and not options.export:
         raise ValueError("--candidate-grid requires --export; inspection uses --inspect-grids")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
+    stage = None
     report = None
     def emit(payload):
         if event_sink is not None:
@@ -248,7 +381,7 @@ def run_import(options, *, event_sink=None):
             except (ValueError, OSError) as exc:
                 metadata_error = True
                 metadata = load_metadata(None, [m.model_id for m in inventory.models])
-                diagnostics.append(SourceIssue(str(options.metadata), str(exc)))
+                diagnostics.append(SourceIssue("metadata", str(exc)))
             pending = []
             if options.export:
                 if metadata.pending_models:
@@ -272,13 +405,17 @@ def run_import(options, *, event_sink=None):
                                       "electrical_verification": "not_performed"} for r in extraction),
                                   export_status="blocked" if pending else "not_requested",
                                   grid_readiness="explicit_candidate_supplied" if options.candidate_grid else "pending_explicit_grid")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
             initial_payload = report_payload(report)
             _write_json(stage / "import-report.json", initial_payload)
             emit({"event": "resource_inventory", "models": [{"model_id": m.model_id,
                   "resource_estimate": initial_payload["inventory"]["models"][i]["resource_estimate"],
-                  "roles": list(m.roles), "layers": list(m.layers)} for i, m in enumerate(inventory.models)],
-                  "role_union": inventory.role_union, "layer_union": inventory.layer_union,
-                  "unique_roles": inventory.unique_roles, "unique_layers": inventory.unique_layers})
+                  "roles": list(m.roles), "electrode_layers": list(m.electrode_layers), "cno_layers": list(m.cno_layers)} for i, m in enumerate(inventory.models)],
+                  "role_union": inventory.role_union, "electrode_layer_union": initial_payload["inventory"]["electrode_layer_union"],
+                  "cno_layer_union": initial_payload["inventory"]["cno_layer_union"],
+                  "unique_roles": inventory.unique_roles, "unique_electrode_layers": initial_payload["inventory"]["unique_electrode_layers"],
+                  "unique_cno_layers": initial_payload["inventory"]["unique_cno_layers"]})
             evidence = []
             grid_error = False
             for model, result in zip(inventory.models, extraction):
@@ -333,10 +470,18 @@ def run_import(options, *, event_sink=None):
                        "source_valid": inventory.valid, "pending_prerequisites": pending}
             emit(summary)
             return summary, status
-    except Exception as exc:
-        if report is not None:
-            report = replace(report, export_status="failed", diagnostics=report.diagnostics + (SourceIssue(".", str(exc)),))
-            _write_json(stage / "import-report.json", report_payload(report))
+    except BaseException as exc:
+        if stage is not None:
+            try:
+                _failure_evidence(stage, report, exc)
+            except Exception as failure_error:
+                exc.add_note("failure evidence could not be updated: " + str(failure_error))
+                _disable_manifest(stage)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            exc.add_note(f"unpublished staging evidence retained at {stage}")
+            raise
+        if stage is None:
+            raise
         raise RuntimeError(f"import failed; unpublished staging evidence retained at {stage}: {exc}") from exc
 
 

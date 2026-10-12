@@ -342,12 +342,16 @@ pending으로 보고한다. export에 metadata/grid가 빠지거나 한 모델�
 부분 학습 pool은 생성하지 않는다. 미해결 CNT 관계 자체는 입력 오류가 아니며 global
 CNT에는 미해결 형상도 남는다. Label/split은 자동으로 만들거나 승인하지 않는다.
 
-`import-report.json`은 `dl1_png_import_v1` sidecar이며 core manifest에 임의 필드를
+`import-report.json`은 `dl1_png_import_v2` sidecar이며 core manifest에 임의 필드를
 추가하지 않는다. `bundle-integrity.json`은 보고서/manifest/NPY/preview의 파일 SHA-256을
 묶는다. 검사는 전기적 진실/서명 인증이 아닌 bundle 손상 탐지다. PNG 원천은 한 번
 읽은 compressed snapshot으로 검증·decode·hash하므로 import 중 파일 교체가 현재
 snapshot의 mask/hash를 바꾸지 않는다. 게시 전 sibling `.staging-*`에서 검증하고 새
-폴더로 원자적으로 게시한다. 실패한 staging은 자동 삭제하지 않고 stderr 경로로
+폴더로 native no-replace 게시를 시도한다. 지원되는 플랫폼에서는 directory rename이 원자적이다.
+Native API가 없거나 ENOSYS/EINVAL이면 목적지를 exclusive mkdir로 먼저 claim한 뒤
+manifest를 마지막에 쓴다. 이 fallback은 directory 전체가 한 번에 보이는 방식은 아니지만
+기존 목적지를 대체하지 않고, 실패 시 consumable manifest를 남기지 않는다.
+실패한 staging은 자동 삭제하지 않고 stderr 경로로
 남긴다. 중단된 staging은 model-ready 최종 bundle로 취급하지 말고 새 출력 경로로 재실행한다.
 
 보고서의 모델별 `resource_estimate`와 정확한 role/layer 목록은 grid 평가/export
@@ -400,3 +404,39 @@ nearest-neighbour 확대 파일을 따로 제공한다. bbox/offset/배율은 �
 위→아래 layer 목록, 건너뛴 전극·cno 목록을 함께 확인한다. Crop/확대는 사람이 보는
 표시 용도이고 모델 입력은 그대로 전체 frame이다. 원본 해상도에서 해결한 관계가
 작은 grid에서 사라져도 원본 보고서에 남으며 train/search의 기존 gate가 차단한다.
+
+
+### R-B 수정: 파일 identity, report v2 및 publication 제한
+
+출력의 기존 ancestor와 입력 root를 `os.path.samefile`로 비교하여 case/NFC/NFD와
+symlink를 다르게 적어도 같은 tree 안에 쓸 수 없게 한다. 입력이 출력 tree 안에
+있어도 거부한다. Argument와 source root를 검증하기 전에 새 parent/staging을 만들지
+않으며, invalid model/metadata처럼 진단 bundle을 요청한 경우에만 검사 후 출력한다.
+실패/KeyboardInterrupt 후 staging의 manifest는 `manifest.pending.json` 등으로 되돌리고
+보고서에는 `failed/interrupted`를 남긴다. 남은 `.writing` 파일이 원래 오류를 가리지 않는다.
+
+새 sidecar는 `dl1_png_import_v2`, integrity는 `dl1_png_bundle_v2`다. Strict
+`dl1_shape_v1_draft` manifest, model input/checkpoint version은 바뀌지 않는다. 새 verifier는
+이전 v1 sidecar/integrity를 unsupported로 명시적으로 거부한다. 이전 결과를 삭제하거나
+덮어쓰지 말고 필요하면 새 출력 경로로 import한다. Integrity는 파일뿐 아니라 정확한
+디렉터리 목록도 묶으므로 빈 디렉터리 추가도 검출한다. 잘못되거나 불완전한 보고서는
+traceback 대신 nonzero diagnostic으로 종료한다. 완전히 일관되게 다시 봉인한 파일의
+진실성/서명 인증은 여전히 제공하지 않는다.
+
+보고서 모델별 `electrode_layers`와 `cno_layers`는 분리되어 있다. Cross-model 목록도
+`electrode_layer_union/unique_electrode_layers`와 `cno_layer_union/unique_cno_layers`로
+구분한다. **모델 vocabulary에 들어가는 것은 electrode layer 이름뿐**이다.
+`all_source_layers/all_source_layer_union/all_source_unique_layers`는 전체 source 감사용이다.
+`extractor_run_status: ran/blocked/not_run`은 실행 상태이며 더 이상 실행을 `complete`로
+표기하지 않는다. Coverage의 `complete/partial/unavailable` 및 기존 model status와
+분리된다. Invalid metadata 진단의 path는 `metadata`이며 absolute location을 report에 넣지 않는다.
+
+`publication_method`는 실제 사용한 방법을 기록한다: macOS의 `darwin_rename_excl`,
+Linux의 `linux_renameat2_noreplace`, 또는 `exclusive_directory_claim_manifest_last`.
+실제 host에서 실행한 것은 **macOS APFS만**이다. Linux/Windows 실제 publication은
+미검증이며 fallback은 macOS에서 native API 부재/ENOSYS/EINVAL을 monkeypatch해 검증했다.
+Fallback 동안에는 불완전한 directory가 보일 수 있으므로 manifest 존재만 보고 읽지 말고
+완료된 bundle에 `--verify-bundle`을 먼저 실행한다. 실패한 claim directory/staging은 증거로
+보존되며 새 출력 경로로 재실행한다. **Exported does not mean the grid is accepted.**
+Warnings가 있는 후보 grid도 export할 수 있으나 train/search의 기존 gate는 기본적으로
+차단하며 grid 승인이나 전기적 검증이 되지 않는다.

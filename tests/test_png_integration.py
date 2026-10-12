@@ -22,8 +22,9 @@ from psdl1.schema import validate_product
 from psdl1.split import SPLIT_VERSION, validate_split
 
 
-@pytest.fixture
-def imported(tmp_path):
+@pytest.fixture(scope="module")
+def imported(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("shared-png-import")
     root = tmp_path / "source"
     write_wide_import_fixture(root)
     write_wide_import_fixture(root, model="SYNTHETIC-WIDE-Z")

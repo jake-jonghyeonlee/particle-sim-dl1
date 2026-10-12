@@ -124,3 +124,56 @@ def test_preview_context_semantics_and_nearest_display_scale(tmp_path):
     assert "black=CNT outline" in html and "yellow=common intersection J" in html and "green crosshair=shared endpoint" in html
     assert "Involved layers, top to bottom: 1:U / A → 3:N / N [skipped, non-overlapping] → 4:C4 / cno [skipped, non-overlapping] → 5:U5 / A [skipped, non-overlapping] → 6:C6 / cno → 7:L / B" in html
     assert "lower: B@7:L, D@7:L" in html and "multiple_lower_electrodes_on_selected_layer" in html
+
+
+def test_rb_S16_asymmetric_offsets_marker_endpoint_and_crosshair(tmp_path):
+    import numpy as np
+    from png_helpers import write_model
+    # Literal bbox [130,710,137,719] => J centre (133,714), local (3,4).
+    pixels = tuple((y, x) for y in range(710, 719) for x in range(130, 137))
+    root = tmp_path / "source"
+    write_model(root, [("A", "1-U.png", pixels), ("B", "7-L.png", pixels), ("cno", "6_C.png", pixels)])
+    out = tmp_path / "out"
+    assert run_import(ImportOptions(root, out))[1] == 0
+    record, = json.loads((out / "import-report.json").read_text())["preview"]
+    crop, = record["component_crops"]
+    assert crop["bbox_xyxy_px"] == [130, 710, 137, 719]
+    assert crop["source_offset_xy_px"] == [130, 710] and crop["shape_yx"] == [9, 7]
+    assert crop["context_bbox_xyxy_px"] == [66, 646, 201, 783]
+    assert crop["context_source_offset_xy_px"] == [66, 646]
+    with Image.open(out / crop["image"]) as image:
+        assert image.size == (7, 9)
+        assert image.getpixel((3, 4)) == (8, 123, 76)
+        assert image.getpixel((4, 3)) != (8, 123, 76)
+    with Image.open(out / crop["context_image"]) as image:
+        assert image.size == (135, 137)
+        assert image.getpixel((67, 68)) == (8, 123, 76)
+        assert image.getpixel((67, 61)) == (8, 123, 76)
+        assert image.getpixel((60, 68)) == (8, 123, 76)
+        assert image.getpixel((77, 78)) != (8, 123, 76)
+    annotation, = (out / "preview").glob("*-annotations.png")
+    with Image.open(annotation) as image:
+        green = np.all(np.asarray(image)[:, :, :3] == [8, 123, 76], axis=-1)
+        yy, xx = np.nonzero(green)
+        assert len(xx) >= 20
+        # Hand-computed centre ~[99.88,534.64] after full-frame overview scaling.
+        assert 94 <= xx.min() <= xx.max() <= 105
+        assert 529 <= yy.min() <= yy.max() <= 540
+    html = (out / "preview.html").read_text()
+    assert "source offset 66,646" in html and "Source bbox XYXY: (130, 710, 137, 719)" in html
+
+
+def test_rb_S16_escapes_invalid_model_candidates_and_stack(tmp_path):
+    from png_helpers import write_model
+    root = tmp_path / "source"
+    pixels = ((710, 130), (710, 131), (711, 130), (711, 131))
+    write_model(root, [('A<&"', '1-U<&".png', pixels), ('B<&"', '7-L<&".png', pixels),
+                       ('cno', '6_C<&".png', pixels)], model='M<&"')
+    bad = write_png(root, 'BAD<&"/A/1-X.png'); Image.new("L", (1203, 1001), 127).save(bad)
+    out = tmp_path / "out"
+    assert run_import(ImportOptions(root, out))[1] == 2
+    html = (out / "preview.html").read_text()
+    assert '<h2>BAD&lt;&amp;&quot;</h2><p>Invalid source' in html
+    assert 'Selected upper: A&lt;&amp;&quot;@1:U&lt;&amp;&quot;; lower: B&lt;&amp;&quot;@7:L&lt;&amp;&quot;' in html
+    assert 'Involved layers, top to bottom: 1:U&lt;&amp;&quot; / A&lt;&amp;&quot; → 6:C&lt;&amp;&quot; / cno → 7:L&lt;&amp;&quot; / B&lt;&amp;&quot;' in html
+    assert all(name not in html for name in ['BAD<&"', 'M<&"', 'A<&"', 'B<&"', 'U<&"', 'L<&"', 'C<&"'])

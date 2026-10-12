@@ -100,3 +100,20 @@ labels/quality acceptance remain pending. A **5–10 diverse product pilot** is 
 integration/connection-inspection pilot, never a required training corpus size or
 retrieval-quality acceptance. See USAGE for strict PNG re-save remedies and preview
 layer/endpoint interpretation.
+
+
+The current PNG report/integrity versions are `dl1_png_import_v2` and
+`dl1_png_bundle_v2`; strict v1 manifests and model/checkpoint versions stay unchanged.
+Electrode layer vocabulary and CNT-plane names are separate report lists; combined
+`all_source_*` lists are audit evidence. `extractor_run_status: ran` says only that
+extraction ran, while coverage and model status remain separate. The verifier rejects
+unsupported old sidecars and added files/directories with clean diagnostics.
+
+Output containment compares existing ancestor file identities, including case/Unicode
+spellings and symlinks. Publication uses native atomic no-replace rename when available,
+otherwise an exclusive directory claim with manifest written last and disabled on any
+failure/interruption. The fallback can expose a partial directory; verify a completed
+bundle before consumption. `publication_method` records the route. Only macOS APFS was
+exercised on a real host; Linux/Windows publication remains untested on real hosts.
+**Exported does not mean the grid is accepted**; warnings and default train/search gates
+still apply. Failed stages retain pending manifests and failed/interrupted reports.

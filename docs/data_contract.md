@@ -548,3 +548,54 @@ entry in [validation.md](validation.md). Synthetic offline context preview is
 `/tmp/dl1-png-preview-evidence/t4-inspection/preview.html`; its 23-file bundle hash
 verification passed. The montage beside the bundle was visually checked. No real-data,
 electrical verification or retrieval-quality claim follows.
+
+
+## R-B finding response: publication and sidecar v2 — 2026-10-12
+
+Containment now compares `os.path.samefile` for every existing output ancestor against
+the input root, and rejects the reverse nesting too, before any directory creation.
+This closes the case/NFC/NFD path-spelling bypass on default APFS. Source/argument
+validation happens before making missing parent/staging directories where a diagnostic
+bundle is not yet needed. Invalid inventory/metadata still gets the authorized diagnostic
+bundle. No source files or model geometry are changed.
+
+Native atomic no-replace directory publication remains on macOS/Linux when available.
+A missing symbol or ENOSYS/EINVAL selects the exclusive-directory-claim fallback (also
+used on Windows). The fallback refuses every existing destination, copies exclusively,
+writes manifest last, verifies the complete bundle, and disables the manifest on failure
+or KeyboardInterrupt. Unlike native rename it does not hide the partially copied
+directory. Consumers must wait for completion and verify the bundle. Failed claimed
+outputs and stages remain evidence; no existing destination is deleted or overwritten.
+The actual method is sealed into `publication_method`. Only macOS APFS was exercised on
+a real host; native Linux and Windows publication are not verified on real hosts.
+
+After any failure/interruption in the staged build, `manifest.json` is renamed back to
+pending evidence and the report says `failed/interrupted`. A distinct failure-report
+writing temporary avoids collisions with an abandoned `.writing` file and preserves the
+original exception. The handler also catches KeyboardInterrupt. Staging never becomes
+a consumable model bundle merely because validation, seal, verify or publication failed.
+
+Report shape changes are explicitly versioned as **dl1_png_import_v2**. The per-model
+and top-level raw run field is `extractor_run_status` with `ran/blocked/not_run`, never
+`complete` for a run. Coverage `complete` remains extraction coverage only, not electrical
+verification. Report vocabulary separates `electrode_layers` from `cno_layers`, their
+unions and unique-to-one-model lists; only electrode layers enter the model vocabulary.
+Combined names remain clearly labelled `all_source_*` audit fields. Internal extraction
+records/semantics and emitted IDs/hashes are unchanged. Invalid metadata report diagnostics
+use the location-independent `metadata` label and omit absolute file paths.
+
+Integrity is **dl1_png_bundle_v2** and lists exact directories as well as files. Added
+empty/nested directories and unlisted/non-file/missing entries reject. Missing/malformed
+report or manifest fields produce a clean diagnostic. V1 sidecar/integrity versions are
+explicitly unsupported by the new verifier; re-import to a new destination if needed.
+This does not bump `dl1_shape_v1_draft`, model input or checkpoint versions or change NPY
+load/preparation arithmetic. Consistent malicious re-sealing is still outside corruption
+verification's claim. Export with grid warnings remains allowed by plan: exported does
+not mean the grid is accepted; training/search retain their strict default gates.
+
+R-B fix validation: required targeted command **249 passed (65.74 s)**, final publication
+follow-up **14 passed (6.34 s)**, full default suite **484 passed, 1 existing skip
+(76.00 s)**. All five case/NFC/NFD containment reproductions ran on APFS with zero entries
+created. All eleven required scratch mutants failed their specified tests; exact commands,
+rows, fixture coordinates and evidence path are recorded in the new dated
+[validation record](validation.md). Independent refreshed review remains pending.

@@ -47,6 +47,8 @@ def test_auto_manifest_export_and_pending_prerequisites(tmp_path):
     doc = report(out)
     assert doc["export_status"] == "exported" and doc["metadata"]["pending_models"] == []
     p, = load_manifest(out / "manifest.json")
+    assert p.lineage_id == "SYNTHETIC-TEST-FAMILY" and p.design_version == "SYNTHETIC-TEST-V1"
+    assert p.lineage_id != p.product_id and p.design_version != p.product_id
     assert p.frame.shape_yx == (1001, 1203) and p.frame.pixel_pitch_um == 0.1
     assert p.unit_size_um == pytest.approx([120.3, 100.1])
     assert len(p.elements) == 5 and len(p.connections) == 3 and p.connectivity_observation == "partial"
@@ -162,8 +164,8 @@ def test_vocabulary_inventory_and_oov_search_diagnostics(tmp_path):
     out = tmp_path / "inspect"
     assert cli("--root", root, "--out", out).returncode == 0
     inventory = report(out)["inventory"]
-    assert inventory["role_union"] == ["A", "B", "D"] and inventory["layer_union"] == ["X", "Y", "Z"]
-    assert inventory["unique_roles"] == ["B", "D"] and inventory["unique_layers"] == ["Y", "Z"]
+    assert inventory["role_union"] == ["A", "B", "D"] and inventory["electrode_layer_union"] == ["X", "Y", "Z"]
+    assert inventory["unique_roles"] == ["B", "D"] and inventory["unique_electrode_layers"] == ["Y", "Z"]
     assert inventory["models"][0]["warnings"][0]["path"] == "M/readme.txt"
     assert report(out)["metadata"]["pending_models"] == ["M", "Q"]
     assert not (out / "manifest.json").exists()
@@ -259,3 +261,233 @@ def test_grid_failure_preserves_diagnostics_preview_and_blocks_export(tmp_path, 
     assert "inspect_grid_evaluation_failed" in report(out)["pending_prerequisites"]
     assert "synthetic grid runner failure" in report(out)["grid_evidence"][0]["error"]
     assert (out / "preview.html").exists() and not (out / "manifest.json").exists()
+
+
+def _tree_snapshot(root):
+    return {p.relative_to(root).as_posix(): ("directory" if p.is_dir() else ("symlink", str(p.readlink()))
+            if p.is_symlink() else (p.read_bytes(), p.stat().st_mtime_ns)) for p in root.rglob("*")}
+
+
+@pytest.mark.parametrize("row", ["case-model", "case-root", "unicode-model", "case-top", "case-electrode"])
+def test_rb_B1_review_table_refused_without_any_creation(tmp_path, row):
+    import unicodedata
+    source = tmp_path / ("입력" if row == "unicode-model" else "Src")
+    write_import_fixture(source, model="M1")
+    mapping = metadata(tmp_path / "meta.json", model="M1")
+    if row == "unicode-model":
+        alias = tmp_path / unicodedata.normalize("NFD", "입력")
+        if not alias.exists() or not os.path.samefile(source, alias):
+            pytest.skip("temp filesystem distinguishes NFC/NFD spellings")
+        root, out = source, alias / "M1/o"
+    else:
+        alias = tmp_path / "SRC"
+        if not alias.exists() or not os.path.samefile(source, alias):
+            pytest.skip("temp filesystem is case-sensitive")
+        root, out = {
+            "case-model": (source, alias / "M1/o6"),
+            "case-root": (tmp_path / "src", source / "M1/o8"),
+            "case-top": (source, tmp_path / "src/o5"),
+            "case-electrode": (source, alias / "M1/A/o7"),
+        }[row]
+    before = _tree_snapshot(tmp_path)
+    assert importer.main(["--root", str(root), "--out", str(out), "--export", "--metadata", str(mapping), "--candidate-grid", "64"]) == 2
+    assert _tree_snapshot(tmp_path) == before
+    assert not out.exists()
+
+
+def test_rb_B1_exact_relative_symlink_and_reverse_containment(tmp_path, monkeypatch):
+    root = tmp_path / "Src"; write_import_fixture(root)
+    link = tmp_path / "alias"; link.symlink_to(root, target_is_directory=True)
+    before = _tree_snapshot(tmp_path)
+    pairs = [(root, root / "o1"), (root, root / "SYNTHETIC-M/A/o"),
+             (root, root / "../Src/o2"), (root, link / "inside"), (link, root / "inside"),
+             (root, tmp_path), (root, root)]
+    monkeypatch.chdir(root)
+    pairs.append((Path("."), Path("SYNTHETIC-M/relative")))
+    for source, out in pairs:
+        assert importer.main(["--root", str(source), "--out", str(out)]) == 2
+        assert _tree_snapshot(tmp_path) == before
+
+
+def test_argument_and_source_failures_do_not_create_parent_or_stage(tmp_path):
+    bad = tmp_path / "file"; bad.write_text("not a source directory")
+    before = _tree_snapshot(tmp_path)
+    for root, extra in [(tmp_path / "missing", []), (bad, []), (tmp_path, ["--candidate-grid", "16"])]:
+        assert importer.main(["--root", str(root), "--out", str(tmp_path / "new/parent/output"), *extra]) == 2
+        assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.fixture(scope="module")
+def shared_export(tmp_path_factory):
+    # One immutable real-CLI export reused by corruption checks, never modified.
+    return export(tmp_path_factory.mktemp("rb-export"))[1]
+
+
+@pytest.mark.parametrize("change", ["extra-file", "missing-file", "empty-directory", "nested-directory", "manifest-report-link"])
+def test_rb_S14_unlisted_missing_entries_and_manifest_report_hash_link(tmp_path, shared_export, change):
+    copied = tmp_path / "copy"; shutil.copytree(shared_export, copied)
+    if change == "extra-file":
+        (copied / "unexpected.txt").write_text("not in integrity")
+    elif change == "missing-file":
+        (copied / "preview.html").unlink()
+    elif change == "empty-directory":
+        (copied / "empty-extra").mkdir()
+    elif change == "nested-directory":
+        (copied / "preview/empty-extra").mkdir()
+    else:
+        doc = report(copied); doc["generated_manifest_sha256"] = "0" * 64
+        importer._write_json(copied / "import-report.json", doc)
+        integrity = json.loads((copied / "bundle-integrity.json").read_text())
+        integrity["files"]["import-report.json"] = importer.file_sha256(copied / "import-report.json")
+        importer._write_json(copied / "bundle-integrity.json", integrity)
+    with pytest.raises((ValueError, OSError), match="unlisted|missing|link"):
+        importer.verify_bundle(copied)
+
+
+@pytest.mark.parametrize("malformation", ["missing-status", "list-report", "missing-inventory", "missing-publication", "missing-algorithm", "missing-run-status", "bad-products", "bad-assets"])
+def test_verify_malformed_report_or_manifest_is_clean_cli_diagnostic(tmp_path, shared_export, malformation, capsys):
+    copied = tmp_path / "copy"; shutil.copytree(shared_export, copied)
+    doc = report(copied)
+    if malformation == "missing-status": del doc["export_status"]
+    elif malformation == "list-report": doc = []
+    elif malformation == "missing-inventory": del doc["inventory"]
+    elif malformation == "missing-publication": del doc["publication_method"]
+    elif malformation == "missing-algorithm": del doc["algorithm_version"]
+    elif malformation == "missing-run-status": del doc["extractor_run_status"]
+    elif malformation == "bad-assets": doc["generated_asset_hashes"] = None
+    else:
+        manifest = json.loads((copied / "manifest.json").read_text()); manifest["products"] = None
+        importer._write_json(copied / "manifest.json", manifest)
+        doc["generated_manifest_sha256"] = importer.file_sha256(copied / "manifest.json")
+    importer._write_json(copied / "import-report.json", doc)
+    importer._seal_bundle(copied)  # bypass file hash so structural report checks run
+    assert importer.main(["--verify-bundle", str(copied)]) == 2
+    error = capsys.readouterr().err
+    assert error and "Traceback" not in error
+
+
+@pytest.mark.parametrize("capability", ["missing-symbol", "enosys", "einval", "windows"])
+def test_publish_fallback_claim_and_manifest_last(tmp_path, shared_export, monkeypatch, capability):
+    stage = tmp_path / "stage"; shutil.copytree(shared_export, stage)
+    out = tmp_path / "published"
+    def unavailable(*args):
+        if capability in {"missing-symbol", "windows"}: raise AttributeError("no native symbol")
+        import errno
+        raise OSError(errno.ENOSYS if capability == "enosys" else errno.EINVAL, "native operation unavailable")
+    if capability == "windows":
+        monkeypatch.setattr(importer.sys, "platform", "win32")
+        def no_libc(*args, **kwargs): raise AssertionError("Windows must not try loading libc")
+        monkeypatch.setattr(importer.ctypes, "CDLL", no_libc)
+    else:
+        monkeypatch.setattr(importer, "_native_publish_noreplace", unavailable)
+    original_copy = importer._copy_exclusive
+    copied = []
+    def ordered(source, target):
+        assert not (out / "manifest.json").exists()
+        copied.append(target.relative_to(out).as_posix())
+        original_copy(source, target)
+    monkeypatch.setattr(importer, "_copy_exclusive", ordered)
+    assert importer._publish_noreplace(stage, out) == "exclusive_directory_claim_manifest_last"
+    assert copied[-1] == "manifest.json"
+    assert report(out)["publication_method"] == "exclusive_directory_claim_manifest_last"
+    assert importer.verify_bundle(out)["status"] == "verified"
+    before = _tree_snapshot(out)
+    with pytest.raises(FileExistsError): importer._publish_noreplace(stage, out)
+    assert _tree_snapshot(out) == before
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_publish_fallback_failure_never_leaves_consumable_manifest(tmp_path, shared_export, monkeypatch, interrupt):
+    stage = tmp_path / "stage"; shutil.copytree(shared_export, stage)
+    out = tmp_path / "failed"
+    def unavailable(*args): raise AttributeError("native symbol absent")
+    monkeypatch.setattr(importer, "_native_publish_noreplace", unavailable)
+    original = importer._copy_exclusive
+    def failed_after_final_manifest(source, target):
+        original(source, target)
+        if target.name == "manifest.json":
+            raise KeyboardInterrupt("synthetic stop") if interrupt else OSError("synthetic final copy fault")
+    monkeypatch.setattr(importer, "_copy_exclusive", failed_after_final_manifest)
+    with pytest.raises(KeyboardInterrupt if interrupt else OSError): importer._publish_noreplace(stage, out)
+    assert not (out / "manifest.json").exists()
+    assert (out / "manifest.pending.json").exists()
+    assert report(out)["export_status"] == ("interrupted" if interrupt else "failed")
+    assert not (stage / "manifest.json").exists() and (stage / "manifest.pending.json").exists()
+    assert report(stage)["publication_method"] == "exclusive_directory_claim_manifest_last"
+
+
+@pytest.mark.parametrize("point", ["validation", "seal", "verify", "publish", "interrupt-seal", "writing-leftover"])
+def test_rb_S15_multi_stage_failure_and_pending_manifest(tmp_path, monkeypatch, point):
+    root = tmp_path / "source"; write_import_fixture(root)
+    out = tmp_path / "out"
+    mapping = metadata(tmp_path / "metadata.json")
+    original_loader = importer.load_manifest
+    def guarded_loader(path):
+        assert path.name == "manifest.pending.json"
+        assert not (path.parent / "manifest.json").exists()
+        if point == "validation": raise RuntimeError("synthetic validation fault")
+        return original_loader(path)
+    monkeypatch.setattr(importer, "load_manifest", guarded_loader)
+    target = {"seal": "_seal_bundle", "verify": "verify_bundle", "publish": "_publish_noreplace", "interrupt-seal": "_seal_bundle"}.get(point)
+    if target:
+        def fail(*args):
+            assert (args[0] / "manifest.json").is_file()
+            if point == "interrupt-seal": raise KeyboardInterrupt("synthetic interrupt")
+            raise RuntimeError("synthetic " + point + " fault")
+        monkeypatch.setattr(importer, target, fail)
+    if point == "writing-leftover":
+        original_write = importer._write_json
+        def leftovers(path, payload):
+            if path.name == "import-report.json" and payload["export_status"] == "exported":
+                path.with_name(path.name + ".writing").write_text("abandoned partial report")
+                raise OSError("synthetic original write fault")
+            return original_write(path, payload)
+        monkeypatch.setattr(importer, "_write_json", leftovers)
+    with pytest.raises(KeyboardInterrupt if point == "interrupt-seal" else RuntimeError, match="synthetic"):
+        importer.run_import(ImportOptions(root, out, True, mapping, 16))
+    stage, = tmp_path.glob(".out.staging-*")
+    assert not out.exists() and not (stage / "manifest.json").exists()
+    assert (stage / "manifest.pending.json").is_file()
+    assert report(stage)["export_status"] == ("interrupted" if point == "interrupt-seal" else "failed")
+    if point == "writing-leftover": assert (stage / "import-report.json.writing").exists()
+
+
+def test_metadata_diagnostic_is_location_independent(tmp_path):
+    root = tmp_path / "source"; write_png(root, "M/A/1-X.png")
+    outputs = []
+    for name in ("first", "second"):
+        where = tmp_path / name; where.mkdir()
+        bad = where / "metadata.json"; bad.write_text('{"unknown": "not metadata"}')
+        out = where / "out"
+        assert importer.run_import(ImportOptions(root, out, True, bad, 16))[1] == 2
+        payload = report(out)
+        diagnostic, = [d for d in payload["diagnostics"] if d["path"] == "metadata"]
+        assert str(tmp_path) not in json.dumps(payload, ensure_ascii=False)
+        assert diagnostic["reason"] == "metadata: metadata requires exactly metadata_schema_version and models"
+        outputs.append((out / "import-report.json").read_bytes())
+    assert outputs[0] == outputs[1]
+
+
+def test_model_run_status_does_not_say_complete_for_partial_coverage(shared_export):
+    doc = report(shared_export)
+    assert doc["report_schema_version"] == "dl1_png_import_v2"
+    assert doc["extractor_run_status"] == "ran"
+    model, = doc["extraction"]
+    assert model["extractor_run_status"] == "ran" and model["connectivity_observation"] == "partial"
+    assert "extraction_status" not in model and "extraction_status" not in doc
+    expected = {"darwin_rename_excl"} if sys.platform == "darwin" else {"linux_renameat2_noreplace", "exclusive_directory_claim_manifest_last"}
+    assert doc["publication_method"] in expected
+
+
+def test_fallback_raced_claim_preserves_destination(tmp_path, shared_export, monkeypatch):
+    import errno
+    stage = tmp_path / "stage"; shutil.copytree(shared_export, stage)
+    out = tmp_path / "raced"
+    def unavailable_and_raced(*args):
+        out.mkdir(); (out / "existing.txt").write_text("existing user evidence")
+        raise OSError(errno.ENOSYS, "native unavailable")
+    monkeypatch.setattr(importer, "_native_publish_noreplace", unavailable_and_raced)
+    with pytest.raises(FileExistsError): importer._publish_noreplace(stage, out)
+    assert sorted(p.name for p in out.iterdir()) == ["existing.txt"]
+    assert (out / "existing.txt").read_text() == "existing user evidence"
+    assert not (out / "manifest.json").exists()
