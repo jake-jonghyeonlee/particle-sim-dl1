@@ -181,3 +181,88 @@ The frozen CLI spelling for subsequent T3 implementation is
 `--verify-bundle BUNDLE` verifies a published bundle without sources. No grid is chosen
 by default. T1 supplies contracts/APIs; the importer CLI and export/preview are T3 work.
 Existing schema/model-input versions, NPY loader and requirements lock are unchanged.
+
+## Original-resolution CNT extraction (T2)
+
+`png_connections.extract_model` operates without lineage/design metadata or grids.
+It labels each CNT source plane independently using horizontal-run union/find with
+4-neighbour edge overlap. The single int32 source label array is released after each
+file; bbox/pixel counts derive from runs, without a full-frame scan per component.
+Each component retains a bbox-local bool mask. Candidate intersections, common-contact
+checks, geometry hashing and centroid selection receive only bbox slices. Large or
+widely spanning bboxes may still be expensive; this is no universal sublinear guarantee.
+
+For CNT stack s, full overlapping electrode candidates are recorded above, below and
+at equal stack. The maximal overlapping upper stack and minimal overlapping lower stack
+are selected **before** their common intersection is tested. Multiple electrodes on a
+selected stack, missing side, same endpoint element, equal-stack contact, empty common
+intersection or disconnected common-contact regions leave the component unresolved with
+named reasons and no relation. A failed nearest pair never falls through to a deeper
+layer. Other lower overlaps retain the explicit reason
+`deeper_than_nearest_overlapping_lower`. Equal-stack electrode/cno overlap is reachable
+only with the same stack/name; conflicting names already invalidate source inventory.
+
+A uniquely selected pair may skip modeled nonoverlapping layers and still emit one
+relation. Its `skipped_upper_layers` and `skipped_lower_layers` separately group actual
+electrode and cno stack/layer entries with asset/path references; numeric gaps do not
+invent layers. `needs_confirmation` and directional summary counts expose this rule.
+The nearest-overlap/skipped-layer and 4-neighbour rules are implementation interpretations,
+not independently established physical facts. A connected common intersection cannot
+prove one physical contact; disconnected common regions flag possible multicontact and
+are never heuristically split.
+
+The representative is an actual common-intersection pixel closest to its centroid.
+Squared distances compare Python integer numerators, avoiding floating-point ties and
+integer overflow; ties sort by y, then x. Bbox offsets restore original coordinates.
+Both endpoint references share `[(x+0.5)*0.1,(y+0.5)*0.1]` µm. Component/connection IDs
+bind canonical original geometry and source/element identities, independent of traversal,
+root path and PNG re-encoding. Duplicate/colliding emitted identities fail explicitly.
+
+All resolved components yield at most one observed CNT relation each. All/some/zero
+resolved components produce `complete`/`partial`/`unavailable`; missing cno, present cno
+without PNGs and observed white-only CNT have distinct reasons. The global CNT mask
+preserves **all** source foreground, including unresolved components. A skipped-layer
+confirmation flag alone does not force partial coverage. **complete means extraction
+coverage only; electrical verification not performed.** Both electrical and real-data
+validation remain `not_performed`; no absent/white image certifies electrical absence.
+
+`extract_inventory` returns resource-populated source records plus compact extraction
+records for sidecar serialization. `iter_connections` materializes one full-frame bool
+component mask at a time for export; callers must release consumed masks.
+`to_product` is the explicit existing-schema compatibility boundary: it retains full-frame
+connection masks, creates full valid/global-CNT masks, preserves original frames and
+coordinates, and runs `validate_product`. It keeps lineage/design absent unless supplied
+as explicit metadata. Callers must surface estimates before that potentially heavy step.
+The legacy loader/validator still adds float32 copies and further allocations.
+
+Estimates use N=H*W, E=electrode assets, K=nonempty CNT components, R=resolved relations,
+and U=1 when decoded CNT source files exist (including white-only), otherwise 0.
+Generated mask count M=E+1+U+R includes valid, optional global CNT and connection masks.
+Bool payload is N*M bytes; projected retained loader masks use 4*N*M bytes. Actual NumPy
+v1 bool header encoding is generated in memory, without creating any export-sized array,
+and its M-fold overhead is included in total projected NPY bytes. The upper scenario
+replaces R by K. Invalid source estimates remain unknown with a reason. Estimates exclude
+manifest/report/preview files and decoder/label/temporary/grid/Python/validation overhead;
+they predict neither peak RAM nor runtime and do not approve real resource suitability.
+
+S23 measured labeling, extraction and estimate generation on a synthetic 2000×2000 frame
+with 300 disjoint 2×2 components, one 200×200 square and one 3×500 elongated component.
+One small component lacks upper overlap: K=302 and R=301. Hand-specified centres include
+`[1099,1099]` for the even square and `[1149,1501]` for the elongated region. Structural
+instrumentation requires precisely one source labeling pass, 604 bbox overlap checks,
+301 bbox common intersections/representatives and 905 bbox hash operations; full-frame
+connection-mask materialization is forbidden during the measured operation.
+
+Measured elapsed time: **0.055192 s** on **Mac16,11 / Apple M4 Pro**, macOS 26.5.2 arm64,
+Python 3.12.13, NumPy 2.5.3. The coordinator reviewed the initial 10-second proposal and
+requested **`SCALE_REGRESSION_SECONDS=2.0`**, additional larger components and re-measurement;
+the revised measurement is below its 0.2-second re-ask threshold and the guard exceeds
+10× measured time (about 36×). This committed constant is solely a deterministic synthetic
+regression guard, not a production limit; changes require evidence/coordinator review.
+Timing excludes PNG decoding/source hashing, disk export, full legacy loading, model
+inference and network. No real source or hundreds of full-frame masks were exported.
+
+For this fixture M=305, projected bool payload=1,220,000,000 bytes, headers=39,040 bytes,
+NPY total=1,220,039,040 bytes and retained float32 masks=4,880,000,000 bytes. The K scenario
+has M=306, NPY total=1,224,039,168 bytes and float32 masks=4,896,000,000 bytes. A single
+synthetic bool NPY under test `tmp_path` independently checks the 128-byte header.

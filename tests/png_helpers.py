@@ -20,3 +20,9 @@ def write_png(root, relative_path, *, shape=(1001, 1203), pixels=((0, 0),), mode
         image = image.convert(mode)
     image.save(path, compress_level=compress_level, **save_options)
     return path
+
+
+def write_model(root, assets, *, shape=(1001, 1203), model="M"):
+    """Assets are hand-written (folder, filename, foreground y/x pixels)."""
+    for folder, filename, pixels in assets:
+        write_png(root, f"{model}/{folder}/{filename}", shape=shape, pixels=pixels)

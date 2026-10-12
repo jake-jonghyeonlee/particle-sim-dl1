@@ -235,7 +235,7 @@ class ImportReport:
     export_status: str = "not_requested"
     grid_readiness: str = "pending_explicit_grid"
     # T2/T3 supply JSON-serializable extraction/grid/publication evidence.
-    extraction: tuple[dict, ...] = ()
+    extraction: tuple["ModelExtraction", ...] = ()
     grid_evidence: tuple[dict, ...] = ()
     generated_manifest_sha256: str | None = None
     generated_asset_hashes: tuple[tuple[str, str], ...] = ()
@@ -245,3 +245,121 @@ class ImportReport:
 def require_report_version(report: dict) -> None:
     if report.get("report_schema_version") != REPORT_SCHEMA_VERSION:
         raise ValueError("unsupported PNG report_schema_version")
+
+
+@dataclass(frozen=True)
+class LayerEvidence:
+    stack: int
+    layer: str
+    asset_ids: tuple[str, ...]
+    source_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SkippedLayers:
+    electrode_layers: tuple[LayerEvidence, ...] = ()
+    cno_layers: tuple[LayerEvidence, ...] = ()
+
+    @property
+    def present(self) -> bool:
+        return bool(self.electrode_layers or self.cno_layers)
+
+
+@dataclass(frozen=True)
+class OverlapCandidate:
+    element_id: str
+    asset_id: str
+    electrode: str
+    stack: int
+    layer: str
+    source_path: str
+    overlap_pixels: int
+
+
+@dataclass(frozen=True)
+class IgnoredCandidate:
+    candidate: OverlapCandidate
+    reason: str = "deeper_than_nearest_overlapping_lower"
+
+
+@dataclass(frozen=True)
+class ExtractedEndpoint:
+    element_id: str
+    xy_um: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class ExtractedRelation:
+    connection_id: str
+    component_id: str
+    endpoints: tuple[ExtractedEndpoint, ExtractedEndpoint]
+    representative_xy_px: tuple[int, int]
+    common_intersection_pixels: int
+    common_intersection_sha256: str
+    skipped_upper_layers: SkippedLayers
+    skipped_lower_layers: SkippedLayers
+    needs_confirmation: bool
+    selection_reason: str = "unique_nearest_overlapping_upper_and_lower_with_connected_common_intersection"
+    kind: str = "CNT"
+    observation: str = "observed"
+
+
+@dataclass(frozen=True)
+class ExtractedComponent:
+    component_id: str
+    source_asset_id: str
+    source_path: str
+    cnt_stack: int
+    cnt_layer: str
+    shape_yx: tuple[int, int]
+    bbox_xyxy_px: tuple[int, int, int, int]
+    pixel_count: int
+    mask_sha256: str  # canonical bbox-local mask; bbox/shape bound by component_id
+    mask: np.ndarray = field(repr=False, compare=False)  # bbox-local only
+    above_candidates: tuple[OverlapCandidate, ...] = ()
+    below_candidates: tuple[OverlapCandidate, ...] = ()
+    equal_stack_candidates: tuple[OverlapCandidate, ...] = ()
+    selected_upper_candidates: tuple[OverlapCandidate, ...] = ()
+    selected_lower_candidates: tuple[OverlapCandidate, ...] = ()
+    ignored_lower_candidates: tuple[IgnoredCandidate, ...] = ()
+    unresolved_reasons: tuple[str, ...] = ()
+    common_intersection_pixels: int | None = None
+    common_intersection_regions: int | None = None
+    relation: ExtractedRelation | None = None
+
+
+@dataclass(frozen=True)
+class ExtractionSummary:
+    component_count: int
+    resolved_relation_count: int
+    unresolved_component_count: int
+    needs_confirmation_relations: int
+    skipped_upper_relations: int
+    skipped_lower_relations: int
+    skipped_upper_electrode_layers: int
+    skipped_upper_cno_layers: int
+    skipped_lower_electrode_layers: int
+    skipped_lower_cno_layers: int
+
+
+@dataclass(frozen=True)
+class ModelExtraction:
+    model_id: str
+    components: tuple[ExtractedComponent, ...]
+    connectivity_observation: str
+    summary: ExtractionSummary
+    resource_estimate: ResourceEstimate
+    source_reasons: tuple[str, ...] = ()
+    extraction_status: str = "complete"
+    algorithm_id: str = ALGORITHM_ID
+    algorithm_version: str = ALGORITHM_VERSION
+    component_neighbourhood: int = 4
+    rule_evidence: str = "implementation_interpretation_not_electrical_verification"
+    residual_limitations: str = "connected_common_intersection_cannot_prove_single_physical_contact"
+    electrical_verification: str = "not_performed"
+    real_data_validation: str = "not_performed"
+    coverage_meaning: str = "complete means extraction coverage only; electrical verification not performed"
+
+    @property
+    def relations(self) -> tuple[ExtractedRelation, ...]:
+        return tuple(c.relation for c in self.components if c.relation is not None)
