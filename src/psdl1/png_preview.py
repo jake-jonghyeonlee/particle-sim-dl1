@@ -36,8 +36,8 @@ def _draw_marker(draw, xy, state, index, radius=5):
 
 
 def _skipped_text(skipped):
-    electrode = "; ".join(f"{l.stack}:{l.layer} [{', '.join(l.source_paths)}]" for l in skipped.electrode_layers) or "none"
-    cno = "; ".join(f"{l.stack}:{l.layer} [{', '.join(l.source_paths)}]" for l in skipped.cno_layers) or "none"
+    electrode = "; ".join(f"{l.order_index}:{l.layer} [{', '.join(l.source_paths)}]" for l in skipped.electrode_layers) or "none"
+    cno = "; ".join(f"{l.order_index}:{l.layer} [{', '.join(l.source_paths)}]" for l in skipped.cno_layers) or "none"
     return escape("electrode layers: " + electrode + " | cno layers: " + cno)
 
 
@@ -78,17 +78,20 @@ def _context_image(model, component):
 
 
 def _stack_text(model, component):
+    if model.stack_order.status != "resolved":
+        return '<p>Unordered CNT inventory: ' + escape(component.cnt_layer +
+            f" / filename number (provenance only) {component.cnt_filename_number} / " + component.source_path) + '</p>'
     r = component.relation
     skipped = set()
     if r is not None:
         for side in (r.skipped_upper_layers, r.skipped_lower_layers):
             for layer in side.electrode_layers + side.cno_layers:
                 skipped.update(layer.asset_ids)
-    involved = {c.asset_id for c in component.above_candidates + component.below_candidates + component.equal_stack_candidates}
+    involved = {c.asset_id for c in component.above_candidates + component.below_candidates}
     involved.add(component.source_asset_id)
     involved.update(skipped)
-    lines = [f"{a.stack}:{a.layer} / {a.electrode or 'cno'}" + (" [skipped, non-overlapping]" if a.asset_id in skipped else "")
-             for a in sorted(model.assets, key=lambda a: (a.stack, a.layer, a.electrode or 'cno')) if a.asset_id in involved]
+    lines = [f"position {model.order_index(a)}:{a.layer} / {a.electrode or 'cno'}" + (" [skipped, non-overlapping]" if a.asset_id in skipped else "")
+             for a in sorted(model.assets, key=lambda a: (model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode or 'cno')) if a.asset_id in involved]
     return '<p>Involved layers, top to bottom: ' + escape(' → '.join(lines)) + '</p>'
 
 
@@ -116,7 +119,9 @@ def write_preview(stage, inventory, extraction, *, report=None):
         base_relative = "preview/" + model_key + "-overview.png"
         overview = Image.new("RGB", (ow, oh), "white")
         overlays, toggles = [], []
-        for index, asset in enumerate(model.assets):
+        display_assets = sorted(model.assets, key=lambda a: (
+            0 if a.kind == "electrode" else 1, a.stack or 0, a.layer, a.mask_sha256, a.electrode or ""))
+        for index, asset in enumerate(display_assets):
             colour = (30, 30, 30) if asset.kind == "cno" else COLOURS[index % len(COLOURS)]
             image = _layer_image(asset.mask, (ow, oh), colour)
             overview.paste(image, (0, 0), image)
@@ -124,7 +129,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
             image.save(stage / layer_relative)
             target = "layer-" + asset.asset_id
             overlays.append(f'<img class="overlay" id="{target}" src="{layer_relative}" alt="{escape(asset.relative_path, quote=True)}">')
-            toggles.append(f'<label><input type="checkbox" checked data-layer="{target}"> {escape(asset.electrode or "cno")} / {asset.stack}:{escape(asset.layer)}</label>')
+            toggles.append(f'<label><input type="checkbox" checked data-layer="{target}"> {escape(asset.electrode or "cno")} / {escape(asset.layer)} / {"filename number (provenance only)" if asset.kind == "cno" else "electrode number"} {asset.filename_number}</label>')
         annotation = Image.new("RGBA", (ow, oh), (255, 255, 255, 0))
         draw = ImageDraw.Draw(annotation)
         bbox = model.frame.core_bbox_xyxy_px
@@ -159,8 +164,8 @@ def write_preview(stage, inventory, extraction, *, report=None):
             enlarged_relative = "preview/" + component.component_id + "-context-display.png"
             context.resize((context.width * display_factor, context.height * display_factor), Image.Resampling.NEAREST).save(stage / enlarged_relative)
             anchor = "component-" + component.component_id
-            above = ", ".join(f"{c.electrode}@{c.stack}:{c.layer}" for c in component.selected_upper_candidates) or "none"
-            below = ", ".join(f"{c.electrode}@{c.stack}:{c.layer}" for c in component.selected_lower_candidates) or "none"
+            above = ", ".join(f"{c.electrode}@{c.order_index}:{c.layer}" for c in component.selected_upper_candidates) or "none"
+            below = ", ".join(f"{c.electrode}@{c.order_index}:{c.layer}" for c in component.selected_lower_candidates) or "none"
             reasons = "; ".join(component.unresolved_reasons) or "resolved under implementation rule"
             details = f'<p>Selected upper: {escape(above)}; lower: {escape(below)}. {escape(reasons)}</p>'
             if r is not None:
@@ -168,11 +173,11 @@ def write_preview(stage, inventory, extraction, *, report=None):
                 details += '<p>Skipped upper — ' + _skipped_text(r.skipped_upper_layers) + '</p>'
                 details += '<p>Skipped lower — ' + _skipped_text(r.skipped_lower_layers) + '</p>'
             details += _stack_text(model, component)
-            ignored = "; ".join(f"{c.candidate.electrode}@{c.candidate.stack}:{c.candidate.layer}: {c.reason}" for c in component.ignored_lower_candidates) or "none"
+            ignored = "; ".join(f"{c.candidate.electrode}@{c.candidate.order_index}:{c.candidate.layer}: {c.reason}" for c in component.ignored_lower_candidates) or "none"
             details += f'<p>Ignored lower candidates: {escape(ignored)}</p>'
             details += '<details><summary>All overlapping source candidates</summary><p>' + escape(str([
-                (c.electrode, c.stack, c.layer, c.overlap_pixels) for c in
-                component.above_candidates + component.below_candidates + component.equal_stack_candidates])) + '</p></details>'
+                (c.electrode, c.order_index, c.layer, c.overlap_pixels) for c in
+                component.above_candidates + component.below_candidates])) + '</p></details>'
             component_sections.append(f'<article class="{state}" id="{anchor}"><h3>{number}. {state.replace("_", " ")}</h3>'
                                       f'<code>{component.component_id}</code><p>Source bbox XYXY: {component.bbox_xyxy_px}; '
                                       f'crop offset XY=({x0},{y0}); 1 source pixel / display image pixel.</p>'
@@ -196,7 +201,17 @@ def write_preview(stage, inventory, extraction, *, report=None):
         view = (f'<div class="viewport"><div class="stack" style="width:{ow}px;height:{oh}px">' +
                 ''.join(overlays) + f'<img class="overlay" src="{annotation_relative}" alt="Core reference and source-coordinate markers"></div></div>')
         model_status = "available" if result.connectivity_observation == "complete" else result.connectivity_observation
-        sections.append(f'<section><h2>{escape(model.model_id)}</h2><p>Extractor run: {"ran" if result.extraction_status == "complete" else "blocked"}; '
+        if model.stack_order.status == "resolved":
+            order_html = '<p>Resolved top-to-bottom order (user_supplied_order_file)</p><ol start="0">' + ''.join(
+                '<li>' + escape(f"position {e.order_index}: {e.kind} / {e.name}" +
+                                (f" / electrode number {e.electrode_stack}" if e.kind == "electrode" else "") +
+                                " / assets " + ', '.join(e.asset_ids)) + '</li>'
+                for e in model.stack_order.resolved_order) + '</ol>'
+        elif model.stack_order.status == "required":
+            order_html = '<p><strong>Stack order required — supply --stack-order; CNT relations were not extracted.</strong></p><p>CNT overlays are an unordered inventory.</p>'
+        else:
+            order_html = '<p>' + escape('; '.join(model.stack_order.errors)) + '</p>'
+        sections.append(f'<section><h2>{escape(model.model_id)}</h2>' + order_html + f'<p>Extractor run: {"ran" if result.extraction_status == "complete" else "blocked"}; '
                         f'extraction coverage: {result.connectivity_observation}; model connectivity status: {model_status}.</p>'
                         f'<p>Full source frame H×W={h}×{w}; origin (0,0), x→right, y→down; x=0…{w-1}, y=0…{h-1}; '
                         f'pitch 0.1 µm/pixel. Overview scale XY=({sx:.8f},{sy:.8f}).</p><p><a href="{base_relative}">Download full-frame overview</a></p>'
@@ -218,7 +233,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
             'p{line-height:1.5}h2{margin-top:0}a{color:#185e9f}</style><header><h1>DL1 PNG source inspection</h1>'
             '<p><strong>automatic extraction; electrical verification not performed</strong></p>'
             '<p>Display crops are for inspection only, not model input. Model input always retains the full frame and real margins.</p>'
-            '<p>Context legend: blue=selected upper electrodes; rose=selected lower electrodes (all candidates on each selected layer); gray=other electrodes; black=CNT outline; yellow=common intersection J; green crosshair=shared endpoint.</p><p>complete means extraction coverage only; electrical verification not performed. 4-neighbour and skipped-layer rules are implementation interpretations.</p></header>'
+            '<p>Context legend: blue=selected upper electrodes; rose=selected lower electrodes (all candidates on each selected layer); gray=other electrodes; black=CNT outline; yellow=common intersection J; green crosshair=shared endpoint.</p><p>complete means extraction coverage only; electrical verification not performed. 4-neighbour components are user accepted; skipped-layer physical interpretation remains unconfirmed.</p></header>'
             '<main><details open><summary>Source warnings and possible duplicates</summary><ul>' + warnings_html + '</ul></details>' + ''.join(sections) + '</main>'
             '<script>document.querySelectorAll("[data-layer]").forEach(x=>x.addEventListener("change",()=>{document.getElementById(x.dataset.layer).hidden=!x.checked;}));</script></html>')
     (stage / "preview.html").write_text(html, encoding="utf-8")

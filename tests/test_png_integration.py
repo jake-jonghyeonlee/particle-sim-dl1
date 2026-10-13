@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from png_helpers import write_wide_import_fixture, write_model
+from png_helpers import write_stack_order, write_wide_import_fixture, write_model
 from psdl1.data import build_vocab, load_manifest, grid_check, input_identity
 from psdl1.import_png import run_import
 from psdl1.png_contract import ImportOptions
@@ -34,7 +34,7 @@ def imported(tmp_path_factory):
         "SYNTHETIC-WIDE-Z": {"lineage_id": "SYNTHETIC-OTHER-FAMILY", "design_version": "SYNTHETIC-OTHER-V1"}}}))
     out = tmp_path / "bundle"
     command = [sys.executable, "-m", "psdl1.import_png", "--root", str(root), "--out", str(out),
-               "--export", "--metadata", str(mapping), "--candidate-grid", "128"]
+               "--export", "--metadata", str(mapping), "--candidate-grid", "128", "--stack-order", str(write_stack_order(tmp_path / "order.json", ["U", "N", "C4", "U5", "C6", "L"]))]
     result = subprocess.run(command, capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     assert result.returncode == 0, result.stderr
     p, other = load_manifest(out / "manifest.json")
@@ -157,7 +157,7 @@ def test_grid_loss_gates_and_original_relations_survive(tmp_path):
     mapping.write_text(json.dumps({"metadata_schema_version": "dl1_png_metadata_v1", "models": {
         "SYNTHETIC-M": {"lineage_id": "SYNTHETIC-FAMILY", "design_version": "SYNTHETIC-V1"}}}))
     out = tmp_path / "bundle"
-    assert run_import(ImportOptions(root, out, True, mapping, 16))[1] == 0
+    assert run_import(ImportOptions(root, out, True, mapping, 16, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'C', 'L'])))[1] == 0
     p, = load_manifest(out / "manifest.json")
     assert len(p.connections) == 1 and p.connections[0].mask.sum() == 1
     assert p.connections[0].endpoints[0].xy_um == pytest.approx((60.15, 60.15))

@@ -6,6 +6,7 @@ import torch
 from psdl1.data import frame_transform, normalize_unit, prepare_product, build_vocab
 from psdl1.train import structured_batch
 from psdl1.png_contract import ModelMetadata
+from png_helpers import write_stack_order
 from psdl1.png_source import discover_source
 from psdl1.png_connections import extract_model, to_product
 from png_helpers import write_wide_import_fixture
@@ -30,7 +31,7 @@ def test_original_grid_original_roundtrip_with_rounding():
 
 def test_S17_margin_elements_cnt_connections_and_valid_share_full_frame(tmp_path):
     write_wide_import_fixture(tmp_path)
-    model, = discover_source(tmp_path).models
+    model, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), ["U", "N", "C4", "U5", "C6", "L"])).models
     extraction = extract_model(model)
     p = to_product(model, extraction, metadata=ModelMetadata(model.model_id, "SYNTHETIC-FAMILY", "SYNTHETIC-V1"))
     roles, layers = build_vocab([p])
@@ -66,7 +67,7 @@ def test_real_margin_patterns_reach_all_channels(tmp_path):
     for folder, filename, mask in [("A", "1-U.png", electrode), ("B", "7-L.png", electrode), ("cno", "6_C.png", cnt)]:
         path = tmp_path / "M" / folder / filename; path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.where(mask, 0, 255).astype(np.uint8)).save(path)
-    source, = discover_source(tmp_path).models
+    source, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), ["U", "C", "L"])).models
     extracted = extract_model(source)
     p = to_product(source, extracted, metadata=ModelMetadata("M", "SYNTHETIC-MARGIN", "SYNTHETIC-V1"))
     assert len(p.connections) == 4 and p.connectivity_observation == "complete"

@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pytest
 
-from png_helpers import write_model
+from png_helpers import write_model, write_stack_order
 import psdl1.png_connections as extraction
 import psdl1.png_contract as contract
 from psdl1.png_source import discover_source
@@ -26,7 +26,7 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
     upper_pixels = small[:-4] + large + elongated
     write_model(tmp_path, [("A", "1-U.png", upper_pixels), ("B", "8-L.png", pixels),
                            ("cno", "6_C.png", pixels)], shape=(2000, 2000))
-    model, = discover_source(tmp_path).models
+    model, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), ["U", "C", "L"])).models
     assert model.valid
     operations = {"slice": 0, "overlap": 0, "joint": 0, "representative": 0, "hash": 0, "full_labels": 0}
     original_overlap = extraction.overlap_pixels
@@ -124,7 +124,7 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
 
 def test_resource_estimate_without_cnt_and_unknown_invalid_source(tmp_path):
     write_model(tmp_path, [("A", "1-U.png", ((10, 20),))])
-    model, = discover_source(tmp_path).models
+    model, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), ["U", "C", "L"])).models
     result = extraction.extract_model(model)
     e = result.resource_estimate
     assert (e.global_cnt_indicator, e.cnt_file_count, e.cnt_component_count, e.resolved_relation_count) == (0, 0, 0, 0)

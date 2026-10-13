@@ -7,7 +7,7 @@ import shutil
 import numpy as np
 import pytest
 
-from png_helpers import write_model, write_png
+from png_helpers import write_model, write_png, write_stack_order
 from psdl1.data import input_identity
 from psdl1.png_connections import (component_mask, extract_inventory, extract_model, iter_connections,
                                    label_components, representative_pixel, to_product)
@@ -24,9 +24,9 @@ def expected_element(electrode, stack, layer, model="M"):
                                                 ensure_ascii=False).encode()).hexdigest()
 
 
-def run_model(tmp_path, assets):
+def run_model(tmp_path, assets, order=None):
     write_model(tmp_path, assets)
-    model, = discover_source(tmp_path).models
+    model, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), order if order is not None else ["U", "C", "L", "D"])).models
     assert model.valid
     return model, extract_model(model)
 
@@ -38,10 +38,10 @@ def test_nearest_overlapping_lower_only(tmp_path, joint_at_nearest):
         ("N", "7-N.png", ((500, 500),)),
         ("B", "8-L.png", ((10, 20 if joint_at_nearest else 22),)),
         ("D", "10-D.png", ((10, 20),)),
-        ("cno", "006_OCNT.png", ((10, 20), (10, 21), (10, 22)))])
+        ("cno", "006_OCNT.png", ((10, 20), (10, 21), (10, 22)))], ["U", "OCNT", "N", "L", "D"])
     c, = result.components
-    assert [(v.electrode, v.stack) for v in c.below_candidates] == [("B", 8), ("D", 10)]
-    assert [(v.electrode, v.stack) for v in c.selected_lower_candidates] == [("B", 8)]
+    assert [(v.electrode, v.electrode_stack) for v in c.below_candidates] == [("B", 8), ("D", 10)]
+    assert [(v.electrode, v.electrode_stack) for v in c.selected_lower_candidates] == [("B", 8)]
     assert [(v.candidate.electrode, v.reason) for v in c.ignored_lower_candidates] == [
         ("D", "deeper_than_nearest_overlapping_lower")]
     if joint_at_nearest:
@@ -67,15 +67,15 @@ def test_nearest_upper_and_symmetric_skipped_layers(tmp_path):
         ("cno", "7_C7.png", ()),
         ("B", "8-B.png", ((700, 700),)),
         ("B2", "8-B.png", ((700, 701),)),  # one layer entry with two asset references
-        ("L", "9-L.png", ((10, 20),))])
+        ("L", "9-L.png", ((10, 20),))], ["U", "F", "N", "C4", "C6", "C7", "B", "L"])
     r, = result.relations
     assert [e.element_id for e in r.endpoints] == [expected_element("F", 2, "F"), expected_element("L", 9, "L")]
-    assert [(l.stack, l.layer, l.source_paths) for l in r.skipped_upper_layers.electrode_layers] == [
+    assert [(l.electrode_stack, l.layer, l.source_paths) for l in r.skipped_upper_layers.electrode_layers] == [
         (3, "N", ("M/N/3-N.png",))]
-    assert [(l.stack, l.layer) for l in r.skipped_upper_layers.cno_layers] == [(4, "C4")]
-    assert [(l.stack, l.layer, l.source_paths) for l in r.skipped_lower_layers.electrode_layers] == [
+    assert [(l.order_index, l.layer) for l in r.skipped_upper_layers.cno_layers] == [(3, "C4")]
+    assert [(l.electrode_stack, l.layer, l.source_paths) for l in r.skipped_lower_layers.electrode_layers] == [
         (8, "B", ("M/B/8-B.png", "M/B2/8-B.png"))]
-    assert [(l.stack, l.layer) for l in r.skipped_lower_layers.cno_layers] == [(7, "C7")]
+    assert [(l.order_index, l.layer) for l in r.skipped_lower_layers.cno_layers] == [(5, "C7")]
     assert r.needs_confirmation and result.connectivity_observation == "complete"
     s = result.summary
     assert (s.needs_confirmation_relations, s.skipped_upper_relations, s.skipped_lower_relations,
@@ -95,20 +95,17 @@ def test_skipped_numeric_gaps_are_not_invented_layers(tmp_path):
     assert not r.skipped_upper_layers.present and not r.skipped_lower_layers.present
 
 
-@pytest.mark.parametrize("missing", ["upper", "lower", "both", "equal"])
-def test_equal_stack_and_missing_side_unresolved(tmp_path, missing):
+@pytest.mark.parametrize("missing", ["upper", "lower", "both"])
+def test_missing_side_unresolved(tmp_path, missing):
     items = [("cno", "6_C.png", ((10, 20),))]
     if missing not in {"upper", "both"}: items.append(("A", "1-U.png", ((10, 20),)))
     if missing not in {"lower", "both"}: items.append(("B", "8-L.png", ((10, 20),)))
-    if missing == "equal": items.append(("E", "6-C.png", ((10, 20),)))
     if missing == "both": items.append(("N", "1-U.png", ((500, 500),)))
     _, result = run_model(tmp_path, items)
     c, = result.components
     expected = {"upper": ("missing_upper_overlap",), "lower": ("missing_lower_overlap",),
-                "both": ("missing_upper_overlap", "missing_lower_overlap"), "equal": ("equal_stack_overlap",)}
+                "both": ("missing_upper_overlap", "missing_lower_overlap")}
     assert c.unresolved_reasons == expected[missing] and not result.relations
-    if missing == "equal":
-        assert [(v.stack, v.layer) for v in c.equal_stack_candidates] == [(6, "C")]
 
 
 def test_disjoint_upper_lower_contact_unresolved(tmp_path):
@@ -164,9 +161,9 @@ def test_same_bound_element_guard():
     # an injected selected-pair identity alias, without allowing a relation.
     from psdl1.png_connections import _selected_pair_reasons
     from psdl1.png_contract import OverlapCandidate
-    u = OverlapCandidate("same", "u", "A", 1, "U", "M/A/1-U.png", 1)
-    l = OverlapCandidate("same", "l", "B", 8, "L", "M/B/8-L.png", 1)
-    assert _selected_pair_reasons((u,), (l,), ()) == ("same_bound_element",)
+    u = OverlapCandidate("same", "u", "A", 0, 1, "U", "M/A/1-U.png", 1)
+    l = OverlapCandidate("same", "l", "B", 2, 8, "L", "M/B/8-L.png", 1)
+    assert _selected_pair_reasons((u,), (l,)) == ("same_bound_element",)
 
 
 def test_representative_pixel_and_one_connection(tmp_path):
@@ -206,7 +203,7 @@ def test_extraction_coverage_and_cnt_source_reasons(tmp_path, status):
         items.append(("cno", "6_C.png", () if status == "empty" else ((10, 20), (30, 40))))
     write_model(tmp_path, items)
     if status == "no_assets": (tmp_path / "M/cno").mkdir()
-    model, = discover_source(tmp_path).models
+    model, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), ["U", "C", "L"])).models
     result = extract_model(model)
     expected = status if status in {"complete", "partial", "unavailable"} else "unavailable"
     assert result.connectivity_observation == expected
@@ -226,10 +223,10 @@ def test_components_on_distinct_cnt_planes_are_not_unioned(tmp_path):
     model, result = run_model(tmp_path, [("A", "1-U.png", ((10, 20),)),
                                        ("B", "8-L.png", ((10, 20),)),
                                        ("cno", "4_C4.png", ((10, 20),)),
-                                       ("cno", "6_C6.png", ((10, 20),))])
+                                       ("cno", "6_C6.png", ((10, 20),))], ["U", "C4", "C6", "L"])
     assert result.summary.component_count == result.summary.resolved_relation_count == 2
     assert len({c.component_id for c in result.components}) == 2
-    assert [c.cnt_stack for c in result.components] == [4, 6]
+    assert [c.cnt_order_index for c in result.components] == [1, 2]
     assert len(to_product(model, result).connections) == 2
 
 
@@ -238,7 +235,7 @@ def test_enumeration_and_root_relocation_invariance(tmp_path, monkeypatch):
     pixels = ((10, 20), (30, 40))
     write_model(first, [("A", "1-U.png", pixels), ("B", "8-L.png", pixels),
                         ("cno", "6_C.png", pixels)])
-    model, = discover_source(first).models
+    model, = discover_source(first, stack_order=write_stack_order(tmp_path / "order.json", ["U", "C", "L"])).models
     before = extract_model(model)
     shutil.copytree(first, second)
     (second / "M/cno/6_C.png").rename(second / "M/cno/006-C.png")
@@ -246,7 +243,7 @@ def test_enumeration_and_root_relocation_invariance(tmp_path, monkeypatch):
     from pathlib import Path
     original = Path.iterdir
     monkeypatch.setattr(Path, "iterdir", lambda p: iter(reversed(list(original(p)))))
-    moved, = discover_source(second).models
+    moved, = discover_source(second, stack_order=tmp_path / "order.json").models
     moved = replace(moved, assets=tuple(reversed(moved.assets)))
     import psdl1.png_connections as module
     original_labeler = module.label_components
@@ -264,7 +261,7 @@ def test_enumeration_and_root_relocation_invariance(tmp_path, monkeypatch):
     changed_result = extract_model(changed)
     assert [r.connection_id for r in changed_result.relations] != [r.connection_id for r in before.relations]
     assert input_identity(to_product(changed, changed_result)) != input_identity(to_product(model, before))
-    inv, results = extract_inventory(discover_source(first))
+    inv, results = extract_inventory(discover_source(first, stack_order=write_stack_order(tmp_path / "order.json", ["U", "C", "L"])))
     payload = report_payload(ImportReport(inv, load_metadata(None, ["M"]), extraction=results,
                                          extraction_status="complete"))
     assert payload["extraction"][0]["summary"]["component_count"] == 2
@@ -275,7 +272,7 @@ def test_enumeration_and_root_relocation_invariance(tmp_path, monkeypatch):
 
 def test_invalid_source_resource_estimate_remains_unknown(tmp_path):
     write_model(tmp_path, [("A", "1-U.png", ((10, 20),))], shape=(1000, 1203))
-    model, = discover_source(tmp_path).models
+    model, = discover_source(tmp_path, stack_order=write_stack_order(tmp_path.parent / (tmp_path.name + "-order.json"), ["U", "C", "L"])).models
     result = extract_model(model)
     assert result.extraction_status == "blocked"
     assert result.resource_estimate.frame_pixels is None
@@ -327,10 +324,10 @@ def test_representative_pixel_matches_fraction_reference_randomized(monkeypatch)
 def test_component_id_precomputed_hash_preserves_identity():
     from psdl1.png_contract import component_id, mask_hash
     mask = np.array([[True, False], [True, True]])
-    args = ("M", 6, "C", ("M", "cno", None, 6, "C"), (1001, 1203), (20, 30, 22, 32), mask)
-    # Both call routes must retain the exact published pre-FA canonical identity.
+    args = ("M", "C", ("M", "cno", None, "C", "full-mask-hash"), (1001, 1203), (20, 30, 22, 32), mask)
+    # Both call routes follow the declared number-free component payload.
     expected = "component_" + hashlib.sha256(json.dumps([
-        "component", ["M", 6, "C", ["M", "cno", None, 6, "C"], [1001, 1203], [20, 30, 22, 32],
+        "component", ["M", "C", ["M", "cno", None, "C", "full-mask-hash"], [1001, 1203], [20, 30, 22, 32],
                       mask_hash(mask)]], separators=(",", ":")).encode()).hexdigest()
     assert component_id(*args) == component_id(*args, local_mask_sha256=mask_hash(mask)) == expected
 
@@ -349,7 +346,11 @@ def test_extracted_component_hash_and_id_describe_actual_mask(tmp_path):
         return h.hexdigest()
     expected_hash = independent_hash(actual)
     assert c.mask_sha256 == expected_hash
-    payload = ["component", ["M", 6, "C", ["M", "cno", None, 6, "C"], [1001, 1203],
+    full = np.zeros((1001, 1203), dtype=bool)
+    for y, x in pixels: full[y, x] = True
+    full_digest = hashlib.sha256(b'{"shape_yx":[1001,1203]}')
+    full_digest.update(full.tobytes())
+    payload = ["component", ["M", "C", ["M", "cno", None, "C", full_digest.hexdigest()], [1001, 1203],
                              [20, 10, 22, 12], expected_hash]]
     expected_id = "component_" + hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
     assert c.component_id == expected_id
@@ -357,7 +358,7 @@ def test_extracted_component_hash_and_id_describe_actual_mask(tmp_path):
     altered = actual.copy(); altered[0, 1] = False
     assert independent_hash(altered) != c.mask_sha256
     from psdl1.png_contract import component_id
-    assert component_id("M", 6, "C", ("M", "cno", None, 6, "C"), (1001, 1203),
+    assert component_id("M", "C", ("M", "cno", None, "C", "full-mask-hash"), (1001, 1203),
                         (20, 10, 22, 12), ~actual) != c.component_id
 
 
@@ -380,3 +381,227 @@ def test_int64_proof_near_overflow_takes_exact_fallback(monkeypatch):
         pytest.fail("unsafe near-overflow coordinates took int64 path")
     monkeypatch.setattr(module.np, "argmin", forbidden_argmin)
     assert representative_pixel(np.ones((1, 1), dtype=bool)) == (0, expected_y)
+
+
+# O01–O12/O18: literal synthetic orders are syntax-only, not physical prescriptions.
+def ordered_source(root, order, assets=None):
+    if assets is not None:
+        write_model(root, assets)
+    reference = write_stack_order(root.parent / (root.name + '-order.json'), order)
+    model, = discover_source(root, stack_order=reference).models
+    return model, extract_model(model), reference
+
+
+def three_layers(cnts=None):
+    p = ((10, 20),)
+    return [('A', '1-U.png', p), ('B', '2-M.png', p), ('D', '3-L.png', p)] + (
+        cnts if cnts is not None else [('cno', '1-OCNT.png', p)])
+
+
+def endpoint_ids(result):
+    return [[e.element_id for e in r.endpoints] for r in result.relations]
+
+
+def test_cno_123_numbers_do_not_conflict_with_electrode_stacks(tmp_path):
+    root = tmp_path / 'source'
+    model, result, order = ordered_source(root, ['U', 'OCNT', 'M', 'GCNT', 'L', 'PCNT'],
+        three_layers([('cno', '1-OCNT.png', ((10, 20),)), ('cno', '2-GCNT.png', ((10, 20),)),
+                      ('cno', '3-PCNT.png', ((10, 20),))]))
+    assert model.valid and all(a.stack is None for a in model.cnt_assets)
+    assert endpoint_ids(result) == [[expected_element('A', 1, 'U'), expected_element('B', 2, 'M')],
+                                    [expected_element('B', 2, 'M'), expected_element('D', 3, 'L')]]
+    assert result.components[2].unresolved_reasons == ('missing_lower_overlap',)
+    for name in ['2-GCNT.png', '3-PCNT.png']:
+        (root / 'M/cno' / name).rename(root / 'M/cno' / ('1-' + name.split('-', 1)[1]))
+    renamed, = discover_source(root, stack_order=order).models
+    changed = extract_model(renamed)
+    assert [a.asset_id for a in model.cnt_assets] == [a.asset_id for a in renamed.cnt_assets]
+    assert [r.connection_id for r in result.relations] == [r.connection_id for r in changed.relations]
+
+
+def test_same_geometry_two_orders_changes_relations(tmp_path):
+    root = tmp_path / 'source'
+    first, result, _ = ordered_source(root, ['U', 'OCNT', 'M', 'L'], three_layers())
+    second, changed, _ = ordered_source(root, ['U', 'M', 'OCNT', 'L'])
+    assert endpoint_ids(result) == [[expected_element('A', 1, 'U'), expected_element('B', 2, 'M')]]
+    assert endpoint_ids(changed) == [[expected_element('B', 2, 'M'), expected_element('D', 3, 'L')]]
+    for r in result.relations + changed.relations:
+        assert all(e.xy_um == pytest.approx((2.05, 1.05)) for e in r.endpoints)
+    assert first.cnt_assets[0].asset_id == second.cnt_assets[0].asset_id
+    assert result.components[0].component_id == changed.components[0].component_id
+    assert result.relations[0].connection_id != changed.relations[0].connection_id
+    assert first.stack_order.resolved_order_sha256 != second.stack_order.resolved_order_sha256
+
+
+def test_stack_order_rejects_reversed_electrode_numbers(tmp_path):
+    model, result, order = ordered_source(tmp_path / 'source', ['M', 'OCNT', 'U', 'L'], three_layers())
+    assert model.stack_order.errors == ('stack_order_electrode_order_conflict: model "M", listed [["M", 2], ["U", 1], ["L", 3]], expected [["U", 1], ["M", 2], ["L", 3]]',)
+    assert result.extraction_status == 'blocked' and result.relations == ()
+    from psdl1.import_png import run_import
+    from psdl1.png_contract import ImportOptions
+    out = tmp_path / 'out'
+    assert run_import(ImportOptions(root=tmp_path / 'source', out=out, export=True, stack_order=order))[1] == 2
+    assert not (out / 'manifest.json').exists() and not (out / 'assets').exists()
+
+
+@pytest.mark.parametrize('white', [False, True])
+def test_stack_order_requires_all_present_names(tmp_path, white):
+    assets = three_layers([('cno', '1-OCNT.png', () if white else ((10, 20),))])
+    model, result, _ = ordered_source(tmp_path / 'source', ['U', 'M', 'L'], assets)
+    assert model.stack_order.errors == ('stack_order_missing_cnt_names: model "M", missing ["OCNT"]',)
+    assert not result.relations
+    model, result, _ = ordered_source(tmp_path / 'source', ['U', 'OCNT', 'L'])
+    assert model.stack_order.errors == ('stack_order_missing_electrode_names: model "M", missing ["M"]',)
+    assert not result.relations
+
+
+def test_reference_order_filters_absent_layers_for_all_models(tmp_path):
+    root = tmp_path / 'source'
+    write_model(root, three_layers(), model='A')
+    write_model(root, [('A', '1-U.png', ((10, 20),)), ('D', '3-L.png', ((10, 20),)),
+                       ('cno', '1-GCNT.png', ((10, 20),))], model='B')
+    write_model(root, [('A', '1-X.png', ((10, 20),)), ('D', '3-Y.png', ((10, 20),)),
+                       ('cno', '1-Z.png', ((10, 20),))], model='C')
+    order = write_stack_order(tmp_path / 'order.json', ['U', 'OCNT', 'M', 'GCNT', 'L', 'PCNT'])
+    a, b, c = discover_source(root, stack_order=order).models
+    assert [e.name for e in a.stack_order.resolved_order] == ['U', 'OCNT', 'M', 'L']
+    assert a.stack_order.ignored_names == ('GCNT', 'PCNT')
+    assert [e.name for e in b.stack_order.resolved_order] == ['U', 'GCNT', 'L']
+    assert b.stack_order.ignored_names == ('OCNT', 'M', 'PCNT')
+    assert c.stack_order.errors == ('stack_order_missing_electrode_names: model "C", missing ["X", "Y"]',
+                                    'stack_order_missing_cnt_names: model "C", missing ["Z"]')
+    assert not extract_model(c).relations
+    from psdl1.png_source import load_stack_order
+    order.write_text('{"stack_order_schema_version":"dl1_png_stack_order_v1","order":[],"models":{}}')
+    assert load_stack_order(order).errors == ('stack_order_fields: required ["order", "stack_order_schema_version"]; missing []; unknown ["models"]',)
+
+
+def test_same_name_cnt_assets_remain_separate_and_ambiguities_fail(tmp_path):
+    root = tmp_path / 'source'
+    assets = [('A', '1-U.png', ((10, 20), (10, 21), (10, 22))),
+              ('B', '3-L.png', ((10, 20), (10, 21), (10, 22))),
+              ('cno', '1-OCNT.png', ((10, 20), (10, 21))), ('cno', '9-OCNT.png', ((10, 21), (10, 22)))]
+    model, result, order = ordered_source(root, ['U', 'OCNT', 'L'], assets)
+    assert model.valid and len(model.cnt_assets) == 2
+    assert result.summary.component_count == result.summary.resolved_relation_count == 2
+    assert {c.cnt_order_index for c in result.components} == {1}
+    assert {c.pixel_count for c in result.components} == {2}
+    assert model.stack_order.resolved_order[1].asset_ids == tuple(sorted(a.asset_id for a in model.cnt_assets))
+    original = sorted(a.asset_id for a in model.cnt_assets)
+    (root / 'M/cno/1-OCNT.png').rename(root / 'M/cno/88_OCNT.png')
+    (root / 'M/cno/9-OCNT.png').rename(root / 'M/cno/2-OCNT.png')
+    renamed, = discover_source(root, stack_order=order).models
+    assert sorted(a.asset_id for a in renamed.cnt_assets) == original
+    write_png(root, 'M/cno/2-OCNT.png', pixels=((10, 20), (10, 21)), compress_level=0)
+    invalid, = discover_source(root, stack_order=order).models
+    reason, = [e.reason for e in invalid.errors if e.reason.startswith('ambiguous_cnt_asset_identity:')]
+    assert '"M/cno/2-OCNT.png", "M/cno/88_OCNT.png"' in reason
+    assert not invalid.valid and not extract_model(invalid).relations
+    for name, fixture, expected in [
+        ('ambiguous', [('A', '1-X.png', ((10, 20),)), ('B', '3-X.png', ((10, 20),)), ('cno', '1-C.png', ((10, 20),))], 'stack_order_ambiguous_electrode_name'),
+        ('collision', [('A', '1-OCNT.png', ((10, 20),)), ('cno', '1-OCNT.png', ((10, 20),))], 'stack_order_name_kind_collision')]:
+        m, r, _ = ordered_source(tmp_path / name, ['X', 'C', 'OCNT'], fixture)
+        assert m.stack_order.errors[0].startswith(expected + ':') and not r.relations
+    m, _, _ = ordered_source(tmp_path / 'shared', ['U', 'OCNT', 'L'],
+        [('A', '1-U.png', ((10, 20),)), ('B', '1-U.png', ((10, 20),)), ('D', '3-L.png', ((10, 20),)), ('cno', '1-OCNT.png', ((10, 20),))])
+    assert m.valid and m.stack_order.status == 'resolved'
+
+
+def test_cno_renumbering_preserves_semantic_identities(tmp_path, monkeypatch):
+    from psdl1.png_contract import model_identity
+    root = tmp_path / 'source'
+    model, result, order = ordered_source(root, ['U', 'OCNT', 'M', 'GCNT', 'L'],
+        three_layers([('cno', '1-OCNT.png', ((10, 20),)), ('cno', '9-OCNT.png', ((10, 20), (10, 21))),
+                      ('cno', '2-GCNT.png', ((10, 20),))]))
+    moved = tmp_path / 'moved'; shutil.copytree(root, moved)
+    (moved / 'M/cno/1-OCNT.png').rename(moved / 'M/cno/099_OCNT.png')
+    (moved / 'M/cno/2-GCNT.png').rename(moved / 'M/cno/1-GCNT.png')
+    from pathlib import Path
+    iterdir = Path.iterdir
+    monkeypatch.setattr(Path, 'iterdir', lambda p: iter(reversed(list(iterdir(p)))))
+    after, = discover_source(moved, stack_order=order).models
+    changed = extract_model(after)
+    assert model_identity(model) == model_identity(after)
+    assert [c.component_id for c in result.components] == [c.component_id for c in changed.components]
+    assert [r.connection_id for r in result.relations] == [r.connection_id for r in changed.relations]
+    assert input_identity(to_product(model, result)) == input_identity(to_product(after, changed))
+    for a in model.cnt_assets:
+        payload = ['asset', ['M', 'cno', None, a.layer, a.mask_sha256]]
+        assert a.asset_id == 'asset_' + hashlib.sha256(json.dumps(payload, separators=(',', ':')).encode()).hexdigest()
+        c = next(c for c in result.components if c.source_asset_id == a.asset_id)
+        payload = ['component', ['M', a.layer, ['M', 'cno', None, a.layer, a.mask_sha256],
+                                 [1001, 1203], list(c.bbox_xyxy_px), c.mask_sha256]]
+        assert c.component_id == 'component_' + hashlib.sha256(json.dumps(payload, separators=(',', ':')).encode()).hexdigest()
+    from psdl1.import_png import run_import
+    from psdl1.png_contract import ImportOptions
+    from psdl1.data import load_manifest
+    mapping = tmp_path / 'metadata.json'
+    mapping.write_text(json.dumps({'metadata_schema_version': 'dl1_png_metadata_v1', 'models': {
+        'M': {'lineage_id': 'SYNTHETIC', 'design_version': 'SYNTHETIC-V1'}}}))
+    loaded_ids = []
+    for source, destination in [(root, tmp_path / 'before-export'), (moved, tmp_path / 'after-export')]:
+        assert run_import(ImportOptions(root=source, out=destination, export=True, metadata=mapping,
+                                       candidate_grid=16, stack_order=order))[1] == 0
+        loaded_ids.append(input_identity(load_manifest(destination / 'manifest.json')[0]))
+    assert loaded_ids[0] == loaded_ids[1]
+    assert next(a for a in after.cnt_assets if a.original_filename == '099_OCNT.png').filename_number == 99
+    write_png(moved, 'M/cno/099_OCNT.png', pixels=((11, 20),))
+    pixel_changed, = discover_source(moved, stack_order=order).models
+    assert {a.asset_id for a in pixel_changed.cnt_assets} != {a.asset_id for a in after.cnt_assets}
+    (moved / 'M/cno/099_OCNT.png').rename(moved / 'M/cno/099_OTHER.png')
+    name_changed, = discover_source(moved, stack_order=write_stack_order(tmp_path / 'other-order.json', ['U', 'OCNT', 'OTHER', 'M', 'GCNT', 'L'])).models
+    assert {a.asset_id for a in name_changed.cnt_assets} != {a.asset_id for a in pixel_changed.cnt_assets}
+
+
+def test_order_skipped_layers_separate_electrode_and_cno(tmp_path):
+    root = tmp_path / 'source'
+    model, result, _ = ordered_source(root, ['U', 'E', 'GCNT', 'OCNT', 'F', 'PCNT', 'L'],
+        [('A', '1-U.png', ((10, 20),)), ('B', '9-L.png', ((10, 20),)),
+         ('E', '3-E.png', ((900, 900),)), ('F', '7-F.png', ((900, 900),)),
+         ('cno', '88-OCNT.png', ((10, 20),)), ('cno', '1-GCNT.png', ()), ('cno', '2-PCNT.png', ())])
+    r, = result.relations
+    assert result.components[0].cnt_order_index == 3
+    assert [(e.order_index, e.layer, e.electrode_stack) for e in r.skipped_upper_layers.electrode_layers] == [(1, 'E', 3)]
+    assert [(e.order_index, e.layer, e.electrode_stack) for e in r.skipped_upper_layers.cno_layers] == [(2, 'GCNT', None)]
+    assert [(e.order_index, e.layer, e.electrode_stack) for e in r.skipped_lower_layers.electrode_layers] == [(4, 'F', 7)]
+    assert [(e.order_index, e.layer, e.electrode_stack) for e in r.skipped_lower_layers.cno_layers] == [(5, 'PCNT', None)]
+    s = result.summary
+    assert (s.skipped_upper_electrode_layers, s.skipped_upper_cno_layers, s.skipped_lower_electrode_layers, s.skipped_lower_cno_layers) == (1, 1, 1, 1)
+    assert r.needs_confirmation
+    write_png(root, 'M/cno/47-GCNT.png', pixels=((800, 800),))
+    model, changed, _ = ordered_source(root, ['ABSENT', 'U', 'E', 'GCNT', 'OCNT', 'F', 'PCNT', 'L'])
+    r, = changed.relations
+    assert len(r.skipped_upper_layers.cno_layers) == 1
+    assert r.skipped_upper_layers.cno_layers[0].source_paths == ('M/cno/1-GCNT.png', 'M/cno/47-GCNT.png')
+    assert model.stack_order.ignored_names == ('ABSENT',)
+    assert changed.summary.component_count == 2 and changed.summary.resolved_relation_count == 1
+
+
+def test_nearest_pair_guards_and_bbox_cost_with_explicit_order(tmp_path, monkeypatch):
+    from psdl1 import png_connections as module
+    operands = []
+    original = module.overlap_pixels
+    def inspect(c, a):
+        operands.append((c.shape, a.shape))
+        return original(c, a)
+    monkeypatch.setattr(module, 'overlap_pixels', inspect)
+    model, result, _ = ordered_source(tmp_path / 'source', ['OCNT', 'U', 'M', 'L'], three_layers())
+    assert result.components[0].unresolved_reasons == ('missing_upper_overlap',)
+    assert not result.relations and operands == [((1, 1), (1, 1))] * 3
+    # Existing tests above retain no-fallthrough, common-intersection, selected
+    # layer ambiguity, 4-neighbour, centroid ties and disconnected-region guards.
+    assert result.resource_estimate.cnt_component_count == 1
+    assert result.resource_estimate.resolved_relation_count == 0
+
+
+def test_same_electrode_rule_stays_off_until_confirmed(tmp_path):
+    model, result, _ = ordered_source(tmp_path / 'source', ['U', 'OCNT', 'L'],
+        [('A', '1-U.png', ((10, 20),)), ('B', '3-L.png', ((10, 20),)), ('cno', '1-OCNT.png', ((10, 20),))])
+    assert endpoint_ids(result) == [[expected_element('A', 1, 'U'), expected_element('B', 3, 'L')]]
+    assert result.same_electrode_required is False
+    assert ImportReport.__dataclass_fields__['same_electrode_required'].default is False
+    _, changed, _ = ordered_source(tmp_path / 'ambiguous', ['U', 'OCNT', 'L'],
+        [('A', '1-U.png', ((10, 20),)), ('B', '1-U.png', ((10, 20),)),
+         ('A', '3-L.png', ((10, 20),)), ('cno', '1-OCNT.png', ((10, 20),))])
+    assert not changed.relations
+    assert changed.components[0].unresolved_reasons == ('multiple_upper_electrodes_on_selected_layer',)

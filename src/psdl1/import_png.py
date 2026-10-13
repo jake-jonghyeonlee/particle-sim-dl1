@@ -16,10 +16,10 @@ from .data import frame_transform, grid_check, input_identity, load_manifest
 from .png_connections import element_id, extract_inventory, iter_connections, to_product
 from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_id,
                            require_report_version)
-from .png_source import decoder_session, discover_source, load_metadata, report_payload
+from .png_source import decoder_session, discover_source, load_metadata, report_payload, load_stack_order
 from .schema import SCHEMA_VERSION, validate_product
 
-BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v2"
+BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v3"
 
 
 def file_sha256(path):
@@ -296,10 +296,10 @@ def _duplicates(inventory):
     model_groups = {}
     for model in inventory.models:
         if model.valid:
-            key = tuple(sorted((a.kind, a.electrode or "", a.stack, a.layer, a.mask_sha256) for a in model.assets))
+            key = tuple(sorted((a.kind, a.electrode or "", a.stack or 0, a.layer, a.mask_sha256) for a in model.assets))
             model_groups.setdefault(key, []).append(model.model_id)
     result.extend({"kind": "identical_model_geometry", "model_ids": sorted(names),
-                   "meaning": "possible_in_root_symlink_alias_or_duplicate_product"}
+                   "meaning": "possible_in_root_symlink_alias_or_duplicate_product_geometry_not_order_equivalence"}
                   for _, names in sorted(model_groups.items()) if len(names) > 1)
     return tuple(result)
 
@@ -370,7 +370,8 @@ def run_import(options, *, event_sink=None):
     try:
         # Nested source session retains the explicit guard for the whole import.
         with decoder_session(options.png_max_image_pixels) as decoder_policy:
-            inventory, extraction = extract_inventory(discover_source(root, png_max_image_pixels=options.png_max_image_pixels))
+            reference = load_stack_order(options.stack_order)
+            inventory, extraction = extract_inventory(discover_source(root, png_max_image_pixels=options.png_max_image_pixels, stack_order=reference))
             inventory = replace(inventory, decoder=decoder_policy)
             diagnostics = []
             metadata_error = False
@@ -382,7 +383,15 @@ def run_import(options, *, event_sink=None):
                 metadata_error = True
                 metadata = load_metadata(None, [m.model_id for m in inventory.models])
                 diagnostics.append(SourceIssue("metadata", str(exc)))
+            diagnostics.extend(SourceIssue("stack_order", e) for e in reference.errors)
+            for model in inventory.models:
+                diagnostics.extend(SourceIssue("stack_order", e) for e in model.stack_order.errors if e not in reference.errors)
             pending = []
+            order_invalid = bool(reference.errors) or any(m.stack_order.status == "invalid" for m in inventory.models)
+            if any(m.stack_order.status == "required" for m in inventory.models):
+                pending.append("explicit_stack_order_missing")
+            if order_invalid:
+                pending.append("invalid_stack_order")
             if options.export:
                 if metadata.pending_models:
                     pending.append("explicit_metadata_missing")
@@ -394,7 +403,9 @@ def run_import(options, *, event_sink=None):
                     pending.append("invalid_metadata")
             duplicates = _duplicates(inventory)
             diagnostics.extend(SourceIssue(".", "possible duplicate/alias geometry: " + str(entry)) for entry in duplicates)
-            report = ImportReport(inventory, metadata, extraction=extraction, extraction_status="extractor_ran",
+            report = ImportReport(inventory, metadata, stack_order=reference, extraction=extraction,
+                                  extraction_status=("extractor_ran" if all(r.extraction_status == "complete" for r in extraction) else
+                                                     "blocked" if all(r.extraction_status == "blocked" for r in extraction) else "partial"),
                                   candidate_grid=options.candidate_grid, pending_prerequisites=tuple(pending),
                                   diagnostics=tuple(diagnostics), duplicate_geometry=duplicates,
                                   status_summary=tuple({"model_id": r.model_id,
@@ -403,7 +414,7 @@ def run_import(options, *, event_sink=None):
                                       "model_connectivity_status": "available" if r.connectivity_observation == "complete" else r.connectivity_observation,
                                       "model_vocabulary_eligibility": "not_evaluated_without_checkpoint",
                                       "electrical_verification": "not_performed"} for r in extraction),
-                                  export_status="blocked" if pending else "not_requested",
+                                  export_status="blocked" if pending and options.export else "not_requested",
                                   grid_readiness="explicit_candidate_supplied" if options.candidate_grid else "pending_explicit_grid")
             out.parent.mkdir(parents=True, exist_ok=True)
             stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
@@ -419,7 +430,10 @@ def run_import(options, *, event_sink=None):
             evidence = []
             grid_error = False
             for model, result in zip(inventory.models, extraction):
-                if model.valid and options.inspect_grids:
+                if result.extraction_status == "blocked" and options.inspect_grids:
+                    evidence.append({"model_id": model.model_id, "purpose": "inspect_not_evaluated",
+                                     "reason": "stack_order_required" if model.stack_order.status == "required" else "invalid_stack_order"})
+                elif model.valid and options.inspect_grids:
                     product = None
                     try:
                         product = to_product(model, result)
@@ -435,7 +449,7 @@ def run_import(options, *, event_sink=None):
             if grid_error and options.export:
                 pending.append("inspect_grid_evaluation_failed")
             report = replace(report, grid_evidence=tuple(evidence), diagnostics=tuple(diagnostics),
-                             pending_prerequisites=tuple(pending), export_status="blocked" if pending else report.export_status)
+                             pending_prerequisites=tuple(pending), export_status="blocked" if pending and options.export else report.export_status)
             from .png_preview import write_preview
             preview = write_preview(stage, inventory, extraction, report=report)
             report = replace(report, preview=preview)
@@ -465,7 +479,7 @@ def run_import(options, *, event_sink=None):
             _seal_bundle(stage)
             verify_bundle(stage)
             _publish_noreplace(stage, out)
-            status = 2 if pending or not inventory.valid or metadata_error or grid_error else 0
+            status = 2 if (options.export and pending) or order_invalid or not inventory.valid or metadata_error or grid_error else 0
             summary = {"event": "completed", "output": str(out), "export_status": report.export_status,
                        "source_valid": inventory.valid, "pending_prerequisites": pending}
             emit(summary)
@@ -501,15 +515,18 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, help="new destination outside input tree; existing paths are refused")
     parser.add_argument("--export", action="store_true", help="all-model export; missing metadata/grid gives diagnostic report and nonzero exit, no manifest")
     parser.add_argument("--metadata", type=Path)
+    parser.add_argument("--stack-order", type=Path, help="user-supplied reference order; required for CNT export, optional diagnostic inspection")
     parser.add_argument("--candidate-grid", type=_positive)
     parser.add_argument("--inspect-grids", type=_positive, nargs="+", default=[])
     parser.add_argument("--png-max-image-pixels", type=_positive, help="explicit finite Pillow pixel guard override, recorded; never disables guard")
     parser.add_argument("--verify-bundle", type=Path, help="verify published hashes without source PNGs")
     args = parser.parse_args(argv)
-    if args.verify_bundle and (args.root or args.out or args.export or args.metadata or args.candidate_grid or args.inspect_grids or args.png_max_image_pixels):
+    if args.verify_bundle and (args.root or args.out or args.export or args.metadata or args.stack_order or args.candidate_grid or args.inspect_grids or args.png_max_image_pixels):
         parser.error("--verify-bundle must be used alone")
-    options = ImportOptions(args.root, args.out, args.export, args.metadata, args.candidate_grid,
-                            tuple(args.inspect_grids), args.png_max_image_pixels, args.verify_bundle)
+    options = ImportOptions(root=args.root, out=args.out, export=args.export, metadata=args.metadata,
+                            candidate_grid=args.candidate_grid, inspect_grids=tuple(args.inspect_grids),
+                            png_max_image_pixels=args.png_max_image_pixels, verify_bundle=args.verify_bundle,
+                            stack_order=args.stack_order)
     try:
         summary, code = run_import(options, event_sink=lambda event: print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True))
         if args.verify_bundle:

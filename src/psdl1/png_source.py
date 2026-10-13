@@ -4,7 +4,7 @@ Decoding is serialized because Pillow's pixel guard is process-global. Neither
 geometry nor source names are resampled, registered, thresholded or aliased.
 """
 from contextlib import contextmanager
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from io import BytesIO
 import hashlib
 import json
@@ -20,7 +20,8 @@ import numpy as np
 
 from .png_contract import (DecoderPolicy, FrameRecord, ImportReport, METADATA_SCHEMA_VERSION,
                            MetadataRecord, ModelMetadata, ModelSource, ResourceEstimate,
-                           SourceAsset, SourceInventory, SourceIssue, canonical_id, mask_hash)
+                           SourceAsset, SourceInventory, SourceIssue, canonical_id, mask_hash,
+                           StackOrderInput, StackOrderResolution, OrderEntry, STACK_ORDER_SCHEMA_VERSION, order_digest)
 from .schema import identifier
 
 _DECODER_LOCK = threading.RLock()
@@ -70,7 +71,7 @@ class PNGSourceError(ValueError):
 def parse_png_name(filename: str) -> tuple[int, str]:
     match = re.fullmatch(r"([0-9]+)[-_](.+)\.png", filename)
     if match is None or int(match[1]) <= 0:
-        raise ValueError(f"{filename}: expected positive stack prefix and first '-'/'_' separator")
+        raise ValueError(f"{filename}: expected positive numeric prefix and first '-'/'_' separator")
     return int(match[1]), identifier(match[2], "layer")
 
 
@@ -328,7 +329,7 @@ def decode_png(path, *, png_max_image_pixels=None):
         return mask, mode, policy
 
 
-def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
+def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> SourceInventory:
     root = Path(root).resolve(strict=True)
     if not root.is_dir():
         raise ValueError(f"{root}: source root must be a directory")
@@ -416,31 +417,42 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
                         continue
                     warn_name(layer, path, model_warnings)
                     binding = (folder.name, stack, layer) if is_cnt else (folder.name, layer)
-                    if binding in bindings:
+                    if not is_cnt and binding in bindings:
                         model_errors.append(SourceIssue(rel(path), f"duplicate normalized binding; also {bindings[binding]}"))
                         model_errors.append(SourceIssue(bindings[binding], f"duplicate normalized binding; also {rel(path)}"))
-                    else:
+                    elif not is_cnt:
                         bindings[binding] = rel(path)
-                    if stack in stacks and stacks[stack] != layer:
+                    if not is_cnt and stack in stacks and stacks[stack] != layer:
                         model_errors.append(SourceIssue(rel(path), f"conflicting stack {stack}; also {stack_paths[stack]} ({stacks[stack]})"))
-                    else:
+                    elif not is_cnt:
                         stacks[stack], stack_paths[stack] = layer, rel(path)
                     try:
                         mask, mode, file_hash = _decode(path, rel(path), policy)
                         source_binding = (model_dir.name, "cno" if is_cnt else "electrode",
                                           None if is_cnt else folder.name, stack, layer)
+                        geometry_hash = mask_hash(mask)
+                        if is_cnt:
+                            source_binding = (model_dir.name, "cno", None, layer, geometry_hash)
                         asset_id = canonical_id("asset", source_binding)
                         claim_id(asset_id, rel(path), model_errors)
                         assets.append(SourceAsset(
                             asset_id, model_dir.name, source_binding[1],
-                            source_binding[2], source_binding[2], stack, layer, rel(path), path.name,
-                            file_hash, mask_hash(mask), mode,
+                            source_binding[2], source_binding[2], None if is_cnt else stack, layer, stack, rel(path), path.name,
+                            file_hash, geometry_hash, mode,
                             tuple(mask.shape), mask))
                     except PNGSourceError as exc:
                         model_errors.append(exc.issue)
                 if not is_cnt and not png_count:
                     model_warnings.append(SourceIssue(rel(folder), "electrode folder contains no PNG assets"))
-            assets.sort(key=lambda a: (a.stack, a.kind, a.electrode or "", a.layer, a.relative_path))
+            assets.sort(key=lambda a: (a.kind, a.stack or 0, a.electrode or "", a.layer, a.mask_sha256))
+            cnt_groups = {}
+            for a in assets:
+                if a.kind == "cno":
+                    cnt_groups.setdefault((a.layer, a.mask_sha256), []).append(a.relative_path)
+            for (name, digest), paths in sorted(cnt_groups.items()):
+                if len(paths) > 1:
+                    model_errors.append(SourceIssue(rel(model_dir),
+                        f"ambiguous_cnt_asset_identity: model {json.dumps(model_dir.name, ensure_ascii=False)}, CNT {json.dumps(name, ensure_ascii=False)}, mask_sha256 {digest}, files {json.dumps(sorted(paths), ensure_ascii=False)}; separate stable source identifiers are required"))
             frame = None
             if assets:
                 h, w = assets[0].shape_yx
@@ -473,8 +485,9 @@ def discover_source(root, *, png_max_image_pixels=None) -> SourceInventory:
         return tuple(sorted(counts)), tuple(sorted(n for n, c in counts.items() if c == 1))
     roles, unique_roles = names("roles")
     layers, unique_layers = names("layers")
-    return SourceInventory(tuple(models), policy, roles, layers, unique_roles, unique_layers,
+    inventory = SourceInventory(tuple(models), policy, roles, layers, unique_roles, unique_layers,
                            tuple(errors), tuple(notices))
+    return resolve_stack_order(inventory, stack_order if isinstance(stack_order, StackOrderInput) else load_stack_order(stack_order))
 
 
 def _strict_object(pairs):
@@ -526,11 +539,14 @@ def report_payload(report: ImportReport) -> dict:
                 status = result.pop("extraction_status")
                 result["extractor_run_status"] = "ran" if status in {"complete", "extractor_ran"} else status
             if isinstance(value, ModelSource):
-                # Preserve combined legacy names for audit, explicitly distinguish
-                # the electrode vocabulary from CNT plane names in v2 reports.
+                # Distinguish electrode vocabulary, CNT inventory and resolved order.
+                result["electrode_stack_table"] = result.pop("stack_table")
                 result["electrode_layers"] = list(value.electrode_layers)
                 result["cno_layers"] = list(value.cno_layers)
                 result["all_source_layers"] = result.pop("layers")
+            if isinstance(value, SourceAsset):
+                result["electrode_stack"] = result.pop("stack")
+                result["order_index"] = next((m.order_index(value) for m in report.inventory.models if m.model_id == value.model), None)
             if isinstance(value, SourceInventory):
                 for name in ("layer_union", "unique_layers"):
                     result["all_source_" + name] = result.pop(name)
@@ -548,3 +564,115 @@ def report_payload(report: ImportReport) -> dict:
             return {k: encode(v) for k, v in value.items()}
         return value
     return encode(report)
+
+
+def _order_document(doc):
+    """Strict structural validation shared with self-contained report readers."""
+    q = lambda v: json.dumps(v, ensure_ascii=True)
+    if not isinstance(doc, dict):
+        raise ValueError('stack_order_schema: expected object')
+    required = {'order', 'stack_order_schema_version'}
+    if set(doc) != required:
+        raise ValueError('stack_order_fields: required ["order", "stack_order_schema_version"]; missing ' +
+                         q(sorted(required - set(doc))) + '; unknown ' + q(sorted(set(doc) - required)))
+    if doc['stack_order_schema_version'] != STACK_ORDER_SCHEMA_VERSION:
+        raise ValueError('stack_order_version: expected "dl1_png_stack_order_v1", got ' + q(doc['stack_order_schema_version']))
+    names = doc['order']
+    if not isinstance(names, list):
+        raise ValueError('stack_order_list_type: order must be an array of layer names')
+    for i, name in enumerate(names):
+        if (not isinstance(name, str) or not name or name.strip() != name or
+                any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in name)):
+            raise ValueError(f'stack_order_identifier: order[{i}] must be a nonempty trimmed identifier without controls or unpaired surrogates')
+    for name in names:
+        indexes = [i for i, n in enumerate(names) if n == name]
+        if len(indexes) > 1:
+            raise ValueError(f'stack_order_duplicate_name: order repeats {q(name)} at indexes {q(indexes)}')
+    return doc
+
+
+def load_stack_order(path):
+    if path is None:
+        return StackOrderInput()
+    digest = None
+    try:
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as exc:
+            raise ValueError(f'stack_order_read_error: cannot read stack order file ({type(exc).__name__})') from exc
+        digest = hashlib.sha256(raw).hexdigest()
+        if b'\x00' in raw or raw.startswith((b'\xff\xfe', b'\xfe\xff', b'\x00\x00\xfe\xff')):
+            raise ValueError('stack_order_encoding: expected UTF-8 with optional leading BOM')
+        try:
+            text = raw.decode('utf-8-sig')
+        except UnicodeError as exc:
+            raise ValueError('stack_order_encoding: expected UTF-8 with optional leading BOM') from exc
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('stack_order_duplicate_key: duplicate key ' + json.dumps(key))
+                result[key] = value
+            return result
+        def nonfinite(token):
+            raise ValueError('stack_order_nonfinite: invalid JSON constant ' + token)
+        def finite_float(token):
+            import math
+            value = float(token)
+            if not math.isfinite(value):
+                nonfinite(token)
+            return value
+        try:
+            doc = json.loads(text, object_pairs_hook=unique, parse_constant=nonfinite, parse_float=finite_float)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f'stack_order_json: invalid JSON at line {exc.lineno}, column {exc.colno}') from exc
+        _order_document(doc)
+        return StackOrderInput(STACK_ORDER_SCHEMA_VERSION, 'user_supplied_order_file', digest, doc)
+    except ValueError as exc:
+        return StackOrderInput(source='user_supplied_order_file', file_sha256=digest, errors=(str(exc),))
+
+
+def resolve_model_order(model, reference):
+    q = lambda v: json.dumps(v, ensure_ascii=False)
+    if reference.source is None:
+        if model.cno_present:
+            error = f'stack_order_required: model {q(model.model_id)}; supply --stack-order for CNT placement'
+            return StackOrderResolution(status='required', errors=(error,))
+        return StackOrderResolution()
+    if reference.errors:
+        return StackOrderResolution(status='invalid', errors=reference.errors)
+    if not model.valid:
+        return StackOrderResolution(status="invalid", errors=("invalid_source_inventory",))
+    errors, groups = [], {}
+    for a in model.assets:
+        groups.setdefault((a.kind, a.layer), []).append(a)
+    for (kind, name), assets in sorted(groups.items()):
+        if kind == 'electrode':
+            numbers = sorted({a.stack for a in assets})
+            if len(numbers) > 1:
+                errors.append(f'stack_order_ambiguous_electrode_name: model {q(model.model_id)}, layer {q(name)}, electrode numbers {q(numbers)}, files {q(sorted(a.relative_path for a in assets))}')
+            if ('cno', name) in groups:
+                errors.append(f'stack_order_name_kind_collision: model {q(model.model_id)}, name {q(name)}, electrode files {q(sorted(a.relative_path for a in assets))}, CNT files {q(sorted(a.relative_path for a in groups[("cno", name)]))}')
+    if errors:
+        return StackOrderResolution(status='invalid', errors=tuple(errors))
+    names = reference.document['order']
+    for kind, code in [('electrode', 'electrode'), ('cno', 'cnt')]:
+        missing = sorted(name for k, name in groups if k == kind and name not in names)
+        if missing:
+            errors.append(f'stack_order_missing_{code}_names: model {q(model.model_id)}, missing {q(missing)}')
+    if errors:
+        return StackOrderResolution(status='invalid', errors=tuple(errors))
+    by_name = {name: (kind, assets) for (kind, name), assets in groups.items()}
+    filtered = [n for n in names if n in by_name]
+    listed = [[n, by_name[n][1][0].stack] for n in filtered if by_name[n][0] == 'electrode']
+    expected = sorted(listed, key=lambda pair: pair[1])
+    if listed != expected:
+        return StackOrderResolution(status='invalid', errors=(f'stack_order_electrode_order_conflict: model {q(model.model_id)}, listed {q(listed)}, expected {q(expected)}',))
+    entries = tuple(OrderEntry(i, by_name[n][0], n, by_name[n][1][0].stack,
+                              tuple(sorted(a.asset_id for a in by_name[n][1]))) for i, n in enumerate(filtered))
+    return StackOrderResolution('resolved', 'user_supplied_order_file', 'order', entries,
+                                tuple(n for n in names if n not in by_name), order_digest(entries))
+
+
+def resolve_stack_order(inventory, reference):
+    return replace(inventory, models=tuple(replace(m, stack_order=resolve_model_order(m, reference)) for m in inventory.models))

@@ -122,3 +122,11 @@ def write_wide_import_fixture(root, *, model="SYNTHETIC-WIDE"):
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.where(rectangles(boxes), 0, 255).astype(np.uint8)).save(path)
     return pads
+
+
+def write_stack_order(path, order):
+    """Syntax-only synthetic reference: caller supplies literal positions."""
+    import json
+    path = Path(path)
+    path.write_text(json.dumps({'stack_order_schema_version': 'dl1_png_stack_order_v1', 'order': order}), encoding='utf-8')
+    return path

@@ -1,5 +1,6 @@
 """T1 plan S01-S05, S12, S24 and S25: independent synthetic oracles."""
 import builtins
+import hashlib
 from dataclasses import FrozenInstanceError
 import json
 import shutil
@@ -83,8 +84,8 @@ def test_numeric_stack_and_first_separator(tmp_path):
         write_png(tmp_path, "M/A/" + name)
     write_png(tmp_path, "M/cno/006_OCNT.png")
     model, = discover_source(tmp_path).models
-    assert model.stack_table == ((1, "pxl"), (2, "SD2"), (6, "OCNT"), (10, "Z"))
-    assert [a.stack for a in model.assets] == [1, 2, 6, 10]
+    assert model.stack_table == ((1, "pxl"), (2, "SD2"), (10, "Z"))
+    assert [a.stack for a in model.assets] == [None, 1, 2, 10]
     assert model.cnt_assets[0].original_filename == "006_OCNT.png"
 
 
@@ -211,9 +212,9 @@ def test_enumeration_and_root_relocation_invariance(tmp_path, monkeypatch):
     write_png(second, "M/B/10-Z.png", pixels=((1, 1),))
     assert model_identity(discover_source(second).models[0]) != model_identity(before)
     assert canonical_id("element", ["M", "A", 2, "X"]) != canonical_id("element", ["M", "B", 2, "X"])
-    assert component_id("M", 6, "C", ("M", "cno", None, 6, "C"), (1001, 1203),
+    assert component_id("M", "C", ("M", "cno", None, "C", "mask"), (1001, 1203),
                         (3, 4, 5, 5), np.array([[True, False]])) != component_id(
-                            "M", 6, "C", ("M", "cno", None, 6, "C"), (1001, 1203),
+                            "M", "C", ("M", "cno", None, "C", "mask"), (1001, 1203),
                             (3, 4, 5, 5), np.array([[False, True]]))
 
 
@@ -235,6 +236,9 @@ def test_vocabulary_inventory_and_oov_search_diagnostics(tmp_path):
     assert "mask" not in payload["inventory"]["models"][0]["assets"][0]
     json.dumps(payload, allow_nan=False)
     with pytest.raises(FrozenInstanceError): report.export_status = "exported"
+    from psdl1.png_connections import extract_inventory
+    inv, extracted = extract_inventory(inv)
+    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"]), extraction=extracted, extraction_status="blocked"))
     require_report_version(payload)
     with pytest.raises(ValueError): require_report_version({"report_schema_version": "v2"})
 
@@ -329,8 +333,9 @@ def test_emitted_identity_collision_fails_and_repeated_cnt_layer_is_preserved(tm
     for relative in ["M/A/1-X.png", "M/cno/2-C.png", "M/cno/3-C.png"]:
         write_png(tmp_path, relative)
     inventory = discover_source(tmp_path)
-    assert inventory.valid
-    assert inventory.models[0].repeated_layers == ("C",)
+    assert not inventory.valid
+    assert any("ambiguous_cnt_asset_identity" in e.reason for e in inventory.models[0].errors)
+    assert inventory.models[0].repeated_layers == ()
     assert len(inventory.models[0].cnt_assets) == 2
     monkeypatch.setattr("psdl1.png_source.canonical_id", lambda kind, value: kind + "_collision")
     inventory = discover_source(tmp_path)
@@ -765,9 +770,79 @@ def test_rb_report_separates_model_and_cnt_vocabulary_and_versions(tmp_path):
     assert inventory["unique_cno_layers"] == ["ONLY-M-CNT", "ONLY-Q-CNT"]
     assert inventory["all_source_layer_union"] == ["ONLY-M-CNT", "ONLY-Q-CNT", "X", "Y", "Z"]
     assert "layer_union" not in inventory and "unique_layers" not in inventory
-    assert payload["report_schema_version"] == "dl1_png_import_v2"
+    assert payload["report_schema_version"] == "dl1_png_import_v3"
     assert payload["extractor_run_status"] == "not_run" and "extraction_status" not in payload
+    from psdl1.png_connections import extract_inventory
+    inv, extracted = extract_inventory(inv)
+    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"]), extraction=extracted, extraction_status="blocked"))
     require_report_version(payload)
     for version in ["dl1_png_import_v1", "unsupported", None]:
         with pytest.raises(ValueError, match="unsupported"):
             require_report_version({**payload, "report_schema_version": version})
+
+
+@pytest.mark.parametrize('raw,expected', [
+    (b'[]', 'stack_order_schema: expected object'),
+    (b'{}', 'stack_order_fields: required ["order", "stack_order_schema_version"]; missing ["order", "stack_order_schema_version"]; unknown []'),
+    (b'{"order":[],"order":[]}', 'stack_order_duplicate_key: duplicate key "order"'),
+    (b'{"order":[],"models":{"x":1,"x":2}}', 'stack_order_duplicate_key: duplicate key "x"'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":[],"default":[]}', 'stack_order_fields: required ["order", "stack_order_schema_version"]; missing []; unknown ["default"]'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":[],"models":{}}', 'stack_order_fields: required ["order", "stack_order_schema_version"]; missing []; unknown ["models"]'),
+    (b'{"stack_order_schema_version":"old","order":[]}', 'stack_order_version: expected "dl1_png_stack_order_v1", got "old"'),
+    (b'{"stack_order_schema_version":1,"order":[]}', 'stack_order_version: expected "dl1_png_stack_order_v1", got 1'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":"U"}', 'stack_order_list_type: order must be an array of layer names'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":[1]}', 'stack_order_identifier: order[0] must be a nonempty trimmed identifier without controls or unpaired surrogates'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":[""]}', 'stack_order_identifier: order[0] must be a nonempty trimmed identifier without controls or unpaired surrogates'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":[" U"]}', 'stack_order_identifier: order[0] must be a nonempty trimmed identifier without controls or unpaired surrogates'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":["U\\u0001"]}', 'stack_order_identifier: order[0] must be a nonempty trimmed identifier without controls or unpaired surrogates'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":["U\\u007f"]}', 'stack_order_identifier: order[0] must be a nonempty trimmed identifier without controls or unpaired surrogates'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":["\\ud800"]}', 'stack_order_identifier: order[0] must be a nonempty trimmed identifier without controls or unpaired surrogates'),
+    (b'{"stack_order_schema_version":"dl1_png_stack_order_v1","order":["ABSENT","ABSENT"]}', 'stack_order_duplicate_name: order repeats "ABSENT" at indexes [0, 1]'),
+    (b'{"order":NaN}', 'stack_order_nonfinite: invalid JSON constant NaN'),
+    (b'{"order":Infinity}', 'stack_order_nonfinite: invalid JSON constant Infinity'),
+    (b'{"order":-Infinity}', 'stack_order_nonfinite: invalid JSON constant -Infinity'),
+    (b'{} {}', 'stack_order_json: invalid JSON at line 1, column 4'),
+    (b'// comment\n{}', 'stack_order_json: invalid JSON at line 1, column 1'),
+    (b'\xff', 'stack_order_encoding: expected UTF-8 with optional leading BOM'),
+    (b'\xff\xfe{\x00}\x00', 'stack_order_encoding: expected UTF-8 with optional leading BOM'),
+    (b'{\x00}', 'stack_order_encoding: expected UTF-8 with optional leading BOM'),
+])
+def test_stack_order_strict_json_diagnostics(tmp_path, raw, expected):
+    from psdl1.png_source import load_stack_order
+    from psdl1.png_connections import extract_model
+    path = tmp_path / 'order.json'; path.write_bytes(raw)
+    reference = load_stack_order(path)
+    assert reference.errors == (expected,)
+    assert reference.file_sha256 == hashlib.sha256(raw).hexdigest()
+    root = tmp_path / 'source'
+    write_png(root, 'M/A/1-U.png'); write_png(root, 'M/cno/1-OCNT.png')
+    model, = discover_source(root, stack_order=reference).models
+    assert model.stack_order.status == 'invalid' and extract_model(model).relations == ()
+
+
+def test_stack_order_exact_identifiers_and_read_errors(tmp_path):
+    from png_helpers import write_stack_order
+    from psdl1.png_source import load_stack_order
+    order = ['U', '한글<&', 'é', 'e\u0301', 'OCNT', 'ocnt']
+    reference = load_stack_order(write_stack_order(tmp_path / 'order.json', order))
+    assert reference.document['order'] == order and reference.errors == ()
+    assert load_stack_order(tmp_path / 'missing').errors == ('stack_order_read_error: cannot read stack order file (FileNotFoundError)',)
+    assert load_stack_order(tmp_path).errors == ('stack_order_read_error: cannot read stack order file (IsADirectoryError)',)
+    write_png(tmp_path / 'source', 'M/A/1-U.png'); write_png(tmp_path / 'source', 'M/cno/1-OCNT.png')
+    reference = load_stack_order(write_stack_order(tmp_path / 'order.json', ['U', 'ocnt']))
+    model, = discover_source(tmp_path / 'source', stack_order=reference).models
+    assert model.stack_order.errors == ('stack_order_missing_cnt_names: model "M", missing ["OCNT"]',)
+
+
+def test_no_cno_source_identity_keeps_baseline_numeric_sort(tmp_path):
+    for name in ['1-U.png', '2-M.png', '10-L.png']:
+        write_png(tmp_path, 'M/A/' + name, pixels=((10, 20),))
+    model, = discover_source(tmp_path).models
+    full = np.zeros((1001, 1203), dtype=bool); full[10, 20] = True
+    h = hashlib.sha256(b'{"shape_yx":[1001,1203]}'); h.update(full.tobytes())
+    payload = ['model', ['M', [1001, 1203], [
+        [['M', 'electrode', 'A', 1, 'U'], h.hexdigest()],
+        [['M', 'electrode', 'A', 2, 'M'], h.hexdigest()],
+        [['M', 'electrode', 'A', 10, 'L'], h.hexdigest()]]]]
+    expected = 'model_' + hashlib.sha256(json.dumps(payload, separators=(',', ':')).encode()).hexdigest()
+    assert model_identity(model) == expected

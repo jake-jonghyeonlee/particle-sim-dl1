@@ -1,7 +1,7 @@
 """Conservative original-resolution extraction; no electrical certification.
 
-4-neighbour and nearest-overlap/skipped-layer semantics are implementation
-interpretations. Bbox-local extraction does not remove the v1 consumer's O(R*N)
+4-neighbour components are user accepted; skipped-layer physical semantics
+remain an implementation interpretation. Bbox-local extraction does not remove the v1 consumer's O(R*N)
 full-frame connection masks, float32 loading or validation overhead.
 """
 from dataclasses import dataclass, replace
@@ -152,20 +152,14 @@ def component_slice(label_window, label):
 
 def _skipped(model, low, high):
     def group(kind):
-        groups = {}
-        for a in model.assets:
-            if a.kind == kind and low < a.stack < high:
-                groups.setdefault((a.stack, a.layer), []).append(a)
-        return tuple(LayerEvidence(s, layer, tuple(sorted(a.asset_id for a in assets)),
-                                   tuple(sorted(a.relative_path for a in assets)))
-                     for (s, layer), assets in sorted(groups.items()))
+        return tuple(LayerEvidence(e.order_index, e.electrode_stack, e.name, e.asset_ids,
+                                   tuple(sorted(a.relative_path for a in model.assets if a.asset_id in e.asset_ids)))
+                     for e in model.stack_order.resolved_order if e.kind == kind and low < e.order_index < high)
     return SkippedLayers(group("electrode"), group("cno"))
 
 
-def _selected_pair_reasons(upper, lower, equal):
+def _selected_pair_reasons(upper, lower):
     reasons = []
-    if equal:
-        reasons.append("equal_stack_overlap")
     if not upper:
         reasons.append("missing_upper_overlap")
     elif len(upper) > 1:
@@ -185,23 +179,28 @@ def _extract_component(model, cnt, labels, box, electrode_by_id):
     local = component_slice(labels[window], box.label)
     local.flags.writeable = False
     local_hash = mask_hash(local)
-    cid = component_id(model.model_id, cnt.stack, cnt.layer, cnt.binding,
+    cid = component_id(model.model_id, cnt.layer, cnt.binding,
                        cnt.shape_yx, box.bbox_xyxy_px, local, local_mask_sha256=local_hash)
+    position = model.order_index(cnt)
+    if model.stack_order.status != "resolved":
+        reason = "stack_order_required" if model.stack_order.status != "invalid" else "invalid_stack_order"
+        return ExtractedComponent(cid, cnt.asset_id, cnt.relative_path, None, cnt.filename_number, cnt.layer,
+                                  cnt.shape_yx, box.bbox_xyxy_px, box.pixel_count, local_hash, local,
+                                  unresolved_reasons=(reason,))
     candidates = []
     for asset in sorted(model.electrodes, key=lambda a: (a.stack, a.electrode, a.layer)):
         count = overlap_pixels(local, asset.mask[window])
         if count:
             candidates.append(OverlapCandidate(element_id(asset), asset.asset_id, asset.electrode,
-                                                asset.stack, asset.layer, asset.relative_path, count))
-    above = tuple(c for c in candidates if c.stack < cnt.stack)
-    below = tuple(c for c in candidates if c.stack > cnt.stack)
-    equal = tuple(c for c in candidates if c.stack == cnt.stack)
-    upper_stack = max((a.stack for a in above), default=None)
-    lower_stack = min((a.stack for a in below), default=None)
-    upper = tuple(c for c in above if c.stack == upper_stack)
-    lower = tuple(c for c in below if c.stack == lower_stack)
-    ignored = tuple(IgnoredCandidate(c) for c in below if lower and c.stack > lower[0].stack)
-    reasons = _selected_pair_reasons(upper, lower, equal)
+                                                model.order_index(asset), asset.stack, asset.layer, asset.relative_path, count))
+    above = tuple(c for c in candidates if c.order_index < position)
+    below = tuple(c for c in candidates if c.order_index > position)
+    upper_stack = max((a.order_index for a in above), default=None)
+    lower_stack = min((a.order_index for a in below), default=None)
+    upper = tuple(c for c in above if c.order_index == upper_stack)
+    lower = tuple(c for c in below if c.order_index == lower_stack)
+    ignored = tuple(IgnoredCandidate(c) for c in below if lower and c.order_index > lower[0].order_index)
+    reasons = _selected_pair_reasons(upper, lower)
     intersection_count = regions = None
     relation = None
     if not reasons:
@@ -221,8 +220,8 @@ def _extract_component(model, cnt, labels, box, electrode_by_id):
                 x, y = representative_pixel(joint)
                 original_xy = (x + x0, y + y0)
                 xy_um = model.frame.pixel_centre_um(*original_xy)
-                skipped_upper = _skipped(model, upper[0].stack, cnt.stack)
-                skipped_lower = _skipped(model, cnt.stack, lower[0].stack)
+                skipped_upper = _skipped(model, upper[0].order_index, position)
+                skipped_lower = _skipped(model, position, lower[0].order_index)
                 connection_id = canonical_id("connection", [cid, upper[0].element_id,
                                                            lower[0].element_id, original_xy])
                 relation = ExtractedRelation(
@@ -230,9 +229,9 @@ def _extract_component(model, cnt, labels, box, electrode_by_id):
                                          ExtractedEndpoint(lower[0].element_id, xy_um)),
                     original_xy, intersection_count, mask_hash(joint), skipped_upper, skipped_lower,
                     skipped_upper.present or skipped_lower.present)
-    return ExtractedComponent(cid, cnt.asset_id, cnt.relative_path, cnt.stack, cnt.layer,
+    return ExtractedComponent(cid, cnt.asset_id, cnt.relative_path, position, cnt.filename_number, cnt.layer,
                               cnt.shape_yx, box.bbox_xyxy_px, box.pixel_count, local_hash, local,
-                              above, below, equal, upper, lower, ignored, reasons,
+                              above, below, upper, lower, ignored, reasons,
                               intersection_count, regions, relation)
 
 
@@ -271,9 +270,14 @@ def estimate_resources(model, component_count, resolved_count):
 
 def extract_model(model):
     """Inspect without metadata, grids or full-frame per-relation allocations."""
+    if model.cno_present and model.stack_order.status == "not_required":
+        from .png_source import resolve_model_order
+        from .png_contract import StackOrderInput
+        model = replace(model, stack_order=resolve_model_order(model, StackOrderInput()))
     if not model.valid:
         return ModelExtraction(model.model_id, (), "unavailable", ExtractionSummary(*(0,) * 10),
-                               estimate_resources(model, 0, 0), ("invalid_source",), "blocked")
+                               estimate_resources(model, 0, 0), ("invalid_source",), "blocked",
+                               position_source=model.stack_order.source)
     by_id = {}
     for a in model.electrodes:
         eid = element_id(a)
@@ -281,7 +285,7 @@ def extract_model(model):
             raise ValueError("duplicate/colliding emitted element identity")
         by_id[eid] = a
     components, seen = [], set(by_id)
-    for cnt in sorted(model.cnt_assets, key=lambda a: (a.stack, a.layer, a.asset_id)):
+    for cnt in sorted(model.cnt_assets, key=lambda a: (model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.mask_sha256)):
         labels, boxes = label_components(cnt.mask)
         for box in boxes:
             component = _extract_component(model, cnt, labels, box, by_id)
@@ -292,7 +296,7 @@ def extract_model(model):
                     seen.add(identity)
             components.append(component)
         del labels
-    components.sort(key=lambda c: (c.cnt_stack, c.cnt_layer, c.source_asset_id,
+    components.sort(key=lambda c: (c.cnt_order_index if c.cnt_order_index is not None else -1, c.cnt_layer, c.source_asset_id,
                                    c.bbox_xyxy_px[1], c.bbox_xyxy_px[0], c.component_id))
     relations = [c.relation for c in components if c.relation is not None]
     count, resolved = len(components), len(relations)
@@ -304,6 +308,9 @@ def extract_model(model):
         source_reasons = ("present_cno_without_png_assets",)
     elif not count:
         source_reasons = ("observed_cnt_empty_foreground",)
+    blocked = model.stack_order.status in {"required", "invalid"}
+    if blocked:
+        source_reasons += ("stack_order_required" if model.stack_order.status == "required" else "invalid_stack_order",)
     summary = ExtractionSummary(
         count, resolved, count - resolved, sum(r.needs_confirmation for r in relations),
         sum(r.skipped_upper_layers.present for r in relations),
@@ -313,7 +320,9 @@ def extract_model(model):
         sum(len(r.skipped_lower_layers.electrode_layers) for r in relations),
         sum(len(r.skipped_lower_layers.cno_layers) for r in relations))
     return ModelExtraction(model.model_id, tuple(components), status, summary,
-                           estimate_resources(model, count, resolved), source_reasons)
+                           estimate_resources(model, count, resolved), source_reasons,
+                           extraction_status="blocked" if blocked else "complete",
+                           position_source=model.stack_order.source)
 
 
 def extract_inventory(inventory):

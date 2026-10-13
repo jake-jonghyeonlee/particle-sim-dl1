@@ -5,7 +5,7 @@ import json
 from PIL import Image
 import pytest
 
-from png_helpers import write_import_fixture, write_png
+from png_helpers import write_stack_order, write_import_fixture, write_png
 from psdl1.import_png import run_import
 from psdl1.png_contract import ImportOptions
 from psdl1.png_preview import require_preview_report
@@ -21,7 +21,7 @@ class References(HTMLParser):
 def test_preview_full_frame_and_unresolved_evidence(tmp_path):
     root = tmp_path / "source"; write_import_fixture(root)
     out = tmp_path / "out"
-    assert run_import(ImportOptions(root, out))[1] == 0
+    assert run_import(ImportOptions(root, out, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))[1] == 0
     doc = json.loads((out / "import-report.json").read_text())
     record, = doc["preview"]
     assert record["source_shape_yx"] == [1001, 1203]
@@ -47,7 +47,7 @@ def test_preview_full_frame_and_unresolved_evidence(tmp_path):
     assert "x→right, y→down" in html and "source offset 20,20" in html
     assert "needs confirmation" in html and "multiple_lower_electrodes_on_selected_layer" in html
     assert "Skipped upper" in html and "electrode layers:" in html and "cno layers:" in html
-    assert "3:N" in html and "4:C4" in html and "5:U5" in html
+    assert "1:N" in html and "2:C4" in html and "3:U5" in html
     assert "model connectivity status: partial" in html and "extraction coverage: partial" in html
     assert html.count('data-layer="') == 7 and html.count('<article class=') == 4
     references = References(); references.feed(html)
@@ -97,7 +97,7 @@ def test_preview_context_semantics_and_nearest_display_scale(tmp_path):
     import numpy as np
     root = tmp_path / "source"; write_wide_import_fixture(root)
     out = tmp_path / "out"
-    assert run_import(ImportOptions(root, out))[1] == 0
+    assert run_import(ImportOptions(root, out, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))[1] == 0
     doc = json.loads((out / "import-report.json").read_text())
     crops = doc["preview"][0]["component_crops"]
     assert [c["context_bbox_xyxy_px"] for c in crops] == [[0, 0, 120, 120], [520, 520, 680, 680],
@@ -122,8 +122,8 @@ def test_preview_context_semantics_and_nearest_display_scale(tmp_path):
     assert "blue=selected upper electrodes" in html and "rose=selected lower electrodes" in html
     assert "all candidates on each selected layer" in html and "gray=other electrodes" in html
     assert "black=CNT outline" in html and "yellow=common intersection J" in html and "green crosshair=shared endpoint" in html
-    assert "Involved layers, top to bottom: 1:U / A → 3:N / N [skipped, non-overlapping] → 4:C4 / cno [skipped, non-overlapping] → 5:U5 / A [skipped, non-overlapping] → 6:C6 / cno → 7:L / B" in html
-    assert "lower: B@7:L, D@7:L" in html and "multiple_lower_electrodes_on_selected_layer" in html
+    assert "Involved layers, top to bottom: position 0:U / A → position 1:N / N [skipped, non-overlapping] → position 2:C4 / cno [skipped, non-overlapping] → position 3:U5 / A [skipped, non-overlapping] → position 4:C6 / cno → position 5:L / B" in html
+    assert "lower: B@5:L, D@5:L" in html and "multiple_lower_electrodes_on_selected_layer" in html
 
 
 def test_rb_S16_asymmetric_offsets_marker_endpoint_and_crosshair(tmp_path):
@@ -134,7 +134,7 @@ def test_rb_S16_asymmetric_offsets_marker_endpoint_and_crosshair(tmp_path):
     root = tmp_path / "source"
     write_model(root, [("A", "1-U.png", pixels), ("B", "7-L.png", pixels), ("cno", "6_C.png", pixels)])
     out = tmp_path / "out"
-    assert run_import(ImportOptions(root, out))[1] == 0
+    assert run_import(ImportOptions(root, out, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'C', 'L'])))[1] == 0
     record, = json.loads((out / "import-report.json").read_text())["preview"]
     crop, = record["component_crops"]
     assert crop["bbox_xyxy_px"] == [130, 710, 137, 719]
@@ -171,9 +171,9 @@ def test_rb_S16_escapes_invalid_model_candidates_and_stack(tmp_path):
                        ('cno', '6_C<&".png', pixels)], model='M<&"')
     bad = write_png(root, 'BAD<&"/A/1-X.png'); Image.new("L", (1203, 1001), 127).save(bad)
     out = tmp_path / "out"
-    assert run_import(ImportOptions(root, out))[1] == 2
+    assert run_import(ImportOptions(root, out, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U<&"', 'C<&"', 'L<&"'])))[1] == 2
     html = (out / "preview.html").read_text()
     assert '<h2>BAD&lt;&amp;&quot;</h2><p>Invalid source' in html
-    assert 'Selected upper: A&lt;&amp;&quot;@1:U&lt;&amp;&quot;; lower: B&lt;&amp;&quot;@7:L&lt;&amp;&quot;' in html
-    assert 'Involved layers, top to bottom: 1:U&lt;&amp;&quot; / A&lt;&amp;&quot; → 6:C&lt;&amp;&quot; / cno → 7:L&lt;&amp;&quot; / B&lt;&amp;&quot;' in html
+    assert 'Selected upper: A&lt;&amp;&quot;@0:U&lt;&amp;&quot;; lower: B&lt;&amp;&quot;@2:L&lt;&amp;&quot;' in html
+    assert 'Involved layers, top to bottom: position 0:U&lt;&amp;&quot; / A&lt;&amp;&quot; → position 1:C&lt;&amp;&quot; / cno → position 2:L&lt;&amp;&quot; / B&lt;&amp;&quot;' in html
     assert all(name not in html for name in ['BAD<&"', 'M<&"', 'A<&"', 'B<&"', 'U<&"', 'L<&"', 'C<&"'])

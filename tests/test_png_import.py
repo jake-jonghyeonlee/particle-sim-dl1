@@ -12,13 +12,17 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from png_helpers import write_import_fixture, write_png
+from png_helpers import write_stack_order, write_import_fixture, write_png
 from psdl1.data import load_manifest, input_identity, frame_transform
 import psdl1.import_png as importer
 from psdl1.png_contract import ImportOptions
 
 
 def cli(*args):
+    if "--root" in args and "--stack-order" not in args:
+        root = Path(args[args.index("--root") + 1])
+        order = write_stack_order(root.parent / "stack-order.json", ["U", "N", "C4", "U5", "C6", "L", "X", "Y", "Z"])
+        args += ("--stack-order", order)
     return subprocess.run([sys.executable, "-m", "psdl1.import_png", *map(str, args)],
                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"), capture_output=True, text=True)
 
@@ -107,7 +111,7 @@ def test_publication_interruption_and_no_overwrite(tmp_path, monkeypatch):
     root, out = tmp_path / "source", tmp_path / "out"
     write_import_fixture(root)
     meta = metadata(tmp_path / "metadata.json")
-    options = ImportOptions(root, out, True, meta, 16)
+    options = ImportOptions(root, out, True, meta, 16, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z']))
     original_write = importer._write_assets
     def interrupted(stage, *args):
         original_write(stage, *args)
@@ -191,7 +195,7 @@ def test_pillow_pixel_limit_error_and_explicit_override(tmp_path, monkeypatch):
 def test_explicit_inspect_grid_evidence_without_export(tmp_path, monkeypatch):
     root = tmp_path / "source"; write_import_fixture(root)
     no_grid = tmp_path / "no-grid"
-    assert importer.run_import(ImportOptions(root, no_grid))[1] == 0
+    assert importer.run_import(ImportOptions(root, no_grid, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))[1] == 0
     assert report(no_grid)["grid_evidence"] == [] and report(no_grid)["candidate_grid"] is None
     assert report(no_grid)["metadata"]["pending_models"] == ["SYNTHETIC-M"]
     original = importer.to_product
@@ -202,7 +206,7 @@ def test_explicit_inspect_grid_evidence_without_export(tmp_path, monkeypatch):
         return original(model, extraction, **kwargs)
     monkeypatch.setattr(importer, "to_product", report_precedes_heavy_work)
     out = tmp_path / "grids"
-    assert importer.run_import(ImportOptions(root, out, inspect_grids=(16, 32)))[1] == 0
+    assert importer.run_import(ImportOptions(root, out, inspect_grids=(16, 32), stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))[1] == 0
     checks = report(out)["grid_evidence"]
     assert [e["grid_check"]["grid"] for e in checks] == [16, 32]
     assert checks[0]["transform"]["resized_shape_yx"] == [13, 16]
@@ -256,7 +260,7 @@ def test_grid_failure_preserves_diagnostics_preview_and_blocks_export(tmp_path, 
         raise RuntimeError("synthetic grid runner failure")
     monkeypatch.setattr(importer, "grid_check", failed_grid)
     _, code = importer.run_import(ImportOptions(root, out, True, metadata(tmp_path / "metadata.json"),
-                                                16, inspect_grids=(8,)))
+                                                16, inspect_grids=(8,), stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))
     assert code == 2 and report(out)["export_status"] == "blocked"
     assert "inspect_grid_evaluation_failed" in report(out)["pending_prerequisites"]
     assert "synthetic grid runner failure" in report(out)["grid_evidence"][0]["error"]
@@ -444,7 +448,7 @@ def test_rb_S15_multi_stage_failure_and_pending_manifest(tmp_path, monkeypatch, 
             return original_write(path, payload)
         monkeypatch.setattr(importer, "_write_json", leftovers)
     with pytest.raises(KeyboardInterrupt if point == "interrupt-seal" else RuntimeError, match="synthetic"):
-        importer.run_import(ImportOptions(root, out, True, mapping, 16))
+        importer.run_import(ImportOptions(root, out, True, mapping, 16, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))
     stage, = tmp_path.glob(".out.staging-*")
     assert not out.exists() and not (stage / "manifest.json").exists()
     assert (stage / "manifest.pending.json").is_file()
@@ -459,7 +463,7 @@ def test_metadata_diagnostic_is_location_independent(tmp_path):
         where = tmp_path / name; where.mkdir()
         bad = where / "metadata.json"; bad.write_text('{"unknown": "not metadata"}')
         out = where / "out"
-        assert importer.run_import(ImportOptions(root, out, True, bad, 16))[1] == 2
+        assert importer.run_import(ImportOptions(root, out, True, bad, 16, stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))[1] == 2
         payload = report(out)
         diagnostic, = [d for d in payload["diagnostics"] if d["path"] == "metadata"]
         assert str(tmp_path) not in json.dumps(payload, ensure_ascii=False)
@@ -470,7 +474,7 @@ def test_metadata_diagnostic_is_location_independent(tmp_path):
 
 def test_model_run_status_does_not_say_complete_for_partial_coverage(shared_export):
     doc = report(shared_export)
-    assert doc["report_schema_version"] == "dl1_png_import_v2"
+    assert doc["report_schema_version"] == "dl1_png_import_v3"
     assert doc["extractor_run_status"] == "ran"
     model, = doc["extraction"]
     assert model["extractor_run_status"] == "ran" and model["connectivity_observation"] == "partial"
@@ -491,3 +495,110 @@ def test_fallback_raced_claim_preserves_destination(tmp_path, shared_export, mon
     assert sorted(p.name for p in out.iterdir()) == ["existing.txt"]
     assert (out / "existing.txt").read_text() == "existing user evidence"
     assert not (out / "manifest.json").exists()
+
+
+def test_missing_order_inspects_but_blocks_export(tmp_path, monkeypatch):
+    from png_helpers import write_model
+    from psdl1.png_connections import extract_model
+    from psdl1.png_source import discover_source
+    root = tmp_path / 'source'
+    write_model(root, [('A', '1-U.png', ((10, 20),)), ('B', '2-M.png', ((10, 20),)),
+                       ('D', '3-L.png', ((10, 20),)), ('cno', '1-OCNT.png', ((10, 20),))])
+    model, = discover_source(root).models
+    result = extract_model(model)
+    assert model.valid and result.extraction_status == 'blocked' and result.relations == ()
+    assert result.summary.component_count == result.summary.unresolved_component_count == 1
+    assert result.summary.resolved_relation_count == 0
+    assert result.components[0].cnt_order_index is None
+    assert result.components[0].unresolved_reasons == ('stack_order_required',)
+    def forbidden(*args, **kwargs):
+        pytest.fail('blocked extraction reached grid/product conversion')
+    monkeypatch.setattr(importer, 'to_product', forbidden)
+    out = tmp_path / 'inspect'
+    assert importer.run_import(ImportOptions(root=root, out=out, inspect_grids=(16,)))[1] == 0
+    doc = report(out)
+    assert doc['export_status'] == 'not_requested' and doc['extractor_run_status'] == 'blocked'
+    assert doc['pending_prerequisites'] == ['explicit_stack_order_missing']
+    assert doc['grid_evidence'] == [{'model_id': 'M', 'purpose': 'inspect_not_evaluated', 'reason': 'stack_order_required'}]
+    assert doc['inventory']['models'][0]['stack_order']['status'] == 'required'
+    assert 'Stack order required — supply --stack-order; CNT relations were not extracted.' in (out / 'preview.html').read_text()
+    assert len(doc['preview'][0]['component_crops']) == 1
+    assert importer.verify_bundle(out)['export_status'] == 'not_requested'
+    mapping = metadata(tmp_path / 'metadata.json', model='M')
+    blocked = tmp_path / 'blocked'
+    assert importer.run_import(ImportOptions(root=root, out=blocked, export=True, metadata=mapping, candidate_grid=16))[1] == 2
+    assert report(blocked)['pending_prerequisites'] == ['explicit_stack_order_missing']
+    assert not (blocked / 'manifest.json').exists() and not (blocked / 'assets').exists()
+    assert importer.verify_bundle(blocked)['export_status'] == 'blocked'
+
+
+def test_no_cno_unchanged_empty_cno_requires_order(tmp_path):
+    from png_helpers import write_model
+    root = tmp_path / 'source'
+    write_model(root, [('A', '1-U.png', ((10, 20),)), ('B', '3-L.png', ((10, 20),))])
+    mapping = metadata(tmp_path / 'metadata.json', model='M')
+    options = ImportOptions(root=root, out=tmp_path / 'no-cno', export=True, metadata=mapping, candidate_grid=16)
+    assert importer.run_import(options)[1] == 0
+    original, = load_manifest(options.out / 'manifest.json')
+    assert [e.element_id for e in original.elements] == [
+        'element_b9e33f62d82afdf5c15532a3643c7b98b94e067bdd5738f0f2768194208e7f3b',
+        # Independently verify the second binding below instead of a candidate helper.
+        'element_' + hashlib.sha256(b'["element",["M","electrode","B",3,"L"]]').hexdigest()]
+    assert report(options.out)['inventory']['models'][0]['stack_order']['status'] == 'not_required'
+    (root / 'M/cno').mkdir()
+    blocked = tmp_path / 'empty-cno'
+    assert importer.run_import(replace(options, out=blocked))[1] == 2
+    assert not (blocked / 'manifest.json').exists()
+    order = write_stack_order(tmp_path / 'order.json', ['U', 'L'])
+    ready = tmp_path / 'empty-ready'
+    assert importer.run_import(replace(options, out=ready, stack_order=order))[1] == 0
+    product, = load_manifest(ready / 'manifest.json')
+    assert input_identity(product) == input_identity(original)
+    assert report(ready)['extraction'][0]['source_reasons'] == ['present_cno_without_png_assets']
+    assert report(ready)['generated_asset_hashes'] == report(options.out)['generated_asset_hashes']
+    write_png(root, 'M/cno/1-OCNT.png', pixels=())
+    white = tmp_path / 'white'
+    assert importer.run_import(replace(options, out=white, stack_order=order))[1] == 2
+    assert report(white)['inventory']['models'][0]['stack_order']['errors'] == ['stack_order_missing_cnt_names: model "M", missing ["OCNT"]']
+
+
+@pytest.mark.parametrize('mutation', ['report_v2', 'bundle_v2', 'relabel', 'algorithm', 'model_algorithm',
+                                    'missing_order', 'duplicate_position', 'reorder', 'digest', 'asset_position'])
+def test_order_sidecar_reader_contract(shared_export, tmp_path, mutation):
+    from psdl1.png_preview import require_preview_report
+    out = tmp_path / 'copy'; shutil.copytree(shared_export, out)
+    doc = report(out)
+    if mutation == 'bundle_v2':
+        seal = json.loads((out / 'bundle-integrity.json').read_text())
+        seal['bundle_schema_version'] = 'dl1_png_bundle_v2'
+        (out / 'bundle-integrity.json').write_text(json.dumps(seal))
+        with pytest.raises(ValueError, match='unsupported bundle integrity version/algorithm'):
+            importer.verify_bundle(out)
+        return
+    expected = 'invalid PNG stack order evidence'
+    if mutation == 'report_v2':
+        doc['report_schema_version'] = 'dl1_png_import_v2'; expected = 'unsupported PNG report_schema_version'
+    elif mutation == 'relabel':
+        doc.pop('stack_order')
+    elif mutation == 'algorithm':
+        doc['algorithm_version'] = '1'; expected = 'unsupported PNG algorithm_id/algorithm_version'
+    elif mutation == 'model_algorithm':
+        doc['extraction'][0]['algorithm_version'] = '1'; expected = 'unsupported PNG algorithm_id/algorithm_version'
+    elif mutation == 'missing_order':
+        doc['inventory']['models'][0]['stack_order']['resolved_order'].pop()
+    elif mutation == 'duplicate_position':
+        doc['inventory']['models'][0]['stack_order']['resolved_order'][1]['order_index'] = 0
+    elif mutation == 'reorder':
+        doc['inventory']['models'][0]['stack_order']['resolved_order'].reverse()
+    elif mutation == 'digest':
+        doc['inventory']['models'][0]['stack_order']['resolved_order_sha256'] = '0' * 64
+    elif mutation == 'asset_position':
+        doc['inventory']['models'][0]['assets'][0]['order_index'] = 99
+    with pytest.raises(ValueError, match=expected):
+        require_preview_report(doc)
+    (out / 'import-report.json').write_text(json.dumps(doc))
+    seal = json.loads((out / 'bundle-integrity.json').read_text())
+    seal['files']['import-report.json'] = importer.file_sha256(out / 'import-report.json')
+    (out / 'bundle-integrity.json').write_text(json.dumps(seal))
+    with pytest.raises(ValueError, match=expected):
+        importer.verify_bundle(out)
