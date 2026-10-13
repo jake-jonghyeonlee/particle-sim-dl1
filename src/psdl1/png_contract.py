@@ -91,7 +91,6 @@ class SourceAsset:
     kind: str  # electrode or cno
     electrode: str | None
     role: str | None
-    stack: int | None
     layer: str
     filename_number: int
     relative_path: str
@@ -107,7 +106,7 @@ class SourceAsset:
     def binding(self) -> tuple:
         if self.kind == "cno":
             return (self.model, "cno", None, self.layer, self.mask_sha256)
-        return (self.model, self.kind, self.electrode, self.stack, self.layer)
+        return (self.model, self.kind, self.electrode, self.layer)
 
 
 @dataclass(frozen=True)
@@ -160,7 +159,6 @@ class OrderEntry:
     order_index: int
     kind: str
     name: str
-    electrode_stack: int | None
     asset_ids: tuple[str, ...]
 
 
@@ -173,22 +171,21 @@ class StackOrderResolution:
     ignored_names: tuple[str, ...] = ()
     resolved_order_sha256: str | None = None
     errors: tuple[str, ...] = ()
+    matched_pairs: tuple[tuple[str, str], ...] = ()
 
 
 def order_digest(entries):
-    return hashlib.sha256(canonical_json([[e.kind, e.name, e.electrode_stack] for e in entries])).hexdigest()
+    return hashlib.sha256(canonical_json([[e.kind, e.name] for e in entries])).hexdigest()
 
 
 @dataclass(frozen=True)
 class ModelSource:
     model_id: str
     assets: tuple[SourceAsset, ...]
-    stack_table: tuple[tuple[int, str], ...]
     roles: tuple[str, ...]
     layers: tuple[str, ...]
     frame: FrameRecord | None
     cno_present: bool
-    repeated_layers: tuple[str, ...] = ()
     errors: tuple[SourceIssue, ...] = ()
     warnings: tuple[SourceIssue, ...] = ()
     resource_estimate: ResourceEstimate = field(default_factory=ResourceEstimate)
@@ -238,7 +235,7 @@ class SourceInventory:
 def model_identity(model: ModelSource) -> str:
     return canonical_id("model", [model.model_id, model.frame.shape_yx if model.frame else None,
                                   [(a.binding, a.mask_sha256) for a in sorted(model.assets,
-                                      key=lambda a: (a.kind, a.electrode or "", a.stack or 0, a.layer, a.mask_sha256))]])
+                                      key=lambda a: (a.kind, a.electrode or "", a.layer, a.mask_sha256))]])
 
 
 @dataclass(frozen=True)
@@ -327,7 +324,6 @@ def require_report_version(report: dict) -> None:
 @dataclass(frozen=True)
 class LayerEvidence:
     order_index: int
-    electrode_stack: int | None
     layer: str
     asset_ids: tuple[str, ...]
     source_paths: tuple[str, ...]
@@ -349,7 +345,6 @@ class OverlapCandidate:
     asset_id: str
     electrode: str
     order_index: int
-    electrode_stack: int
     layer: str
     source_path: str
     overlap_pixels: int
@@ -474,47 +469,45 @@ def _validate_order_evidence(report):
     states = []
     for model in report['inventory']['models']:
         order = model['stack_order']
-        require(set(order) == {'status', 'source', 'selected_list', 'resolved_order', 'ignored_names', 'resolved_order_sha256', 'errors'}, 'resolution fields')
+        require(set(order) == {'status', 'source', 'selected_list', 'resolved_order', 'ignored_names', 'resolved_order_sha256', 'errors', 'matched_pairs'}, 'resolution fields')
         status = order['status']
         require(status in {'resolved', 'required', 'invalid', 'not_required'}, 'resolution status')
         require(isinstance(order['errors'], list) and all(isinstance(e, str) for e in order['errors']), 'resolution errors')
         require(isinstance(order['ignored_names'], list) and isinstance(order['resolved_order'], list), 'resolution lists')
+        require('electrode_stack_table' not in model and 'stack_table' not in model, 'obsolete number table')
         assets = model['assets']
         groups = {}
         for a in assets:
             require('stack' not in a and type(a['filename_number']) is int and a['filename_number'] > 0, 'asset number')
             require(a['kind'] in {'electrode', 'cno'}, 'asset kind')
-            require((type(a['electrode_stack']) is int and a['electrode_stack'] == a['filename_number']) if a['kind'] == 'electrode' else a['electrode_stack'] is None, 'asset electrode number')
+            require('electrode_stack' not in a, 'obsolete asset number position')
             groups.setdefault((a['kind'], a['layer']), []).append(a)
         if status == 'resolved':
             require(top['document'] is not None and order['source'] == 'user_supplied_order_file' and order['selected_list'] == 'order' and not order['errors'], 'resolved input')
             present = {a['layer'] for a in assets}
+            by_folded_name = {n.casefold(): n for n in present}
+            require(len(by_folded_name) == len(present), 'source case collision')
             names = top['document']['order']
-            require(present <= set(names), 'reference coverage')
-            require(order['ignored_names'] == [n for n in names if n not in present], 'ignored names')
-            expected_names = [n for n in names if n in present]
+            require(set(by_folded_name) <= {n.casefold() for n in names}, 'reference coverage')
+            require(order['ignored_names'] == [n for n in names if n.casefold() not in by_folded_name], 'ignored names')
+            pairs = [[n, by_folded_name[n.casefold()]] for n in names if n.casefold() in by_folded_name]
+            require(order['matched_pairs'] == pairs, 'matched pairs')
             entries = order['resolved_order']
-            require(len(entries) == len(expected_names), 'resolved coverage')
-            electrode_numbers = []
-            for i, (entry, name) in enumerate(zip(entries, expected_names)):
-                require(set(entry) == {'order_index', 'kind', 'name', 'electrode_stack', 'asset_ids'}, 'entry fields')
+            require(len(entries) == len(pairs), 'resolved coverage')
+            for i, (entry, (_, name)) in enumerate(zip(entries, pairs)):
+                require(set(entry) == {'order_index', 'kind', 'name', 'asset_ids'}, 'entry fields')
                 require(type(entry['order_index']) is int and entry['order_index'] == i and entry['name'] == name, 'entry order')
                 matching = [(k, aa) for (k, n), aa in groups.items() if n == name]
                 require(len(matching) == 1, 'name kind collision')
                 kind, aa = matching[0]
-                numbers = {a['electrode_stack'] for a in aa}
-                require(len(numbers) == 1 and entry['kind'] == kind and entry['electrode_stack'] == next(iter(numbers)) and
-                        (type(entry['electrode_stack']) is int if kind == 'electrode' else entry['electrode_stack'] is None), 'entry kind/number')
+                require(entry['kind'] == kind, 'entry kind')
                 require(entry['asset_ids'] == sorted(a['asset_id'] for a in aa) and len(set(entry['asset_ids'])) == len(aa), 'asset coverage')
                 require(all(type(a['order_index']) is int and a['order_index'] == i for a in aa), 'asset position')
-                if kind == 'electrode':
-                    electrode_numbers.append(entry['electrode_stack'])
-            require(electrode_numbers == sorted(set(electrode_numbers)), 'electrode monotonicity')
-            value = [[e['kind'], e['name'], e['electrode_stack']] for e in entries]
+            value = [[e['kind'], e['name']] for e in entries]
             require(order['resolved_order_sha256'] == hashlib.sha256(canonical_json(value)).hexdigest(), 'semantic digest')
         else:
             require(order['source'] is None and order['selected_list'] is None and order['resolved_order'] == [] and
-                    order['ignored_names'] == [] and order['resolved_order_sha256'] is None, 'unresolved evidence')
+                    order['ignored_names'] == [] and order['matched_pairs'] == [] and order['resolved_order_sha256'] is None, 'unresolved evidence')
             require(all(a['order_index'] is None for a in assets), 'unresolved asset position')
             if status == 'required':
                 require(model['cno_present'] and top['source'] is None and bool(order['errors']), 'required input')
@@ -546,7 +539,7 @@ def _validate_order_evidence(report):
                 for candidate in component[field]:
                     electrode = assets_by_id[candidate['asset_id']]
                     require(electrode['kind'] == 'electrode' and candidate['order_index'] == electrode['order_index'] and
-                            candidate['electrode_stack'] == electrode['electrode_stack'] and candidate['layer'] == electrode['layer'], 'candidate position')
+                            'electrode_stack' not in candidate and candidate['layer'] == electrode['layer'], 'candidate position')
             if component['relation'] is not None:
                 require(status == 'resolved', 'relation requires resolved order')
                 upper, lower = component['selected_upper_candidates'], component['selected_lower_candidates']
@@ -559,7 +552,7 @@ def _validate_order_evidence(report):
                         expected = []
                         for entry in order['resolved_order']:
                             if entry['kind'] == kind and low < entry['order_index'] < high:
-                                expected.append({'order_index': entry['order_index'], 'electrode_stack': entry['electrode_stack'],
+                                expected.append({'order_index': entry['order_index'],
                                                  'layer': entry['name'], 'asset_ids': entry['asset_ids'],
                                                  'source_paths': sorted(a['relative_path'] for a in assets if a['asset_id'] in entry['asset_ids'])})
                         require(skipped[kind + '_layers'] == expected, 'skipped order evidence')

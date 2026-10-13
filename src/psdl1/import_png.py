@@ -296,7 +296,7 @@ def _duplicates(inventory):
     model_groups = {}
     for model in inventory.models:
         if model.valid:
-            key = tuple(sorted((a.kind, a.electrode or "", a.stack or 0, a.layer, a.mask_sha256) for a in model.assets))
+            key = tuple(sorted((a.kind, a.electrode or "", a.layer, a.mask_sha256) for a in model.assets))
             model_groups.setdefault(key, []).append(model.model_id)
     result.extend({"kind": "identical_model_geometry", "model_ids": sorted(names),
                    "meaning": "possible_in_root_symlink_alias_or_duplicate_product_geometry_not_order_equivalence"}
@@ -317,7 +317,7 @@ def _write_assets(stage, model, extraction, metadata):
     f = model.frame
     valid = save(canonical_id("valid", [model.model_id, f.frame_id]), np.ones(f.shape_yx, dtype=np.bool_))
     elements = []
-    for a in sorted(model.electrodes, key=lambda a: (a.stack, a.electrode, a.layer)):
+    for a in sorted(model.electrodes, key=lambda a: (model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode)):
         eid = element_id(a)
         elements.append({"element_id": eid, "electrode_id": a.electrode, "role": a.role,
                          "actual_layer": a.layer, "observation": "observed", "mask": save(eid, a.mask)})

@@ -120,7 +120,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
         overview = Image.new("RGB", (ow, oh), "white")
         overlays, toggles = [], []
         display_assets = sorted(model.assets, key=lambda a: (
-            0 if a.kind == "electrode" else 1, a.stack or 0, a.layer, a.mask_sha256, a.electrode or ""))
+            model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode or "", a.mask_sha256))
         for index, asset in enumerate(display_assets):
             colour = (30, 30, 30) if asset.kind == "cno" else COLOURS[index % len(COLOURS)]
             image = _layer_image(asset.mask, (ow, oh), colour)
@@ -129,7 +129,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
             image.save(stage / layer_relative)
             target = "layer-" + asset.asset_id
             overlays.append(f'<img class="overlay" id="{target}" src="{layer_relative}" alt="{escape(asset.relative_path, quote=True)}">')
-            toggles.append(f'<label><input type="checkbox" checked data-layer="{target}"> {escape(asset.electrode or "cno")} / {escape(asset.layer)} / {"filename number (provenance only)" if asset.kind == "cno" else "electrode number"} {asset.filename_number}</label>')
+            toggles.append(f'<label><input type="checkbox" checked data-layer="{target}"> {escape(asset.electrode or "cno")} / {escape(asset.layer)} / filename number (provenance only) {asset.filename_number}</label>')
         annotation = Image.new("RGBA", (ow, oh), (255, 255, 255, 0))
         draw = ImageDraw.Draw(annotation)
         bbox = model.frame.core_bbox_xyxy_px
@@ -204,13 +204,12 @@ def write_preview(stage, inventory, extraction, *, report=None):
         if model.stack_order.status == "resolved":
             order_html = '<p>Resolved top-to-bottom order (user_supplied_order_file)</p><ol start="0">' + ''.join(
                 '<li>' + escape(f"position {e.order_index}: {e.kind} / {e.name}" +
-                                (f" / electrode number {e.electrode_stack}" if e.kind == "electrode" else "") +
                                 " / assets " + ', '.join(e.asset_ids)) + '</li>'
                 for e in model.stack_order.resolved_order) + '</ol>'
         elif model.stack_order.status == "required":
-            order_html = '<p><strong>Stack order required — supply --stack-order; CNT relations were not extracted.</strong></p><p>CNT overlays are an unordered inventory.</p>'
+            order_html = '<p><strong>Stack order required — supply --stack-order; CNT relations were not extracted.</strong></p><p>Source overlays are an unordered inventory.</p>'
         else:
-            order_html = '<p>' + escape('; '.join(model.stack_order.errors)) + '</p>'
+            order_html = '<p>Unordered source inventory. ' + escape('; '.join(model.stack_order.errors)) + '</p>'
         sections.append(f'<section><h2>{escape(model.model_id)}</h2>' + order_html + f'<p>Extractor run: {"ran" if result.extraction_status == "complete" else "blocked"}; '
                         f'extraction coverage: {result.connectivity_observation}; model connectivity status: {model_status}.</p>'
                         f'<p>Full source frame H×W={h}×{w}; origin (0,0), x→right, y→down; x=0…{w-1}, y=0…{h-1}; '

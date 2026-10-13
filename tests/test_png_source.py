@@ -84,17 +84,16 @@ def test_numeric_stack_and_first_separator(tmp_path):
         write_png(tmp_path, "M/A/" + name)
     write_png(tmp_path, "M/cno/006_OCNT.png")
     model, = discover_source(tmp_path).models
-    assert model.stack_table == ((1, "pxl"), (2, "SD2"), (10, "Z"))
-    assert [a.stack for a in model.assets] == [None, 1, 2, 10]
+    assert [a.filename_number for a in model.assets] == [6, 2, 10, 1]
     assert model.cnt_assets[0].original_filename == "006_OCNT.png"
 
 
-@pytest.mark.parametrize("case", ["shape", "height", "duplicate", "conflict", "repeated_binding",
+@pytest.mark.parametrize("case", ["shape", "height", "duplicate", "repeated_binding",
                                   "layout", "flat", "badname", "whitespace"])
-def test_shape_duplicate_and_stack_conflict_errors(tmp_path, case):
+def test_shape_duplicate_and_filename_errors(tmp_path, case):
     first = write_png(tmp_path, "M/A/6-X.png")
     relative = {"shape": "M/B/7-Y.png", "height": "M/B/7-Y.png",
-                "duplicate": "M/A/006_X.png", "conflict": "M/B/6-Y.png",
+                "duplicate": "M/A/006_X.png",
                 "repeated_binding": "M/A/7-X.png", "layout": "M/A/deeper/7-Y.png",
                 "flat": "M/7-Y.png", "badname": "M/B/nonsense.png",
                 "whitespace": "M/ B/7-Y.png"}[case]
@@ -104,7 +103,7 @@ def test_shape_duplicate_and_stack_conflict_errors(tmp_path, case):
     assert not inventory.valid
     errors = inventory.models[0].errors
     assert any(relative in e.path or path.parent.relative_to(tmp_path).as_posix() == e.path for e in errors)
-    if case in {"shape", "height", "duplicate", "conflict", "repeated_binding"}:
+    if case in {"shape", "height", "duplicate", "repeated_binding"}:
         assert any(first.relative_to(tmp_path).as_posix() in e.reason for e in errors)
     assert inventory.models[0].resource_estimate.frame_pixels is None
 
@@ -160,7 +159,7 @@ def test_explicit_metadata_and_exact_names(tmp_path):
     write_png(tmp_path / "source", "R/A/1-X.png")
     write_png(tmp_path / "source", "R/B/2-X.png")
     repeated = discover_source(tmp_path / "source").models[2]
-    assert repeated.repeated_layers == ("X",)
+    assert repeated.valid
     assert len(repeated.assets) == 2  # no merging distinct bindings
     write_png(tmp_path / "source", "R/A/2-X.png")
     assert not discover_source(tmp_path / "source").models[2].valid
@@ -335,7 +334,6 @@ def test_emitted_identity_collision_fails_and_repeated_cnt_layer_is_preserved(tm
     inventory = discover_source(tmp_path)
     assert not inventory.valid
     assert any("ambiguous_cnt_asset_identity" in e.reason for e in inventory.models[0].errors)
-    assert inventory.models[0].repeated_layers == ()
     assert len(inventory.models[0].cnt_assets) == 2
     monkeypatch.setattr("psdl1.png_source.canonical_id", lambda kind, value: kind + "_collision")
     inventory = discover_source(tmp_path)
@@ -823,7 +821,7 @@ def test_stack_order_strict_json_diagnostics(tmp_path, raw, expected):
 def test_stack_order_exact_identifiers_and_read_errors(tmp_path):
     from png_helpers import write_stack_order
     from psdl1.png_source import load_stack_order
-    order = ['U', '한글<&', 'é', 'e\u0301', 'OCNT', 'ocnt']
+    order = ['U', '한글<&', 'é', 'e\u0301', 'OCNT']
     reference = load_stack_order(write_stack_order(tmp_path / 'order.json', order))
     assert reference.document['order'] == order and reference.errors == ()
     assert load_stack_order(tmp_path / 'missing').errors == ('stack_order_read_error: cannot read stack order file (FileNotFoundError)',)
@@ -831,18 +829,19 @@ def test_stack_order_exact_identifiers_and_read_errors(tmp_path):
     write_png(tmp_path / 'source', 'M/A/1-U.png'); write_png(tmp_path / 'source', 'M/cno/1-OCNT.png')
     reference = load_stack_order(write_stack_order(tmp_path / 'order.json', ['U', 'ocnt']))
     model, = discover_source(tmp_path / 'source', stack_order=reference).models
-    assert model.stack_order.errors == ('stack_order_missing_cnt_names: model "M", missing ["OCNT"]',)
+    assert model.stack_order.status == 'resolved'
+    assert model.stack_order.matched_pairs == (('U', 'U'), ('ocnt', 'OCNT'))
 
 
-def test_no_cno_source_identity_keeps_baseline_numeric_sort(tmp_path):
+def test_no_cno_source_identity_is_number_free(tmp_path):
     for name in ['1-U.png', '2-M.png', '10-L.png']:
         write_png(tmp_path, 'M/A/' + name, pixels=((10, 20),))
     model, = discover_source(tmp_path).models
     full = np.zeros((1001, 1203), dtype=bool); full[10, 20] = True
     h = hashlib.sha256(b'{"shape_yx":[1001,1203]}'); h.update(full.tobytes())
     payload = ['model', ['M', [1001, 1203], [
-        [['M', 'electrode', 'A', 1, 'U'], h.hexdigest()],
-        [['M', 'electrode', 'A', 2, 'M'], h.hexdigest()],
-        [['M', 'electrode', 'A', 10, 'L'], h.hexdigest()]]]]
+        [['M', 'electrode', 'A', 'L'], h.hexdigest()],
+        [['M', 'electrode', 'A', 'M'], h.hexdigest()],
+        [['M', 'electrode', 'A', 'U'], h.hexdigest()]]]]
     expected = 'model_' + hashlib.sha256(json.dumps(payload, separators=(',', ':')).encode()).hexdigest()
     assert model_identity(model) == expected

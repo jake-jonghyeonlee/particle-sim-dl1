@@ -92,8 +92,8 @@ def test_bbox_extraction_scale_and_resource_estimates(tmp_path, monkeypatch):
     assert [r.representative_xy_px for r in result.relations] == [(x, y) for y, x in expected_origins]
     for r, (y, x) in zip(result.relations, expected_origins):
         assert [e.element_id for e in r.endpoints] == [
-            "element_b9e33f62d82afdf5c15532a3643c7b98b94e067bdd5738f0f2768194208e7f3b",
-            "element_f52f5004a56e8493255d1fb2f45ff4f585c20c0ce3bf30d57e7086cc6b383f1c"]
+            "element_469897965578e2a39abd4379749385548f08d9c49a77a78808f75490cdb2e8aa",
+            "element_72a338a8f9aef26c9341f65684b9c7cfad243741ebbd7aeb9cad28b54f01a685"]
         assert r.endpoints[0].xy_um == r.endpoints[1].xy_um == pytest.approx(((x + 0.5) * 0.1, (y + 0.5) * 0.1))
     assert result.components[299].unresolved_reasons == ("missing_upper_overlap",)
     assert all(c.mask.shape == (2, 2) and c.pixel_count == 4 for c in result.components[:300])

@@ -152,7 +152,7 @@ def component_slice(label_window, label):
 
 def _skipped(model, low, high):
     def group(kind):
-        return tuple(LayerEvidence(e.order_index, e.electrode_stack, e.name, e.asset_ids,
+        return tuple(LayerEvidence(e.order_index, e.name, e.asset_ids,
                                    tuple(sorted(a.relative_path for a in model.assets if a.asset_id in e.asset_ids)))
                      for e in model.stack_order.resolved_order if e.kind == kind and low < e.order_index < high)
     return SkippedLayers(group("electrode"), group("cno"))
@@ -188,17 +188,17 @@ def _extract_component(model, cnt, labels, box, electrode_by_id):
                                   cnt.shape_yx, box.bbox_xyxy_px, box.pixel_count, local_hash, local,
                                   unresolved_reasons=(reason,))
     candidates = []
-    for asset in sorted(model.electrodes, key=lambda a: (a.stack, a.electrode, a.layer)):
+    for asset in sorted(model.electrodes, key=lambda a: (model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode)):
         count = overlap_pixels(local, asset.mask[window])
         if count:
             candidates.append(OverlapCandidate(element_id(asset), asset.asset_id, asset.electrode,
-                                                model.order_index(asset), asset.stack, asset.layer, asset.relative_path, count))
+                                                model.order_index(asset), asset.layer, asset.relative_path, count))
     above = tuple(c for c in candidates if c.order_index < position)
     below = tuple(c for c in candidates if c.order_index > position)
-    upper_stack = max((a.order_index for a in above), default=None)
-    lower_stack = min((a.order_index for a in below), default=None)
-    upper = tuple(c for c in above if c.order_index == upper_stack)
-    lower = tuple(c for c in below if c.order_index == lower_stack)
+    upper_position = max((a.order_index for a in above), default=None)
+    lower_position = min((a.order_index for a in below), default=None)
+    upper = tuple(c for c in above if c.order_index == upper_position)
+    lower = tuple(c for c in below if c.order_index == lower_position)
     ignored = tuple(IgnoredCandidate(c) for c in below if lower and c.order_index > lower[0].order_index)
     reasons = _selected_pair_reasons(upper, lower)
     intersection_count = regions = None
@@ -365,7 +365,7 @@ def to_product(model, extraction, *, metadata=None):
         for a in model.cnt_assets:
             cnt |= a.mask  # preserve unresolved foreground too
     elements = tuple(Element(a.role, a.layer, a.mask, a.electrode, element_id(a), "observed")
-                     for a in sorted(model.electrodes, key=lambda a: (a.stack, a.electrode, a.layer)))
+                     for a in sorted(model.electrodes, key=lambda a: (model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode)))
     product = Product(model.model_id, f.frame_extent_um, elements, cnt,
                       metadata.lineage_id if metadata else None, metadata.design_version if metadata else None,
                       Frame(f.frame_id, f.shape_yx, f.pixel_pitch_um, f.origin_xy_um),

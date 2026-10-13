@@ -384,7 +384,7 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                 identifier(model_dir.name, "model")
             except ValueError as exc:
                 model_errors.append(SourceIssue(rel(model_dir), str(exc)))
-            stacks, stack_paths, bindings = {}, {}, {}
+            bindings = {}
             cno_present = False
             for folder in sorted(model_dir.iterdir()):
                 if not safe(folder, model_errors):
@@ -411,25 +411,21 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                         continue
                     png_count += 1
                     try:
-                        stack, layer = parse_png_name(path.name)
+                        filename_number, layer = parse_png_name(path.name)
                     except ValueError as exc:
                         model_errors.append(SourceIssue(rel(path), str(exc)))
                         continue
                     warn_name(layer, path, model_warnings)
-                    binding = (folder.name, stack, layer) if is_cnt else (folder.name, layer)
+                    binding = (folder.name, layer)
                     if not is_cnt and binding in bindings:
                         model_errors.append(SourceIssue(rel(path), f"duplicate normalized binding; also {bindings[binding]}"))
                         model_errors.append(SourceIssue(bindings[binding], f"duplicate normalized binding; also {rel(path)}"))
                     elif not is_cnt:
                         bindings[binding] = rel(path)
-                    if not is_cnt and stack in stacks and stacks[stack] != layer:
-                        model_errors.append(SourceIssue(rel(path), f"conflicting stack {stack}; also {stack_paths[stack]} ({stacks[stack]})"))
-                    elif not is_cnt:
-                        stacks[stack], stack_paths[stack] = layer, rel(path)
                     try:
                         mask, mode, file_hash = _decode(path, rel(path), policy)
                         source_binding = (model_dir.name, "cno" if is_cnt else "electrode",
-                                          None if is_cnt else folder.name, stack, layer)
+                                          None if is_cnt else folder.name, layer)
                         geometry_hash = mask_hash(mask)
                         if is_cnt:
                             source_binding = (model_dir.name, "cno", None, layer, geometry_hash)
@@ -437,14 +433,14 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                         claim_id(asset_id, rel(path), model_errors)
                         assets.append(SourceAsset(
                             asset_id, model_dir.name, source_binding[1],
-                            source_binding[2], source_binding[2], None if is_cnt else stack, layer, stack, rel(path), path.name,
+                            source_binding[2], source_binding[2], layer, filename_number, rel(path), path.name,
                             file_hash, geometry_hash, mode,
                             tuple(mask.shape), mask))
                     except PNGSourceError as exc:
                         model_errors.append(exc.issue)
                 if not is_cnt and not png_count:
                     model_warnings.append(SourceIssue(rel(folder), "electrode folder contains no PNG assets"))
-            assets.sort(key=lambda a: (a.kind, a.stack or 0, a.electrode or "", a.layer, a.mask_sha256))
+            assets.sort(key=lambda a: (a.kind, a.layer, a.electrode or "", a.mask_sha256))
             cnt_groups = {}
             for a in assets:
                 if a.kind == "cno":
@@ -466,15 +462,18 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                 claim_id(frame.frame_id, rel(model_dir), model_errors)
             if not any(a.kind == "electrode" for a in assets):
                 model_errors.append(SourceIssue(rel(model_dir), "no decoded electrode assets"))
-            repeated = tuple(sorted(layer for layer in set(stacks.values())
-                                    if list(stacks.values()).count(layer) > 1))
-            if repeated:
-                model_warnings.append(SourceIssue(rel(model_dir), "actual layer names repeated at distinct stacks: " + ", ".join(repeated)))
+            folded_names = {}
+            for a in assets:
+                folded_names.setdefault(a.layer.casefold(), set()).add(a.layer)
+            for names in folded_names.values():
+                if len(names) > 1:
+                    model_errors.append(SourceIssue(rel(model_dir),
+                        f"stack_order_case_collision: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted(names), ensure_ascii=False)}, files {json.dumps(sorted(a.relative_path for a in assets if a.layer in names), ensure_ascii=False)}"))
             estimate = ResourceEstimate(unknown_reasons=("invalid_source",) if model_errors else ("extraction_not_run",))
-            models.append(ModelSource(model_dir.name, tuple(assets), tuple(sorted(stacks.items())),
+            models.append(ModelSource(model_dir.name, tuple(assets),
                                       tuple(sorted({a.role for a in assets if a.role is not None})),
                                       tuple(sorted({a.layer for a in assets})), frame, cno_present,
-                                      repeated, tuple(model_errors), tuple(model_warnings), estimate))
+                                      tuple(model_errors), tuple(model_warnings), estimate))
     if not models:
         errors.append(SourceIssue(".", "no source models discovered"))
     def names(field):
@@ -540,12 +539,10 @@ def report_payload(report: ImportReport) -> dict:
                 result["extractor_run_status"] = "ran" if status in {"complete", "extractor_ran"} else status
             if isinstance(value, ModelSource):
                 # Distinguish electrode vocabulary, CNT inventory and resolved order.
-                result["electrode_stack_table"] = result.pop("stack_table")
                 result["electrode_layers"] = list(value.electrode_layers)
                 result["cno_layers"] = list(value.cno_layers)
                 result["all_source_layers"] = result.pop("layers")
             if isinstance(value, SourceAsset):
-                result["electrode_stack"] = result.pop("stack")
                 result["order_index"] = next((m.order_index(value) for m in report.inventory.models if m.model_id == value.model), None)
             if isinstance(value, SourceInventory):
                 for name in ("layer_union", "unique_layers"):
@@ -588,6 +585,11 @@ def _order_document(doc):
         indexes = [i for i, n in enumerate(names) if n == name]
         if len(indexes) > 1:
             raise ValueError(f'stack_order_duplicate_name: order repeats {q(name)} at indexes {q(indexes)}')
+    for i, name in enumerate(names):
+        colliding = [n for n in names if n.casefold() == name.casefold()]
+        if len(colliding) > 1:
+            indexes = [j for j, n in enumerate(names) if n.casefold() == name.casefold()]
+            raise ValueError(f'stack_order_case_collision: order names {q(colliding)} at indexes {q(indexes)}')
     return doc
 
 
@@ -647,31 +649,25 @@ def resolve_model_order(model, reference):
     for a in model.assets:
         groups.setdefault((a.kind, a.layer), []).append(a)
     for (kind, name), assets in sorted(groups.items()):
-        if kind == 'electrode':
-            numbers = sorted({a.stack for a in assets})
-            if len(numbers) > 1:
-                errors.append(f'stack_order_ambiguous_electrode_name: model {q(model.model_id)}, layer {q(name)}, electrode numbers {q(numbers)}, files {q(sorted(a.relative_path for a in assets))}')
-            if ('cno', name) in groups:
-                errors.append(f'stack_order_name_kind_collision: model {q(model.model_id)}, name {q(name)}, electrode files {q(sorted(a.relative_path for a in assets))}, CNT files {q(sorted(a.relative_path for a in groups[("cno", name)]))}')
+        if kind == 'electrode' and ('cno', name) in groups:
+            errors.append(f'stack_order_name_kind_collision: model {q(model.model_id)}, name {q(name)}, electrode files {q(sorted(a.relative_path for a in assets))}, CNT files {q(sorted(a.relative_path for a in groups[("cno", name)]))}')
     if errors:
         return StackOrderResolution(status='invalid', errors=tuple(errors))
     names = reference.document['order']
+    reference_keys = {n.casefold() for n in names}
     for kind, code in [('electrode', 'electrode'), ('cno', 'cnt')]:
-        missing = sorted(name for k, name in groups if k == kind and name not in names)
+        missing = sorted(name for k, name in groups if k == kind and name.casefold() not in reference_keys)
         if missing:
             errors.append(f'stack_order_missing_{code}_names: model {q(model.model_id)}, missing {q(missing)}')
     if errors:
         return StackOrderResolution(status='invalid', errors=tuple(errors))
-    by_name = {name: (kind, assets) for (kind, name), assets in groups.items()}
-    filtered = [n for n in names if n in by_name]
-    listed = [[n, by_name[n][1][0].stack] for n in filtered if by_name[n][0] == 'electrode']
-    expected = sorted(listed, key=lambda pair: pair[1])
-    if listed != expected:
-        return StackOrderResolution(status='invalid', errors=(f'stack_order_electrode_order_conflict: model {q(model.model_id)}, listed {q(listed)}, expected {q(expected)}',))
-    entries = tuple(OrderEntry(i, by_name[n][0], n, by_name[n][1][0].stack,
-                              tuple(sorted(a.asset_id for a in by_name[n][1]))) for i, n in enumerate(filtered))
+    by_name = {name.casefold(): (kind, name, assets) for (kind, name), assets in groups.items()}
+    filtered = [n for n in names if n.casefold() in by_name]
+    entries = tuple(OrderEntry(i, by_name[n.casefold()][0], by_name[n.casefold()][1],
+                              tuple(sorted(a.asset_id for a in by_name[n.casefold()][2]))) for i, n in enumerate(filtered))
     return StackOrderResolution('resolved', 'user_supplied_order_file', 'order', entries,
-                                tuple(n for n in names if n not in by_name), order_digest(entries))
+                                tuple(n for n in names if n.casefold() not in by_name), order_digest(entries),
+                                matched_pairs=tuple((n, by_name[n.casefold()][1]) for n in filtered))
 
 
 def resolve_stack_order(inventory, reference):

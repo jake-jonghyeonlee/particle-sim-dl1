@@ -541,10 +541,10 @@ def test_no_cno_unchanged_empty_cno_requires_order(tmp_path):
     assert importer.run_import(options)[1] == 0
     original, = load_manifest(options.out / 'manifest.json')
     assert [e.element_id for e in original.elements] == [
-        'element_b9e33f62d82afdf5c15532a3643c7b98b94e067bdd5738f0f2768194208e7f3b',
-        # Independently verify the second binding below instead of a candidate helper.
-        'element_' + hashlib.sha256(b'["element",["M","electrode","B",3,"L"]]').hexdigest()]
+        'element_' + hashlib.sha256(b'["element",["M","electrode","B","L"]]').hexdigest(),
+        'element_469897965578e2a39abd4379749385548f08d9c49a77a78808f75490cdb2e8aa']
     assert report(options.out)['inventory']['models'][0]['stack_order']['status'] == 'not_required'
+    assert 'Unordered source inventory.' in (options.out / 'preview.html').read_text()
     (root / 'M/cno').mkdir()
     blocked = tmp_path / 'empty-cno'
     assert importer.run_import(replace(options, out=blocked))[1] == 2
@@ -563,7 +563,7 @@ def test_no_cno_unchanged_empty_cno_requires_order(tmp_path):
 
 
 @pytest.mark.parametrize('mutation', ['report_v2', 'bundle_v2', 'relabel', 'algorithm', 'model_algorithm',
-                                    'missing_order', 'duplicate_position', 'reorder', 'digest', 'asset_position'])
+                                    'missing_order', 'duplicate_position', 'reorder', 'digest', 'asset_position', 'matched_pairs', 'old_number_field'])
 def test_order_sidecar_reader_contract(shared_export, tmp_path, mutation):
     from psdl1.png_preview import require_preview_report
     out = tmp_path / 'copy'; shutil.copytree(shared_export, out)
@@ -592,6 +592,10 @@ def test_order_sidecar_reader_contract(shared_export, tmp_path, mutation):
         doc['inventory']['models'][0]['stack_order']['resolved_order'].reverse()
     elif mutation == 'digest':
         doc['inventory']['models'][0]['stack_order']['resolved_order_sha256'] = '0' * 64
+    elif mutation == 'matched_pairs':
+        doc['inventory']['models'][0]['stack_order']['matched_pairs'][0][1] = 'wrong'
+    elif mutation == 'old_number_field':
+        doc['inventory']['models'][0]['assets'][0]['electrode_stack'] = 1
     elif mutation == 'asset_position':
         doc['inventory']['models'][0]['assets'][0]['order_index'] = 99
     with pytest.raises(ValueError, match=expected):
