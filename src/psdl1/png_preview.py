@@ -24,7 +24,9 @@ def _layer_image(mask, shape_xy, colour):
 
 def _draw_marker(draw, xy, state, index, radius=5):
     x, y = xy
-    if state == "unresolved":
+    if state == "geometry_only":
+        draw.rectangle((x - radius, y - radius, x + radius, y + radius), outline="#78838c", width=2)
+    elif state == "unresolved":
         draw.line((x - radius, y - radius, x + radius, y + radius), fill="#c32836", width=2)
         draw.line((x - radius, y + radius, x + radius, y - radius), fill="#c32836", width=2)
     else:
@@ -138,7 +140,7 @@ def write_preview(stage, inventory, extraction, *, report=None):
         component_sections, crops = [], []
         for number, component in enumerate(result.components, 1):
             r = component.relation
-            state = "unresolved" if r is None else "needs_confirmation" if r.needs_confirmation else "resolved"
+            state = "geometry_only" if result.cnt_mode == "image_only" else "unresolved" if r is None else "needs_confirmation" if r.needs_confirmation else "resolved"
             x0, y0, x1, y1 = component.bbox_xyxy_px
             position = r.representative_xy_px if r is not None else ((x0 + x1 - 1) / 2, (y0 + y1 - 1) / 2)
             _draw_marker(draw, ((position[0] + 0.5) * sx, (position[1] + 0.5) * sy), state, number)
@@ -178,6 +180,9 @@ def write_preview(stage, inventory, extraction, *, report=None):
             details += '<details><summary>All overlapping source candidates</summary><p>' + escape(str([
                 (c.electrode, c.order_index, c.layer, c.overlap_pixels) for c in
                 component.above_candidates + component.below_candidates])) + '</p></details>'
+            if result.cnt_mode == "image_only":
+                details = '<p>Geometry only: ' + escape(component.source_path + ' / CNT ' + component.cnt_layer +
+                    f' / bbox {component.bbox_xyxy_px} / pixels {component.pixel_count}') + '</p><p>cnt_image_only_no_relations</p>'
             component_sections.append(f'<article class="{state}" id="{anchor}"><h3>{number}. {state.replace("_", " ")}</h3>'
                                       f'<code>{component.component_id}</code><p>Source bbox XYXY: {component.bbox_xyxy_px}; '
                                       f'crop offset XY=({x0},{y0}); 1 source pixel / display image pixel.</p>'
@@ -206,33 +211,36 @@ def write_preview(stage, inventory, extraction, *, report=None):
                 '<li>' + escape(f"position {e.order_index}: {e.kind} / {e.name}" +
                                 " / assets " + ', '.join(e.asset_ids)) + '</li>'
                 for e in model.stack_order.resolved_order) + '</ol>'
-        elif model.stack_order.status == "required":
-            order_html = '<p><strong>Stack order required — supply --stack-order; CNT relations were not extracted.</strong></p><p>Source overlays are an unordered inventory.</p>'
+        elif result.cnt_mode == "image_only":
+            order_html = '<p><strong>CNT mode: image_only — CNT is an image only; no relations or contact locations are inferred.</strong></p><p>Unordered source inventory.</p>'
         else:
             order_html = '<p>Unordered source inventory. ' + escape('; '.join(model.stack_order.errors)) + '</p>'
-        sections.append(f'<section><h2>{escape(model.model_id)}</h2>' + order_html + f'<p>Extractor run: {"ran" if result.extraction_status == "complete" else "blocked"}; '
+        marker_legend = ('Gray boxes mark geometry display centres only; purple rectangle=reference-only core.' if result.cnt_mode == 'image_only' else 'Green circle=resolved; amber square/circle=needs confirmation; red X=unresolved; purple rectangle=reference-only core.')
+        sections.append(f'<section><h2>{escape(model.model_id)}</h2><p><strong>CNT mode: {escape(result.cnt_mode)}</strong></p>' + order_html + f'<p>Extractor run: {"ran" if result.extraction_status == "complete" else result.extraction_status}; '
                         f'extraction coverage: {result.connectivity_observation}; model connectivity status: {model_status}.</p>'
                         f'<p>Full source frame H×W={h}×{w}; origin (0,0), x→right, y→down; x=0…{w-1}, y=0…{h-1}; '
                         f'pitch 0.1 µm/pixel. Overview scale XY=({sx:.8f},{sy:.8f}).</p><p><a href="{base_relative}">Download full-frame overview</a></p>'
                         '<div class="controls">' + ''.join(toggles) + '</div>' + view +
-                        '<p>Pan with the scrollbars; browser zoom or the source crops provides magnification. Green circle=resolved; '
-                        'amber square/circle=needs confirmation; red X=unresolved; purple rectangle=reference-only core.</p>' +
+                        '<p>Pan with the scrollbars; browser zoom or the source crops provides magnification. ' + marker_legend + '</p>' +
                         ''.join(component_sections) + '</section>')
         rows.append({"model_id": model.model_id, "overview": base_relative, "source_shape_yx": [h, w],
                      "overview_shape_yx": [oh, ow], "display_scale_xy": [sx, sy], "comparison_scope": "full_frame",
                      "core_bbox_use": "reference_only", "component_crops": crops})
     warnings_html = ''.join('<li>' + escape(text) + '</li>' for text in warnings) or '<li>None recorded.</li>'
+    mode = report.cnt_mode if report is not None else (extraction[0].cnt_mode if extraction else "image_only")
+    legend = ('<p>Geometry inventory only. Gray boxes mark component display centres, not inferred contact locations. Gray=electrodes; black=CNT outline. No relation extraction was run.</p>'
+              if mode == "image_only" else '<p>Context legend: blue=selected upper electrodes; rose=selected lower electrodes (all candidates on each selected layer); gray=other electrodes; black=CNT outline; yellow=common intersection J; green crosshair=shared endpoint.</p><p>complete means extraction coverage only; electrical verification not performed. 4-neighbour components are user accepted; skipped-layer physical interpretation remains unconfirmed.</p>')
     html = ('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             '<title>DL1 PNG source inspection</title><style>body{font:16px system-ui;margin:0;background:#f1f4f7;color:#17242e}'
             'header,main{max-width:1120px;margin:auto;padding:24px}header{background:#17242e;color:white}section{background:white;padding:24px;margin:24px 0;border-radius:12px}'
             'article{padding:16px;margin:16px 0;border-left:5px solid #087b4c;background:#f6f8fa}article.unresolved{border-color:#c32836}'
-            'article.needs_confirmation{border-color:#bb7100;background:#fff9ed}code{overflow-wrap:anywhere;font-size:12px}'
+            'article.geometry_only{border-color:#78838c}article.needs_confirmation{border-color:#bb7100;background:#fff9ed}code{overflow-wrap:anywhere;font-size:12px}'
             '.viewport{overflow:auto;max-height:700px;border:1px solid #bbc5ce;background:white}.stack{position:relative}.overlay{position:absolute;inset:0;width:100%;height:100%}'
             '.controls{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.crop{image-rendering:pixelated;min-width:100px;max-width:100%;max-height:400px;object-fit:contain;object-position:left;border:1px solid #aab5bf}'
             'p{line-height:1.5}h2{margin-top:0}a{color:#185e9f}</style><header><h1>DL1 PNG source inspection</h1>'
-            '<p><strong>automatic extraction; electrical verification not performed</strong></p>'
+            '<p><strong>' + ('geometry inventory' if mode == 'image_only' else 'automatic extraction') + '; electrical verification not performed</strong></p>'
             '<p>Display crops are for inspection only, not model input. Model input always retains the full frame and real margins.</p>'
-            '<p>Context legend: blue=selected upper electrodes; rose=selected lower electrodes (all candidates on each selected layer); gray=other electrodes; black=CNT outline; yellow=common intersection J; green crosshair=shared endpoint.</p><p>complete means extraction coverage only; electrical verification not performed. 4-neighbour components are user accepted; skipped-layer physical interpretation remains unconfirmed.</p></header>'
+            '<p><strong>CNT mode: ' + escape(mode) + '</strong></p>' + legend + '</header>'
             '<main><details open><summary>Source warnings and possible duplicates</summary><ul>' + warnings_html + '</ul></details>' + ''.join(sections) + '</main>'
             '<script>document.querySelectorAll("[data-layer]").forEach(x=>x.addEventListener("change",()=>{document.getElementById(x.dataset.layer).hidden=!x.checked;}));</script></html>')
     (stage / "preview.html").write_text(html, encoding="utf-8")

@@ -141,6 +141,8 @@ class ResourceEstimate:
                           "PNG decoding can transiently use about 17–18 bytes/pixel plus its compressed "
                           "snapshot, and inventory retains about one bool byte/pixel/asset across all models.")
 
+    all_components_resolved_applicability: str = "relations_only"
+
 
 STACK_ORDER_SCHEMA_VERSION = "dl1_png_stack_order_v1"
 
@@ -164,7 +166,7 @@ class OrderEntry:
 
 @dataclass(frozen=True)
 class StackOrderResolution:
-    status: str = "not_required"
+    status: str = "not_used"
     source: str | None = None
     selected_list: str | None = None
     resolved_order: tuple[OrderEntry, ...] = ()
@@ -191,6 +193,7 @@ class ModelSource:
     resource_estimate: ResourceEstimate = field(default_factory=ResourceEstimate)
 
     stack_order: StackOrderResolution = field(default_factory=StackOrderResolution)
+    cnt_mode: str = "image_only"
 
     def order_index(self, asset):
         return next((e.order_index for e in self.stack_order.resolved_order if asset.asset_id in e.asset_ids), None)
@@ -278,6 +281,7 @@ class ImportReport:
     inventory: SourceInventory
     metadata: MetadataRecord
     stack_order: StackOrderInput = field(default_factory=StackOrderInput)
+    cnt_mode: str = "image_only"
     report_schema_version: str = REPORT_SCHEMA_VERSION
     algorithm_id: str = ALGORITHM_ID
     algorithm_version: str = ALGORITHM_VERSION
@@ -302,7 +306,7 @@ class ImportReport:
     duplicate_geometry: tuple[dict, ...] = ()
     preview: tuple[dict, ...] = ()
     status_summary: tuple[dict, ...] = ()
-    extraction_run_meaning: str = "extractor_ran; distinct_from_extraction_coverage_and_model_status"
+    extraction_run_meaning: str = "ran means relation extractor ran; not_run_image_only means geometry inventory only; distinct from connectivity coverage"
 
 
 def require_report_version(report: dict) -> None:
@@ -430,6 +434,7 @@ class ModelExtraction:
     component_neighbourhood: int = 4
     same_electrode_required: bool = False
     position_source: str | None = None
+    cnt_mode: str = "relations"
     component_neighbourhood_evidence: str = "user_accepted_4_neighbour"
     rule_evidence: str = "implementation_interpretation_not_electrical_verification"
     residual_limitations: str = "connected_common_intersection_cannot_prove_single_physical_contact"
@@ -462,8 +467,10 @@ def _validate_order_evidence(report):
         require(top['stack_order_schema_version'] is None, 'unparsed version')
         require(top['source'] is not None or (top['file_sha256'] is None and not top['errors']), 'absent input')
         require(top['source'] is None or bool(top['errors']), 'invalid input errors')
-    require(report['extractor_run_status'] in {'ran', 'partial', 'blocked'}, 'run status')
+    require(report['extractor_run_status'] in {'ran', 'partial', 'blocked', 'not_run_image_only'}, 'run status')
     require(report['same_electrode_required'] is False and report['component_neighbourhood'] == 4, 'algorithm parameters')
+    mode = 'image_only' if top['source'] is None else 'relations'
+    require(report['cnt_mode'] == mode, 'CNT mode')
     extractions = {e['model_id']: e for e in report['extraction']}
     require(len(extractions) == len(report['extraction']), 'duplicate extraction')
     states = []
@@ -471,7 +478,7 @@ def _validate_order_evidence(report):
         order = model['stack_order']
         require(set(order) == {'status', 'source', 'selected_list', 'resolved_order', 'ignored_names', 'resolved_order_sha256', 'errors', 'matched_pairs'}, 'resolution fields')
         status = order['status']
-        require(status in {'resolved', 'required', 'invalid', 'not_required'}, 'resolution status')
+        require(status in {'resolved', 'invalid', 'not_used'}, 'resolution status')
         require(isinstance(order['errors'], list) and all(isinstance(e, str) for e in order['errors']), 'resolution errors')
         require(isinstance(order['ignored_names'], list) and isinstance(order['resolved_order'], list), 'resolution lists')
         require('electrode_stack_table' not in model and 'stack_table' not in model, 'obsolete number table')
@@ -509,31 +516,36 @@ def _validate_order_evidence(report):
             require(order['source'] is None and order['selected_list'] is None and order['resolved_order'] == [] and
                     order['ignored_names'] == [] and order['matched_pairs'] == [] and order['resolved_order_sha256'] is None, 'unresolved evidence')
             require(all(a['order_index'] is None for a in assets), 'unresolved asset position')
-            if status == 'required':
-                require(model['cno_present'] and top['source'] is None and bool(order['errors']), 'required input')
-            if status == 'not_required':
-                require(not model['cno_present'] and top['source'] is None and not order['errors'], 'not required input')
+            if status == 'not_used':
+                require(mode == 'image_only' and not order['errors'], 'unused order')
             if status == 'invalid':
                 require(top['source'] is not None and bool(order['errors']), 'invalid input')
+        require(model['cnt_mode'] == mode, 'model CNT mode')
+        require((mode == 'image_only') == (status == 'not_used'), 'mode/order status')
         extraction = extractions[model['model_id']]
+        require(extraction['cnt_mode'] == mode, 'extraction CNT mode')
         require(extraction['algorithm_id'] == ALGORITHM_ID and extraction['algorithm_version'] == ALGORITHM_VERSION,
                 'algorithm version')
         require(extraction['same_electrode_required'] is False and extraction['component_neighbourhood'] == 4, 'extraction parameters')
         require(extraction['position_source'] == order['source'], 'position source')
-        require(extraction['extractor_run_status'] in {'ran', 'blocked'}, 'extraction status')
+        require(extraction['extractor_run_status'] in {'ran', 'blocked', 'not_run_image_only'}, 'extraction status')
         states.append(extraction['extractor_run_status'])
-        if status in {'required', 'invalid'}:
-            require(extraction['extractor_run_status'] == 'blocked' and extraction['connectivity_observation'] == 'unavailable', 'blocked extraction')
+        if status in {'not_used', 'invalid'}:
+            require(extraction['extractor_run_status'] == ('not_run_image_only' if status == 'not_used' and not model['errors'] and model['frame'] is not None else 'blocked') and extraction['connectivity_observation'] == 'unavailable', 'inactive extraction')
             require(all(c['relation'] is None and c['cnt_order_index'] is None and not c['above_candidates'] and not c['below_candidates'] and
                         not c['selected_upper_candidates'] and not c['selected_lower_candidates'] for c in extraction['components']), 'blocked relations')
+        if mode == 'image_only':
+            resources = extraction['resource_estimate']
+            require(resources['all_components_resolved'] is None and resources['all_components_resolved_applicability'] == 'not_applicable_image_only', 'image-only resource scenario')
+            require(extraction['summary']['resolved_relation_count'] == 0 and resources['resolved_relation_count'] in {0, None}, 'image-only relation count')
         assets_by_id = {a['asset_id']: a for a in assets}
         for component in extraction['components']:
             cnt = assets_by_id[component['source_asset_id']]
             require(cnt['kind'] == 'cno' and component['cnt_layer'] == cnt['layer'] and
                     component['cnt_filename_number'] == cnt['filename_number'], 'component source')
             require(component['cnt_order_index'] == cnt['order_index'], 'component position')
-            if status in {'required', 'invalid'}:
-                reason = 'stack_order_required' if status == 'required' else 'invalid_stack_order'
+            if status in {'not_used', 'invalid'}:
+                reason = 'cnt_image_only_no_relations' if status == 'not_used' else 'invalid_stack_order'
                 require(component['unresolved_reasons'] == [reason] and not component['ignored_lower_candidates'], 'blocked component')
             for field in ['above_candidates', 'below_candidates', 'selected_upper_candidates', 'selected_lower_candidates']:
                 for candidate in component[field]:
@@ -558,5 +570,6 @@ def _validate_order_evidence(report):
                         require(skipped[kind + '_layers'] == expected, 'skipped order evidence')
         require(all('cnt_stack' not in c and 'equal_stack_candidates' not in c for c in extraction['components']), 'obsolete component fields')
     require(set(extractions) == {m['model_id'] for m in report['inventory']['models']}, 'extraction coverage')
-    expected_status = 'ran' if all(s == 'ran' for s in states) else 'blocked' if all(s == 'blocked' for s in states) else 'partial'
+    expected_status = ('not_run_image_only' if mode == 'image_only' and all(s == 'not_run_image_only' for s in states) else
+                       'ran' if all(s == 'ran' for s in states) else 'blocked' if all(s == 'blocked' for s in states) else 'partial')
     require(report['extractor_run_status'] == expected_status, 'aggregate run status')

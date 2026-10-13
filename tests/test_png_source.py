@@ -237,7 +237,7 @@ def test_vocabulary_inventory_and_oov_search_diagnostics(tmp_path):
     with pytest.raises(FrozenInstanceError): report.export_status = "exported"
     from psdl1.png_connections import extract_inventory
     inv, extracted = extract_inventory(inv)
-    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"]), extraction=extracted, extraction_status="blocked"))
+    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"]), extraction=extracted, extraction_status="not_run_image_only"))
     require_report_version(payload)
     with pytest.raises(ValueError): require_report_version({"report_schema_version": "v2"})
 
@@ -772,7 +772,7 @@ def test_rb_report_separates_model_and_cnt_vocabulary_and_versions(tmp_path):
     assert payload["extractor_run_status"] == "not_run" and "extraction_status" not in payload
     from psdl1.png_connections import extract_inventory
     inv, extracted = extract_inventory(inv)
-    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"]), extraction=extracted, extraction_status="blocked"))
+    payload = report_payload(ImportReport(inv, load_metadata(None, ["M", "Q"]), extraction=extracted, extraction_status="not_run_image_only"))
     require_report_version(payload)
     for version in ["dl1_png_import_v1", "unsupported", None]:
         with pytest.raises(ValueError, match="unsupported"):

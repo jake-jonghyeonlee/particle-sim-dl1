@@ -497,7 +497,7 @@ def test_fallback_raced_claim_preserves_destination(tmp_path, shared_export, mon
     assert not (out / "manifest.json").exists()
 
 
-def test_missing_order_inspects_but_blocks_export(tmp_path, monkeypatch):
+def test_missing_order_uses_image_only_and_exports(tmp_path):
     from png_helpers import write_model
     from psdl1.png_connections import extract_model
     from psdl1.png_source import discover_source
@@ -506,33 +506,29 @@ def test_missing_order_inspects_but_blocks_export(tmp_path, monkeypatch):
                        ('D', '3-L.png', ((10, 20),)), ('cno', '1-OCNT.png', ((10, 20),))])
     model, = discover_source(root).models
     result = extract_model(model)
-    assert model.valid and result.extraction_status == 'blocked' and result.relations == ()
-    assert result.summary.component_count == result.summary.unresolved_component_count == 1
-    assert result.summary.resolved_relation_count == 0
+    assert model.valid and result.extraction_status == 'not_run_image_only' and result.relations == ()
+    assert result.summary.component_count == 1 and result.summary.resolved_relation_count == 0
     assert result.components[0].cnt_order_index is None
-    assert result.components[0].unresolved_reasons == ('stack_order_required',)
-    def forbidden(*args, **kwargs):
-        pytest.fail('blocked extraction reached grid/product conversion')
-    monkeypatch.setattr(importer, 'to_product', forbidden)
+    assert result.components[0].unresolved_reasons == ('cnt_image_only_no_relations',)
     out = tmp_path / 'inspect'
     assert importer.run_import(ImportOptions(root=root, out=out, inspect_grids=(16,)))[1] == 0
     doc = report(out)
-    assert doc['export_status'] == 'not_requested' and doc['extractor_run_status'] == 'blocked'
-    assert doc['pending_prerequisites'] == ['explicit_stack_order_missing']
-    assert doc['grid_evidence'] == [{'model_id': 'M', 'purpose': 'inspect_not_evaluated', 'reason': 'stack_order_required'}]
-    assert doc['inventory']['models'][0]['stack_order']['status'] == 'required'
-    assert 'Stack order required — supply --stack-order; CNT relations were not extracted.' in (out / 'preview.html').read_text()
+    assert doc['export_status'] == 'not_requested' and doc['extractor_run_status'] == 'not_run_image_only'
+    assert doc['pending_prerequisites'] == []
+    assert doc['grid_evidence'][0]['purpose'] == 'inspect_only_not_approved'
+    assert doc['inventory']['models'][0]['stack_order']['status'] == 'not_used'
+    assert 'CNT mode: image_only' in (out / 'preview.html').read_text()
     assert len(doc['preview'][0]['component_crops']) == 1
     assert importer.verify_bundle(out)['export_status'] == 'not_requested'
     mapping = metadata(tmp_path / 'metadata.json', model='M')
-    blocked = tmp_path / 'blocked'
-    assert importer.run_import(ImportOptions(root=root, out=blocked, export=True, metadata=mapping, candidate_grid=16))[1] == 2
-    assert report(blocked)['pending_prerequisites'] == ['explicit_stack_order_missing']
-    assert not (blocked / 'manifest.json').exists() and not (blocked / 'assets').exists()
-    assert importer.verify_bundle(blocked)['export_status'] == 'blocked'
+    exported = tmp_path / 'exported'
+    assert importer.run_import(ImportOptions(root=root, out=exported, export=True, metadata=mapping, candidate_grid=16))[1] == 0
+    assert report(exported)['pending_prerequisites'] == []
+    assert (exported / 'manifest.json').exists() and (exported / 'assets').exists()
+    assert importer.verify_bundle(exported)['export_status'] == 'exported'
 
 
-def test_no_cno_unchanged_empty_cno_requires_order(tmp_path):
+def test_no_cno_and_empty_cno_allow_image_only(tmp_path):
     from png_helpers import write_model
     root = tmp_path / 'source'
     write_model(root, [('A', '1-U.png', ((10, 20),)), ('B', '3-L.png', ((10, 20),))])
@@ -543,12 +539,13 @@ def test_no_cno_unchanged_empty_cno_requires_order(tmp_path):
     assert [e.element_id for e in original.elements] == [
         'element_' + hashlib.sha256(b'["element",["M","electrode","B","L"]]').hexdigest(),
         'element_469897965578e2a39abd4379749385548f08d9c49a77a78808f75490cdb2e8aa']
-    assert report(options.out)['inventory']['models'][0]['stack_order']['status'] == 'not_required'
+    assert report(options.out)['inventory']['models'][0]['stack_order']['status'] == 'not_used'
     assert 'Unordered source inventory.' in (options.out / 'preview.html').read_text()
     (root / 'M/cno').mkdir()
     blocked = tmp_path / 'empty-cno'
-    assert importer.run_import(replace(options, out=blocked))[1] == 2
-    assert not (blocked / 'manifest.json').exists()
+    assert importer.run_import(replace(options, out=blocked))[1] == 0
+    assert (blocked / 'manifest.json').exists()
+    assert load_manifest(blocked / 'manifest.json')[0].connections == ()
     order = write_stack_order(tmp_path / 'order.json', ['U', 'L'])
     ready = tmp_path / 'empty-ready'
     assert importer.run_import(replace(options, out=ready, stack_order=order))[1] == 0
@@ -605,4 +602,145 @@ def test_order_sidecar_reader_contract(shared_export, tmp_path, mutation):
     seal['files']['import-report.json'] = importer.file_sha256(out / 'import-report.json')
     (out / 'bundle-integrity.json').write_text(json.dumps(seal))
     with pytest.raises(ValueError, match=expected):
+        importer.verify_bundle(out)
+
+
+@pytest.fixture(scope='module')
+def image_only_pair(tmp_path_factory):
+    from png_helpers import write_image_only_fixture
+    where = tmp_path_factory.mktemp('image-only-pair')
+    root = where / 'source'; write_image_only_fixture(root)
+    mapping = metadata(where / 'metadata.json', model='M')
+    # Syntax-only synthetic reference. The importer has no built-in positions.
+    order = write_stack_order(where / 'order.json', ['PXL', 'OCNT', 'GAT3', 'GCNT', 'OACT'])
+    for mode, reference in [('image_only', None), ('relations', order)]:
+        summary, code = importer.run_import(ImportOptions(root=root, out=where / mode, export=True,
+            metadata=mapping, candidate_grid=128, stack_order=reference))
+        assert code == 0 and summary['cnt_mode'] == mode
+    return where, root, order, mapping
+
+
+def test_image_only_export_carries_global_cnt_and_no_relations(image_only_pair, tmp_path):
+    from psdl1.data import build_vocab, prepare_product
+    where, root, _, mapping = image_only_pair
+    out = where / 'image_only'
+    product, = load_manifest(out / 'manifest.json')
+    expected = np.zeros((1001, 1203), dtype=bool)
+    expected[100:132, 200:248] = True
+    expected[300:332, 400:432] = True
+    np.testing.assert_array_equal(product.cnt, expected)
+    assert product.connections == () and product.connectivity_observation == 'unavailable'
+    roles, layers = build_vocab([product]); prepared = prepare_product(product, 128, roles, layers)
+    # Hand-specified full-frame resize is 107x128 with top padding 10.
+    assert prepared.images[:, 1, 22, 22].min() > 0
+    assert prepared.images[:, 1, 43, 44].min() > 0
+    assert prepared.connection_masks.shape[0] == 0
+    doc = report(out)
+    resources = doc['extraction'][0]['resource_estimate']
+    assert resources['cnt_file_count'] == resources['cnt_component_count'] == 3
+    assert resources['resolved_relation_count'] == 0 and resources['generated_mask_asset_count'] == 5
+    assert resources['all_components_resolved'] is None
+    assert resources['all_components_resolved_applicability'] == 'not_applicable_image_only'
+    # Prefix-only renames preserve every semantic and loaded Product identity.
+    moved = tmp_path / 'source'; shutil.copytree(root, moved)
+    (moved / 'M/cno/1-OCNT.png').rename(moved / 'M/cno/88_OCNT.png')
+    (moved / 'M/cno/001_OCNT.png').rename(moved / 'M/cno/2-OCNT.png')
+    renamed = tmp_path / 'renamed'
+    assert importer.run_import(ImportOptions(root=moved, out=renamed, export=True, metadata=mapping, candidate_grid=128))[1] == 0
+    after, = load_manifest(renamed / 'manifest.json')
+    np.testing.assert_array_equal(after.cnt, expected)
+    assert input_identity(after) == input_identity(product)
+    assert sorted(a['asset_id'] for a in report(renamed)['inventory']['models'][0]['assets']) == sorted(a['asset_id'] for a in doc['inventory']['models'][0]['assets'])
+    assert sorted(c['component_id'] for c in report(renamed)['extraction'][0]['components']) == sorted(c['component_id'] for c in doc['extraction'][0]['components'])
+
+
+def test_image_only_and_relations_modes_differ_and_are_recorded(image_only_pair):
+    where, _, _, _ = image_only_pair
+    image, = load_manifest(where / 'image_only/manifest.json')
+    relations, = load_manifest(where / 'relations/manifest.json')
+    assert len(image.connections) == 0 and len(relations.connections) == 3
+    assert {e.element_id for e in image.elements} == {e.element_id for e in relations.elements}
+    np.testing.assert_array_equal(image.cnt, relations.cnt)
+    assert input_identity(image) != input_identity(relations)
+    for mode, status in [('image_only', 'not_run_image_only'), ('relations', 'ran')]:
+        doc = report(where / mode)
+        assert doc['cnt_mode'] == doc['inventory']['models'][0]['cnt_mode'] == doc['extraction'][0]['cnt_mode'] == mode
+        assert doc['extractor_run_status'] == doc['extraction'][0]['extractor_run_status'] == status
+        assert doc['same_electrode_required'] is False and doc['extraction'][0]['same_electrode_required'] is False
+        assert importer.verify_bundle(where / mode)['export_status'] == 'exported'
+    geometry = report(where / 'image_only')['inventory']['models'][0]
+    assert geometry['stack_order'] == {'status':'not_used', 'source':None, 'selected_list':None,
+        'resolved_order':[], 'ignored_names':[], 'resolved_order_sha256':None, 'errors':[], 'matched_pairs':[]}
+    assert all(a['order_index'] is None for a in geometry['assets'])
+
+
+@pytest.mark.parametrize('bad_order', ['malformed', 'missing_names'])
+def test_invalid_order_never_falls_back_to_image_only(image_only_pair, tmp_path, bad_order):
+    _, root, _, mapping = image_only_pair
+    order = tmp_path / 'bad.json'
+    if bad_order == 'malformed': order.write_text('{broken JSON')
+    else: write_stack_order(order, ['PXL', 'GAT3', 'OACT'])
+    out = tmp_path / 'out'
+    summary, code = importer.run_import(ImportOptions(root=root, out=out, export=True, metadata=mapping,
+        candidate_grid=128, stack_order=order))
+    assert code == 2 and summary['cnt_mode'] == 'relations'
+    doc = report(out)
+    assert doc['cnt_mode'] == doc['extraction'][0]['cnt_mode'] == 'relations'
+    assert doc['inventory']['models'][0]['stack_order']['status'] == 'invalid'
+    assert doc['extraction'][0]['extractor_run_status'] == 'blocked'
+    assert all(c['relation'] is None and c['unresolved_reasons'] == ['invalid_stack_order'] for c in doc['extraction'][0]['components'])
+    assert doc['pending_prerequisites'] == ['invalid_stack_order']
+    assert not (out / 'manifest.json').exists() and not (out / 'assets').exists()
+
+
+def test_image_only_preview_states_mode_and_shows_no_endpoints(image_only_pair):
+    where, _, _, _ = image_only_pair
+    html = (where / 'image_only/preview.html').read_text()
+    assert 'CNT mode: image_only' in html and 'Geometry only:' in html
+    assert 'cnt_image_only_no_relations' in html and 'Unordered source inventory.' in html
+    assert 'Endpoint source XY:' not in html and 'shared endpoint' not in html
+    assert 'Selected upper:' not in html and 'Resolved top-to-bottom order' not in html
+    doc = report(where / 'image_only')
+    assert [c['state'] for c in doc['preview'][0]['component_crops']] == ['geometry_only'] * 3
+    for c in doc['extraction'][0]['components']:
+        assert c['cnt_order_index'] is None and c['relation'] is None
+        assert c['above_candidates'] == c['below_candidates'] == []
+        assert c['unresolved_reasons'] == ['cnt_image_only_no_relations']
+
+
+def test_image_only_inspect_grids(image_only_pair, tmp_path):
+    _, root, _, _ = image_only_pair
+    out = tmp_path / 'inspect'
+    assert importer.run_import(ImportOptions(root=root, out=out, inspect_grids=(64, 128)))[1] == 0
+    doc = report(out)
+    assert doc['cnt_mode'] == 'image_only' and doc['pending_prerequisites'] == []
+    assert [e['grid_check']['grid'] for e in doc['grid_evidence']] == [64, 128]
+    assert all(e['purpose'] == 'inspect_only_not_approved' for e in doc['grid_evidence'])
+    assert doc['extraction'][0]['summary']['component_count'] == 3
+    assert doc['extraction'][0]['summary']['resolved_relation_count'] == 0
+    assert not (out / 'manifest.json').exists()
+
+
+@pytest.mark.parametrize('mutation', ['cnt_mode', 'model_cnt_mode', 'extraction_cnt_mode', 'position', 'relation', 'resource_plan', 'manifest_relation'])
+def test_image_only_reader_rejects_inferred_evidence(image_only_pair, tmp_path, mutation):
+    where, _, _, _ = image_only_pair
+    out = tmp_path / 'copy'; shutil.copytree(where / 'image_only', out)
+    doc = report(out)
+    if mutation == 'cnt_mode': doc['cnt_mode'] = 'relations'
+    elif mutation == 'model_cnt_mode': doc['inventory']['models'][0]['cnt_mode'] = 'relations'
+    elif mutation == 'extraction_cnt_mode': doc['extraction'][0]['cnt_mode'] = 'relations'
+    elif mutation == 'position': doc['extraction'][0]['components'][0]['cnt_order_index'] = 0
+    elif mutation == 'relation': doc['extraction'][0]['components'][0]['relation'] = {'endpoints': []}
+    elif mutation == 'resource_plan': doc['extraction'][0]['resource_estimate']['all_components_resolved'] = {'resolved_relation_count':3}
+    elif mutation == 'manifest_relation':
+        manifest = json.loads((out / 'manifest.json').read_text())
+        manifest['products'][0]['connections'] = [{'endpoints':[]}]
+        (out / 'manifest.json').write_text(json.dumps(manifest))
+        doc['generated_manifest_sha256'] = importer.file_sha256(out / 'manifest.json')
+    (out / 'import-report.json').write_text(json.dumps(doc))
+    seal = json.loads((out / 'bundle-integrity.json').read_text())
+    for name in ['import-report.json', 'manifest.json']:
+        seal['files'][name] = importer.file_sha256(out / name)
+    (out / 'bundle-integrity.json').write_text(json.dumps(seal))
+    with pytest.raises(ValueError, match='image-only manifest|invalid PNG stack order evidence'):
         importer.verify_bundle(out)

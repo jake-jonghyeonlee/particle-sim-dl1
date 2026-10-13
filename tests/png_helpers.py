@@ -130,3 +130,14 @@ def write_stack_order(path, order):
     path = Path(path)
     path.write_text(json.dumps({'stack_order_schema_version': 'dl1_png_stack_order_v1', 'order': order}), encoding='utf-8')
     return path
+
+
+def write_image_only_fixture(root, *, model='M'):
+    """Synthetic masks and syntax-only names; every numeric prefix is 1."""
+    first = tuple((y, x) for y in range(100, 132) for x in range(200, 232))
+    second = tuple((y, x) for y in range(100, 132) for x in range(216, 248))
+    other = tuple((y, x) for y in range(300, 332) for x in range(400, 432))
+    electrodes = tuple(sorted(set(first + second + other)))
+    write_model(root, [('A', '1-pxl.png', electrodes), ('B', '1-GAT3.png', electrodes),
+                       ('D', '1-OACT.png', electrodes), ('cno', '1-OCNT.png', first),
+                       ('cno', '001_OCNT.png', second), ('cno', '1-GCNT.png', other)], model=model)

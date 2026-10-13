@@ -182,8 +182,8 @@ def _extract_component(model, cnt, labels, box, electrode_by_id):
     cid = component_id(model.model_id, cnt.layer, cnt.binding,
                        cnt.shape_yx, box.bbox_xyxy_px, local, local_mask_sha256=local_hash)
     position = model.order_index(cnt)
-    if model.stack_order.status != "resolved":
-        reason = "stack_order_required" if model.stack_order.status != "invalid" else "invalid_stack_order"
+    if model.cnt_mode == "image_only" or model.stack_order.status != "resolved":
+        reason = "cnt_image_only_no_relations" if model.cnt_mode == "image_only" else "invalid_stack_order"
         return ExtractedComponent(cid, cnt.asset_id, cnt.relative_path, None, cnt.filename_number, cnt.layer,
                                   cnt.shape_yx, box.bbox_xyxy_px, box.pixel_count, local_hash, local,
                                   unresolved_reasons=(reason,))
@@ -245,7 +245,8 @@ def _npy_header_bytes(shape):
 def estimate_resources(model, component_count, resolved_count):
     """Actual bool NPY header encoding; estimates exclude other bundle files."""
     if not model.valid:
-        return ResourceEstimate(unknown_reasons=("invalid_or_undecodable_source",))
+        return ResourceEstimate(unknown_reasons=("invalid_or_undecodable_source",),
+                                all_components_resolved_applicability="not_applicable_image_only" if model.cnt_mode == "image_only" else "relations_only")
     if (type(component_count) is not int or type(resolved_count) is not int or
             not 0 <= resolved_count <= component_count):
         raise ValueError("resource counts require 0 <= resolved <= components")
@@ -261,23 +262,22 @@ def estimate_resources(model, component_count, resolved_count):
         headers = header * masks
         return ResourceScenario(relations, masks, payload, headers, payload + headers,
                                 pixels * masks * np.dtype(np.float32).itemsize)
-    actual, upper = scenario(resolved_count), scenario(component_count)
+    if model.cnt_mode == "image_only" and resolved_count != 0:
+        raise ValueError("image-only resources cannot contain relations")
+    actual, upper = scenario(resolved_count), None if model.cnt_mode == "image_only" else scenario(component_count)
     return ResourceEstimate((h, w), pixels, electrodes, cnt_files, component_count, resolved_count,
                             indicator, actual.generated_mask_asset_count, actual.bool_payload_bytes,
                             actual.npy_header_bytes, actual.projected_bool_npy_export_bytes,
-                            actual.projected_load_manifest_retained_float32_mask_bytes, upper, ())
+                            actual.projected_load_manifest_retained_float32_mask_bytes, upper, (),
+                            all_components_resolved_applicability="not_applicable_image_only" if model.cnt_mode == "image_only" else "relations_only")
 
 
 def extract_model(model):
     """Inspect without metadata, grids or full-frame per-relation allocations."""
-    if model.cno_present and model.stack_order.status == "not_required":
-        from .png_source import resolve_model_order
-        from .png_contract import StackOrderInput
-        model = replace(model, stack_order=resolve_model_order(model, StackOrderInput()))
     if not model.valid:
         return ModelExtraction(model.model_id, (), "unavailable", ExtractionSummary(*(0,) * 10),
                                estimate_resources(model, 0, 0), ("invalid_source",), "blocked",
-                               position_source=model.stack_order.source)
+                               position_source=model.stack_order.source, cnt_mode=model.cnt_mode)
     by_id = {}
     for a in model.electrodes:
         eid = element_id(a)
@@ -308,9 +308,11 @@ def extract_model(model):
         source_reasons = ("present_cno_without_png_assets",)
     elif not count:
         source_reasons = ("observed_cnt_empty_foreground",)
-    blocked = model.stack_order.status in {"required", "invalid"}
+    blocked = model.stack_order.status == "invalid"
     if blocked:
-        source_reasons += ("stack_order_required" if model.stack_order.status == "required" else "invalid_stack_order",)
+        source_reasons += ("invalid_stack_order",)
+    elif model.cnt_mode == "image_only":
+        source_reasons += ("cnt_image_only_no_relations",)
     summary = ExtractionSummary(
         count, resolved, count - resolved, sum(r.needs_confirmation for r in relations),
         sum(r.skipped_upper_layers.present for r in relations),
@@ -321,8 +323,8 @@ def extract_model(model):
         sum(len(r.skipped_lower_layers.cno_layers) for r in relations))
     return ModelExtraction(model.model_id, tuple(components), status, summary,
                            estimate_resources(model, count, resolved), source_reasons,
-                           extraction_status="blocked" if blocked else "complete",
-                           position_source=model.stack_order.source)
+                           extraction_status="blocked" if blocked else "not_run_image_only" if model.cnt_mode == "image_only" else "complete",
+                           position_source=model.stack_order.source, cnt_mode=model.cnt_mode)
 
 
 def extract_inventory(inventory):
@@ -341,6 +343,8 @@ def component_mask(component):
 
 def iter_connections(extraction):
     """Export can consume/release one full-frame mask at a time."""
+    if extraction.cnt_mode == "image_only" and extraction.relations:
+        raise ValueError("image-only products cannot contain relations")
     for component in extraction.components:
         r = component.relation
         if r is not None:
@@ -354,7 +358,7 @@ def to_product(model, extraction, *, metadata=None):
     Callers must surface resource_estimate BEFORE this potentially heavy boundary.
     Metadata stays absent for inspection unless explicitly supplied by the caller.
     """
-    if not model.valid or extraction.extraction_status != "complete" or model.model_id != extraction.model_id:
+    if not model.valid or extraction.extraction_status not in {"complete", "not_run_image_only"} or model.model_id != extraction.model_id:
         raise ValueError("valid source and matching completed extraction required")
     if metadata is not None and metadata.model_id != model.model_id:
         raise ValueError("metadata must name the exact source model")

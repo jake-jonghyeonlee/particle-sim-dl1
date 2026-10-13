@@ -637,9 +637,6 @@ def load_stack_order(path):
 def resolve_model_order(model, reference):
     q = lambda v: json.dumps(v, ensure_ascii=False)
     if reference.source is None:
-        if model.cno_present:
-            error = f'stack_order_required: model {q(model.model_id)}; supply --stack-order for CNT placement'
-            return StackOrderResolution(status='required', errors=(error,))
         return StackOrderResolution()
     if reference.errors:
         return StackOrderResolution(status='invalid', errors=reference.errors)
@@ -671,4 +668,4 @@ def resolve_model_order(model, reference):
 
 
 def resolve_stack_order(inventory, reference):
-    return replace(inventory, models=tuple(replace(m, stack_order=resolve_model_order(m, reference)) for m in inventory.models))
+    return replace(inventory, models=tuple(replace(m, stack_order=resolve_model_order(m, reference), cnt_mode="image_only" if reference.source is None else "relations") for m in inventory.models))

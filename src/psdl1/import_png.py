@@ -129,6 +129,8 @@ def _verify_bundle(bundle):
             raise ValueError("duplicate reported generated asset")
         required = set()
         for product in manifest["products"]:
+            if report["cnt_mode"] == "image_only" and (product["connections"] != [] or product["connectivity_observation"] != "unavailable"):
+                raise ValueError("image-only manifest contains relation evidence")
             for relative in ([product["valid"]] + ([product["cnt"]] if product.get("cnt") else []) +
                              [e["mask"] for e in product["elements"]] + [c["mask"] for c in product["connections"]]):
                 required.add(relative)
@@ -388,8 +390,6 @@ def run_import(options, *, event_sink=None):
                 diagnostics.extend(SourceIssue("stack_order", e) for e in model.stack_order.errors if e not in reference.errors)
             pending = []
             order_invalid = bool(reference.errors) or any(m.stack_order.status == "invalid" for m in inventory.models)
-            if any(m.stack_order.status == "required" for m in inventory.models):
-                pending.append("explicit_stack_order_missing")
             if order_invalid:
                 pending.append("invalid_stack_order")
             if options.export:
@@ -403,13 +403,13 @@ def run_import(options, *, event_sink=None):
                     pending.append("invalid_metadata")
             duplicates = _duplicates(inventory)
             diagnostics.extend(SourceIssue(".", "possible duplicate/alias geometry: " + str(entry)) for entry in duplicates)
-            report = ImportReport(inventory, metadata, stack_order=reference, extraction=extraction,
-                                  extraction_status=("extractor_ran" if all(r.extraction_status == "complete" for r in extraction) else
+            report = ImportReport(inventory, metadata, stack_order=reference, cnt_mode="image_only" if options.stack_order is None else "relations", extraction=extraction,
+                                  extraction_status=("not_run_image_only" if options.stack_order is None and all(r.extraction_status == "not_run_image_only" for r in extraction) else "extractor_ran" if all(r.extraction_status == "complete" for r in extraction) else
                                                      "blocked" if all(r.extraction_status == "blocked" for r in extraction) else "partial"),
                                   candidate_grid=options.candidate_grid, pending_prerequisites=tuple(pending),
                                   diagnostics=tuple(diagnostics), duplicate_geometry=duplicates,
                                   status_summary=tuple({"model_id": r.model_id,
-                                      "extractor_run": "ran" if r.extraction_status == "complete" else "blocked",
+                                      "extractor_run": "ran" if r.extraction_status == "complete" else r.extraction_status,
                                       "extraction_coverage": r.connectivity_observation,
                                       "model_connectivity_status": "available" if r.connectivity_observation == "complete" else r.connectivity_observation,
                                       "model_vocabulary_eligibility": "not_evaluated_without_checkpoint",
@@ -432,7 +432,7 @@ def run_import(options, *, event_sink=None):
             for model, result in zip(inventory.models, extraction):
                 if result.extraction_status == "blocked" and options.inspect_grids:
                     evidence.append({"model_id": model.model_id, "purpose": "inspect_not_evaluated",
-                                     "reason": "stack_order_required" if model.stack_order.status == "required" else "invalid_stack_order"})
+                                     "reason": "invalid_source_inventory" if not model.valid else "invalid_stack_order"})
                 elif model.valid and options.inspect_grids:
                     product = None
                     try:
@@ -481,7 +481,7 @@ def run_import(options, *, event_sink=None):
             _publish_noreplace(stage, out)
             status = 2 if (options.export and pending) or order_invalid or not inventory.valid or metadata_error or grid_error else 0
             summary = {"event": "completed", "output": str(out), "export_status": report.export_status,
-                       "source_valid": inventory.valid, "pending_prerequisites": pending}
+                       "source_valid": inventory.valid, "cnt_mode": report.cnt_mode, "pending_prerequisites": pending}
             emit(summary)
             return summary, status
     except BaseException as exc:
@@ -515,7 +515,7 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, help="new destination outside input tree; existing paths are refused")
     parser.add_argument("--export", action="store_true", help="all-model export; missing metadata/grid gives diagnostic report and nonzero exit, no manifest")
     parser.add_argument("--metadata", type=Path)
-    parser.add_argument("--stack-order", type=Path, help="user-supplied reference order; required for CNT export, optional diagnostic inspection")
+    parser.add_argument("--stack-order", type=Path, help="optional reference order enables CNT relations; without it CNT is exported as an image only")
     parser.add_argument("--candidate-grid", type=_positive)
     parser.add_argument("--inspect-grids", type=_positive, nargs="+", default=[])
     parser.add_argument("--png-max-image-pixels", type=_positive, help="explicit finite Pillow pixel guard override, recorded; never disables guard")
