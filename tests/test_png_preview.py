@@ -177,3 +177,37 @@ def test_rb_S16_escapes_invalid_model_candidates_and_stack(tmp_path):
     assert 'Selected upper: A&lt;&amp;&quot;@0:U&lt;&amp;&quot;; lower: B&lt;&amp;&quot;@2:L&lt;&amp;&quot;' in html
     assert 'Involved layers, top to bottom: position 0:U&lt;&amp;&quot; / A&lt;&amp;&quot; → position 1:C&lt;&amp;&quot; / cno → position 2:L&lt;&amp;&quot; / B&lt;&amp;&quot;' in html
     assert all(name not in html for name in ['BAD<&"', 'M<&"', 'A<&"', 'B<&"', 'U<&"', 'L<&"', 'C<&"'])
+
+
+def test_preview_lists_order_without_invented_cnt_position(tmp_path):
+    from png_helpers import write_model
+    root = tmp_path / 'source'; p,q,r = (10,20),(10,21),(10,22)
+    write_model(root,[('A','1-U<&".png',(p,q,r)),('B','1-L<&".png',(p,q,r)),
+        ('E','1-E<&".png',((900,900),)),('F','1-F<&".png',((900,900),)),
+        ('cno','1-CNT<&".png',(p,q)),('cno','2-CNT<&".png',(q,r)),('cno','1-OTHER.png',())])
+    # Syntax-only synthetic positions, never derived from file prefixes.
+    order = write_stack_order(tmp_path/'order.json',['U<&"','E<&"','OTHER','CNT<&"','F<&"','L<&"'])
+    related = tmp_path/'relations'
+    assert run_import(ImportOptions(root=root,out=related,stack_order=order))[1] == 0
+    doc = json.loads((related/'import-report.json').read_text())
+    assert doc['extraction'][0]['summary']['resolved_relation_count'] == 2
+    assert doc['extraction'][0]['summary']['needs_confirmation_relations'] == 2
+    assert doc['extraction'][0]['summary']['skipped_upper_electrode_layers'] == 2
+    assert doc['extraction'][0]['summary']['skipped_upper_cno_layers'] == 2
+    html = (related/'preview.html').read_text()
+    expected = ['position 0: electrode / U&lt;&amp;&quot;', 'position 1: electrode / E&lt;&amp;&quot;',
+        'position 2: cno / OTHER','position 3: cno / CNT&lt;&amp;&quot;',
+        'position 4: electrode / F&lt;&amp;&quot;','position 5: electrode / L&lt;&amp;&quot;']
+    offsets = [html.index(text) for text in expected]
+    assert offsets == sorted(offsets)
+    assert 'Selected upper: A@0:U&lt;&amp;&quot;; lower: B@5:L&lt;&amp;&quot;' in html
+    assert '1:E&lt;&amp;&quot;' in html and '2:OTHER' in html and '4:F&lt;&amp;&quot;' in html
+    assert 'U<&"' not in html and 'CNT<&"' not in html
+    image = tmp_path/'image_only'
+    assert run_import(ImportOptions(root=root,out=image))[1] == 0
+    doc = json.loads((image/'import-report.json').read_text())
+    html = (image/'preview.html').read_text()
+    assert 'CNT mode: image_only' in html and 'Geometry only:' in html
+    assert 'Resolved top-to-bottom order' not in html and 'Selected upper:' not in html and 'Endpoint source XY' not in html
+    assert len(doc['preview'][0]['component_crops']) == 2
+    assert all(c['cnt_order_index'] is None and c['relation'] is None for c in doc['extraction'][0]['components'])

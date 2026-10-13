@@ -2,10 +2,11 @@
 
 DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품을 찾는다. 결과는 비교군 후보 목록이며 원인 판정이나 위험 예측이 아니다.
 
-이 문서는 실행 순서대로 쓰여 있다. 처음이면 1~6장을 차례로 따라 하면 된다. 세부 규칙의 근거는 [data_contract.md](data_contract.md), [training.md](training.md), [validation.md](validation.md)에 있다.
+이 문서는 실행 순서대로 쓰여 있다. 처음이면 1~6장을 차례로 따라 하면 된다. 기본 경로는 **image_only**이며 순서 파일을 쓰지 않는다. 선택적 relations 모드는 11장에서 별도로 준비한다. 세부 규칙의 근거는 [data_contract.md](data_contract.md), [training.md](training.md), [validation.md](validation.md)에 있다.
 
 먼저 알아 둘 것:
 
+- 순서 파일 없이 CNT를 이미지 채널로만 사용한다. 모든 CNT foreground의 합집합을 `cnt`로 내보내며 `connections: []`, `connectivity_observation: "unavailable"`이다. 연결 위치나 상하 위치를 추정하지 않는다.
 - 입력은 원본 layout 형상과 CNT 이미지뿐이다. hotspot, CA, fab 값은 받지 않는다(있으면 오류).
 - 지금까지 검증한 것은 **합성 PNG뿐**이다. 실제 자료 호환성, 검색 품질, 전기적 연결은 검증되지 않았다.
 - 실제로 실행해 본 운영체제는 **macOS뿐**이다. Windows와 Linux에서는 한 번도 실행되지 않았다. Windows에서는 2장의 설치 확인(테스트 실행)을 먼저 한다.
@@ -17,15 +18,16 @@ DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품
 | 0 | 설치와 확인 | `pip install`, `pytest` | Python 3.12, wheel 폴더 | `.venv` |
 | 1 | PNG 폴더 준비 | (사용자) | 모델별 전극·CNT PNG | 입력 폴더 |
 | 2 | 검사 | `psdl1.import_png` | 입력 폴더 | 보고서, preview |
-| 3 | 연결 확인 | (사용자) `preview.html` | 2의 결과 | 규칙이 맞는지 판단 |
+| 3 | 형상 확인(image_only) | (사용자) `preview.html` | 2의 결과 | CNT 형상·여백 확인 |
 | 4 | grid 고르기 | `psdl1.import_png --inspect-grids` | 후보 grid 숫자 | grid별 경고 |
-| 5 | 내보내기 | `psdl1.import_png --export` | 계보 파일, grid | `manifest.json`, NPY |
-| 6 | 묶음 확인 | `--verify-bundle`, `psdl1.data` | 5의 결과 | 확인 결과, 격자 보고서 |
-| 7 | 학습 | `psdl1.train` | manifest, 분할, (정답) | `dl1.pt` |
-| 8 | 검색 | `psdl1.search` | checkpoint, manifest 2개 | 검색 결과 JSON |
-| 9 | 평가 | `psdl1.evaluate` | 정답이 있을 때 | 평가 JSON |
+| 5 | 계보 파일 준비 | (사용자) metadata JSON | 모든 모델의 계열·설계 버전 | 계보 파일 |
+| 6 | 내보내기 | `psdl1.import_png --export` | 계보 파일, grid | `manifest.json`, NPY |
+| 7 | 묶음 확인 | `--verify-bundle`, `psdl1.data` | 6의 결과 | 확인 결과, 격자 보고서 |
+| 8 | 학습 | `psdl1.train` | manifest, 분할, (정답) | `dl1.pt` |
+| 9 | 검색 | `psdl1.search` | checkpoint, manifest 2개 | 검색 결과 JSON |
+| 10 | 평가 | `psdl1.evaluate` | 정답이 있을 때 | 평가 JSON |
 
-연결만 확인하려면 2~3까지만 하면 된다. 2~4는 계보 정보와 grid 없이 실행된다.
+형상만 확인하려면 2~3까지만 하면 된다. 연결 추출이 필요할 때만 11장의 선택적 경로를 쓴다. 2~3은 계보 정보와 grid 없이 실행된다. 4의 grid 비교에는 사용자가 후보 숫자를 직접 준다.
 
 ## 2. 설치와 확인
 
@@ -67,11 +69,11 @@ uv pip install --no-index --find-links /approved/wheels -e ".[png]"
 .venv/bin/python -m pytest -p no:warnings
 ```
 
-이후 명령의 `PY`는 `.venv/bin/python`을 뜻한다.
+이후 POSIX 명령의 `$PNG_ROOT`, `$INSPECT_OUT`, `$EXPORT_OUT`, `$METADATA_JSON` 및 grid·보고서 경로 변수는 사용자가 정한 값으로 설정한다. 출력 경로는 매번 새 이름을 쓴다. Windows의 `PY` 표기는 해당 Python 실행 파일로 바꾼다.
 
 ### 테스트 결과 보는 법
 
-개발 기기에서는 `484 passed, 1 skipped`가 나온다(약 80초). 건너뛴 1개는 선택형 학습 테스트다. Windows에서 실패가 나오면 실패한 테스트 이름과 메시지를 그대로 전달한다. 실제 자료를 넣기 전에 고칠 수 있다.
+O1c 개발 기기 검증은 `551 passed, 1 skipped`였다(약 91초, 합성 자료). O2에서 추가한 검증은 아래 절차와 함께 다시 실행한다. 수치는 해당 시점의 실행 기록이며 대상 OS의 성공을 보증하지 않는다. 건너뛴 1개는 선택형 학습 테스트다. Windows에서 실패가 나오면 실패한 테스트 이름과 메시지를 그대로 전달한다. 실제 자료를 넣기 전에 고칠 수 있다.
 
 ## 3. PNG 폴더 준비
 
@@ -86,7 +88,7 @@ uv pip install --no-index --find-links /approved/wheels -e ".[png]"
     <전극명>\
       4-GAT.png
     cno\
-      006_OCNT.png
+      1-OCNT.png
 ```
 
 | 항목 | 규칙 |
@@ -94,10 +96,13 @@ uv pip install --no-index --find-links /approved/wheels -e ".[png]"
 | 모델명 폴더 | 그대로 제품 이름(`product_id`)이 된다 |
 | 전극명 폴더 | 그대로 전극 이름이자 역할 이름(`role`)이 된다 |
 | `cno` 폴더 | CNT 전용. 소문자 `cno`여야 한다. `CNO`처럼 대소문자가 다르면 오류다 |
-| 파일명 | `<순번>-<layer>.png` 또는 `<순번>_<layer>.png`. 숫자 뒤 첫 `-`/`_`가 구분자이고 나머지 전체가 layer 이름이다 |
-| 순번 | 모델 전체에서 공통인 위→아래 순서. 1이 가장 위. `006`과 `6`은 같은 숫자다 |
-| 같은 순번 | 한 모델 안에서 같은 순번은 같은 layer 이름이어야 한다 |
-| 이름 비교 | 글자 그대로 비교한다. 대소문자, 한글 조합 방식(NFC/NFD)이 다르면 다른 이름이다. 별칭을 자동으로 합치지 않는다 |
+| 파일명 | `<번호>-<layer>.png` 또는 `<번호>_<layer>.png`. 숫자 뒤 첫 `-`/`_`가 구분자이고 나머지 전체가 layer 이름이다 |
+| 파일명 숫자 | 전극·cno 모두 양의 정수와 파일명 문법만 검사한다. **기록용(provenance only)**이며 순서·identity에 쓰지 않는다. 원본 파일을 번호에 맞춰 **이름 변경하지 않는다** |
+| 번호 재사용 | 서로 다른 layer 이름에 같은 번호를 써도 된다. 다른 전극 폴더의 같은 layer가 다른 번호여도 된다 |
+| 중복 전극 × layer | 한 전극 폴더 안에서 같은 layer 파일이 둘이면 오류이며 두 경로를 보고한다 |
+| 같은 CNT 이름 | 여러 cno 파일을 허용하며 source asset과 component는 각각 보존한다. 이미지 채널에서만 전체 CNT를 합친다. 같은 이름·같은 decoded full mask는 identity를 구분할 수 없어 거부한다 |
+| CNT 이름 종류 | 지금까지 알려진 OCNT/GCNT/PCNT는 whitelist가 아니다. 다른 유효한 이름도 받는다 |
+| 이름 비교 | identity·manifest·vocabulary는 원본 철자를 보존한다. 선택적 순서 파일 매칭만 `casefold`로 대소문자를 무시한다. 한 모델 안의 두 layer 이름이 대소문자만 다르면 오류다. NFC/NFD는 정규화하지 않는다 |
 | 그 밖의 폴더 | 입력 폴더 바로 아래의 모든 폴더는 모델로 본다. 모델이 아닌 폴더가 있으면 전체가 오류다 |
 
 ### 이미지 규칙
@@ -121,11 +126,17 @@ uv pip install --no-index --find-links /approved/wheels -e ".[png]"
 - 파일 끝(IEND) 뒤에 남은 바이트, 잘린 파일, CRC 오류
 - 방향 정보(EXIF/XMP orientation)가 기본값이 아닌 파일
 
-## 4. 검사 — 연결 확인과 grid 고르기
+## 4. 검사 — CNT 형상 확인과 grid 고르기
 
 ### 4.1 검사 실행
 
 계보 정보와 grid 없이 실행된다. 출력 폴더는 **입력 폴더 밖의 새 폴더**여야 한다. 이미 있는 폴더는 비어 있어도 거부한다.
+
+```bash
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$INSPECT_OUT"
+```
+
+Windows (명령 프롬프트):
 
 ```bat
 PY -m psdl1.import_png --root D:\png_root --out D:\out\inspect1
@@ -146,69 +157,32 @@ Windows에서는 출력 경로를 짧게 잡는다. 생성되는 파일 이름�
 
 ```text
 D:\out\inspect1\
-  import-report.json       보고서 (dl1_png_import_v2)
-  preview.html             연결 확인 화면 (인터넷 없이 열림)
+  import-report.json       보고서 (dl1_png_import_v3)
+  preview.html             CNT 형상 확인 화면 (인터넷 없이 열림)
   preview\                 preview가 쓰는 이미지
   bundle-integrity.json    위 파일들의 SHA-256 목록
 ```
 
-### 4.3 preview로 연결 확인
+### 4.3 preview로 CNT 형상 확인
 
-`preview.html`을 브라우저로 연다.
+`preview.html`을 브라우저로 연다. 화면과 CLI `completed` 이벤트의 **CNT mode: image_only**를 확인한다.
+CNT 파일별 이름, bbox, 픽셀 수, `cnt_image_only_no_relations` 사유가 보인다.
+회색 사각형은 덩어리의 표시용 중심이며 연결 위치가 아니다. 검정 테두리는 CNT 형상,
+회색 전극은 주변 형상이고 보라 사각형은 중앙 2×2 참고 영역이다.
+상하 순서, 선택된 위/아래 전극, 연결 끝점은 생성하지 않는다.
 
-전체 그림의 표시:
+확대 그림은 사람이 보는 용도다. **모델 입력은 그대로 전체 frame**이다.
+원본 여백도 모델 입력과 전체 CNT 이미지에 그대로 남는다.
 
-| 표시 | 뜻 |
-|---|---|
-| 초록 원 | 연결이 정해짐 |
-| 주황 사각형+원 | 연결은 정해졌지만 **확인 필요**(중간 layer를 건너뜀) |
-| 빨간 X | 미해결 |
-| 보라 사각형 | 중앙 2×2 참고 영역. 참고 표시일 뿐 자르는 데 쓰지 않는다 |
+### 4.4 이미지 채널과 연결 정보의 구분
 
-CNT 덩어리별 확대 그림(주변 64픽셀 포함)의 색:
+모델의 모든 CNT foreground를 합친 기존 `cnt` mask는 이미지 채널이다.
+같은 이름의 CNT 파일도 각각 검사하고 component geometry를 따로 기록하지만,
+채널에는 전체 합집합을 사용한다. CNT가 보인다는 사실을 endpoint 관계로 바꾸지 않는다.
+`connections: []`, `connectivity_observation: "unavailable"`로 내보낸다.
 
-| 색 | 뜻 |
-|---|---|
-| 파랑 | 선택된 위쪽 전극 |
-| 분홍 | 선택된 아래쪽 전극(미해결이면 그 layer의 후보 전부) |
-| 회색 | 그 밖의 전극 |
-| 검정 테두리 | CNT 덩어리 |
-| 노랑 | CNT·위 전극·아래 전극이 모두 겹치는 영역 |
-| 초록 십자 | 연결 위치(끝점) |
-
-확대 그림은 사람이 보는 용도다. 모델 입력은 그대로 전체 frame이다.
-
-### 4.4 연결을 정하는 규칙
-
-CNT 덩어리 하나마다 다음 순서로 정한다.
-
-1. CNT와 겹치는 전극을 찾는다.
-2. CNT 순번보다 작은 쪽에서 가장 가까운 layer가 위쪽, 큰 쪽에서 가장 가까운 layer가 아래쪽이다. 더 먼 layer는 쓰지 않는다.
-3. 위·아래 각각 전극이 정확히 하나여야 한다.
-4. CNT·위 전극·아래 전극이 같은 위치에서 겹쳐야 한다.
-5. 겹친 영역 안의 한 픽셀을 연결 위치로 쓴다.
-
-덩어리는 상하좌우로 붙은 픽셀끼리 묶는다(대각선은 별개).
-
-미해결 사유(`unresolved_reasons`)와 뜻:
-
-| 사유 | 뜻 |
-|---|---|
-| `missing_upper_overlap` / `missing_lower_overlap` | 위쪽/아래쪽에 겹치는 전극이 없음 |
-| `multiple_upper_electrodes_on_selected_layer` / `multiple_lower_...` | 선택된 layer에 겹치는 전극이 둘 이상 |
-| `same_bound_element` | 위와 아래가 같은 전극·layer |
-| `equal_stack_overlap` | CNT와 같은 순번의 전극이 겹침 |
-| `empty_common_intersection` | 위·아래 전극이 CNT의 서로 다른 위치에서만 겹침 |
-| `disconnected_common_intersection_possible_multicontact` | 겹친 영역이 둘 이상으로 떨어져 있음(CNT 하나에 연결이 여러 개일 가능성) |
-
-미해결 덩어리는 연결 관계를 만들지 않는다. 형상은 전체 CNT 이미지에 그대로 남는다.
-
-아직 사용자 확정이 아닌 해석:
-
-- **중간 layer를 건너뛴 연결**을 관계로 인정하는 것. preview에서 주황으로 표시된 연결이 실제로 맞는지 확인이 필요하다.
-- **같은 layer에 후보 전극이 여럿일 때** 미해결로 두는 것.
-
-자동 추출은 전기적 연결 검증이 아니다. 보고서의 `electrical_verification`은 항상 `not_performed`다.
+4-neighbour(상하좌우; 대각선만 붙은 픽셀은 별개)는 사용자가 확인한 규칙이다.
+이것은 전기적 연결 검증이 아니다. 연결 추출은 11장의 선택적 relations 모드에서만 한다.
 
 ### 4.5 보고서에서 볼 곳 (`import-report.json`)
 
@@ -217,14 +191,19 @@ CNT 덩어리 하나마다 다음 순서로 정한다.
 | `export_status` | `not_requested`(검사만), `blocked`(조건 미충족), `exported`, `failed`, `interrupted` |
 | `pending_prerequisites` | 내보내기를 막은 사유. 예: `explicit_metadata_missing` |
 | `inventory.models[].errors` / `warnings` | 파일별 오류와 경고(무시된 파일, 빈 전극 폴더 등) |
-| `inventory.models[].stack_table` | 모델의 순번–layer 표 |
+| `cnt_mode`, `inventory.models[].cnt_mode`, `extraction[].cnt_mode` | `image_only` 또는 `relations`; 모드가 일치해야 한다 |
+| `extractor_run_status` | image_only는 `not_run_image_only`(geometry inventory만 수행), relations는 `ran`/`partial`/`blocked`; coverage와 별개 |
+| `inventory.models[].assets[].filename_number` | 모든 파일의 원본 숫자. provenance only; 순서·identity가 아니다 |
+| `stack_order` | 선택적 순서 파일의 schema/source/raw-byte `file_sha256`/`document`/`errors`; image_only는 파일 evidence 없음 |
+| `inventory.models[].stack_order` | image_only는 `status: not_used`, 비어 있는 order 및 null digest; relations는 `resolved`/`invalid`, `selected_list`, `resolved_order`, `ignored_names`, `matched_pairs`, `resolved_order_sha256`, `errors` |
+| `resolved_order[]` | 0부터 연속인 `order_index`, source spelling `name`, `kind`, 모든 별도 source의 `asset_ids`; 파일 번호 필드 없음 |
 | `inventory.models[].resource_estimate` | 용량 추정. 아래 4.6 참고 |
 | `inventory.role_union`, `electrode_layer_union` | 전체 모델의 전극 이름, 전극 layer 이름 |
 | `inventory.unique_roles`, `unique_electrode_layers` | 한 모델에만 있는 이름 |
 | `duplicate_geometry` | 형상이 완전히 같은 파일/모델(중복 제품 가능성). 자동으로 합치지 않는다 |
-| `extraction[].summary` | 덩어리 수, 해결 수, 미해결 수, 확인 필요 수 |
+| `extraction[].summary` | image_only는 geometry 덩어리 K/관계 0이며 실패한 접촉을 뜻하지 않음; relations는 해결·미해결·확인 필요 수 |
 | `extraction[].connectivity_observation` | 추출 범위: `complete`(전부 해결), `partial`, `unavailable`(해결 없음) |
-| `extraction[].components[]` | 덩어리별 위치(`bbox_xyxy_px`), 후보, 선택, 미해결 사유, `relation` |
+| `extraction[].components[]` | geometry bbox/픽셀 수/source path/CNT 이름; image_only는 `cnt_order_index: null`, 후보 없음, `relation: null`; `cnt_filename_number`는 provenance |
 | `relation.representative_xy_px` | 연결 위치(원본 픽셀) |
 | `relation.needs_confirmation` | 건너뛴 layer가 있으면 true |
 | `relation.skipped_upper_layers` / `skipped_lower_layers` | 건너뛴 전극 layer와 CNT layer |
@@ -235,7 +214,7 @@ CNT 덩어리 하나마다 다음 순서로 정한다.
 
 ### 4.6 용량 추정
 
-기존 manifest 형식은 연결 하나마다 전체 크기의 mask 파일이 하나씩 필요하다. CNT가 많으면 파일과 메모리가 그만큼 늘어난다.
+image_only는 **R=0**이므로 연결별 mask를 만들지 않는다. 선택적 relations 모드의 기존 manifest 형식은 연결 하나마다 전체 크기의 mask 파일이 하나씩 필요하다. CNT가 많으면 파일과 메모리가 그만큼 늘어난다.
 
 | 필드 | 뜻 |
 |---|---|
@@ -244,7 +223,8 @@ CNT 덩어리 하나마다 다음 순서로 정한다.
 | `generated_mask_asset_count` | 내보낼 mask 파일 수 |
 | `projected_bool_npy_export_bytes` | 내보낼 NPY 전체 크기(바이트) |
 | `projected_load_manifest_retained_float32_mask_bytes` | 읽을 때 메모리에 남는 mask 크기(바이트) |
-| `all_components_resolved` | 덩어리가 모두 해결됐을 때의 값 |
+| `all_components_resolved` | image_only는 null, relations에서만 모든 덩어리 해결 시 비용 시나리오 |
+| `all_components_resolved_applicability` | image_only는 `not_applicable_image_only`; 이것을 실행 계획으로 해석하지 않는다 |
 
 이 값은 최대 메모리나 실행 시간 예측이 아니다. 디코딩 중에는 픽셀당 약 17~18바이트가 일시적으로 더 쓰인다. 자원이 충분한지는 이 숫자를 보고 사용자가 판단한다. 프로그램이 정한 한도는 없다.
 
@@ -254,7 +234,7 @@ grid는 모델에 넣기 전에 전체 이미지를 줄이는 정사각형 한 �
 
 - 작으면 가는 선이 사라지거나 떨어진 패턴이 붙는다. 대신 빠르다.
 - 크면 형상이 보존되지만 메모리와 시간이 늘어난다.
-- 연결 추출은 항상 원본 해상도에서 하므로 grid와 무관하다.
+- image_only의 grid 검사는 전극·valid·전체 CNT 형상을 본다. 선택적 relations 추출은 원본 해상도에서 하므로 grid와 무관하다.
 - 학습한 checkpoint는 그 grid에 묶인다. 검색할 제품도 같은 grid로 내보낸다.
 
 기준: 가장 가는 선이 줄어든 뒤에도 2칸 이상 남아야 한다.
@@ -264,6 +244,12 @@ grid ≥ 2 × (이미지 긴 변 픽셀 수) ÷ (가장 가는 선폭 픽셀 수
 ```
 
 후보를 직접 넣어 비교한다. 기본값은 없고, 프로그램이 골라 주지 않는다.
+
+```bash
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$GRID_INSPECT_OUT" --inspect-grids "$GRID_A" "$GRID_B"
+```
+
+Windows (명령 프롬프트):
 
 ```bat
 PY -m psdl1.import_png --root D:\png_root --out D:\out\grid1 --inspect-grids 256 512 1024
@@ -302,20 +288,26 @@ PY -m psdl1.import_png --root D:\png_root --out D:\out\grid1 --inspect-grids 256
 
 ### 5.2 내보내기 실행
 
+```bash
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$EXPORT_OUT" --export --metadata "$METADATA_JSON" --candidate-grid "$CANDIDATE_GRID"
+```
+
+Windows (명령 프롬프트):
+
 ```bat
 PY -m psdl1.import_png --root D:\png_root --out D:\out\bundle1 --export --metadata D:\meta\meta.json --candidate-grid 512
 ```
 
 - 계보 파일이나 grid가 빠지면 종료 코드 2로 끝나고 `manifest.json`을 만들지 않는다. 보고서와 preview만 남는다.
 - 모델 하나라도 입력 오류가 있으면 전체를 내보내지 않는다. 일부만 내보내지 않는다.
-- 미해결 CNT는 오류가 아니다. 그 모델은 `partial` 또는 `unavailable`로 내보낸다.
+- 순서 파일은 기본 경로에 필요 없다. cno가 있어도 image_only로 내보낸다. 모든 CNT 형상은 남지만 관계는 없고 연결 상태는 `unavailable`이다. 선택적 relations의 미해결 CNT도 형상을 보존한다.
 
 만들어지는 것:
 
 ```text
 D:\out\bundle1\
   manifest.json            기존 형식(dl1_shape_v1_draft). 그대로 학습·검색에 쓴다
-  assets\*.npy             전극, 관측 범위, 전체 CNT, 연결별 mask (bool)
+  assets\*.npy             전극, 관측 범위, 전체 CNT (bool); relations에서만 연결별 mask 추가
   import-report.json
   preview.html, preview\
   bundle-integrity.json
@@ -324,6 +316,13 @@ D:\out\bundle1\
 manifest의 `unit_size_um`에는 **전체 이미지 범위**(가로×0.1, 세로×0.1 µm)가 들어간다. 단일 unit 크기가 아니다.
 
 ### 5.3 묶음 확인
+
+```bash
+.venv/bin/python -m psdl1.import_png --verify-bundle "$EXPORT_OUT"
+.venv/bin/python -m psdl1.data "$EXPORT_OUT/manifest.json" --report "$VALIDATOR_REPORT"
+```
+
+Windows (명령 프롬프트):
 
 ```bat
 PY -m psdl1.import_png --verify-bundle D:\out\bundle1
@@ -349,7 +348,7 @@ PY -m psdl1.data D:\out\bundle1\manifest.json --report D:\out\grid-report1.json
 
 ### 6.2 정답 파일 (`relations.csv`, 선택)
 
-머리글 없는 CSV다. 형식은 아직 초안이다.
+머리글 없는 CSV다. 형식은 아직 초안이다. 이것은 제품 쌍의 학습 정답이며 선택적 CNT relations 모드와 별개다.
 
 ```text
 MODEL-A,MODEL-B,similar
@@ -362,6 +361,13 @@ MODEL-A,MODEL-C,different
 - 정답이 없으면 `--unlabelled-negatives`로 "적지 않은 쌍은 다르다"고 가정할 수 있다. 실제로 비슷한 제품을 밀어낼 수 있는 실험 옵션이다. 같은 계열끼리는 이 경우에도 "모름"이다.
 
 ### 6.3 학습
+
+```bash
+.venv/bin/python -m psdl1.train --manifest "$EXPORT_OUT/manifest.json" --split "$SPLIT_JSON" --relations "$RELATIONS_CSV" --out "$TRAIN_OUT" --epochs 100 --batch-size 8 --lr 0.0003
+.venv/bin/python -m psdl1.train --manifest "$EXPORT_OUT/manifest.json" --split "$SPLIT_JSON" --relations "$RELATIONS_CSV" --out "$TRAIN_OUT" --resume "$TRAIN_OUT/dl1.pt" --epochs 150
+```
+
+Windows (명령 프롬프트):
 
 ```bat
 PY -m psdl1.train --manifest D:\out\bundle1\manifest.json --split D:\data\split.json --relations D:\data\relations.csv --out D:\runs\dl1 --epochs 100 --batch-size 8 --lr 0.0003
@@ -392,6 +398,12 @@ PY -m psdl1.train --manifest D:\out\bundle1\manifest.json --split D:\data\split.
 
 manifest 두 개를 받는다. 둘 다 같은 grid로 내보낸 것이어야 한다.
 
+```bash
+.venv/bin/python -m psdl1.search --ckpt "$TRAIN_OUT/dl1.pt" --query-manifest "$QUERY_EXPORT_OUT/manifest.json" --query "$QUERY_ID" --candidates-manifest "$EXPORT_OUT/manifest.json" --topk 5 --out "$SEARCH_OUT"
+```
+
+Windows (명령 프롬프트):
+
 ```bat
 PY -m psdl1.search --ckpt D:\runs\dl1\dl1.pt --query-manifest D:\out\query1\manifest.json --query NEW-MODEL --candidates-manifest D:\out\bundle1\manifest.json --topk 5 --out D:\out\search1.json
 ```
@@ -399,6 +411,12 @@ PY -m psdl1.search --ckpt D:\runs\dl1\dl1.pt --query-manifest D:\out\query1\mani
 **이름 제한**: 전극 폴더명이 그대로 역할 이름이 된다. 학습에 없던 전극 이름이나 layer 이름을 가진 제품은 검색할 수 없다. 찾으려는 제품이 그러면 결과가 `unavailable`이 되고, 후보가 그러면 사유와 함께 `excluded`에 들어간다. 같은 이름은 같은 것으로 취급되지만, 두 전극이 실제로 같은 기능이라는 뜻은 아니다. 별칭을 맞추는 기능은 없다.
 
 ### 6.5 평가 (정답이 있을 때)
+
+```bash
+.venv/bin/python -m psdl1.evaluate --ckpt "$TRAIN_OUT/dl1.pt" --manifest "$EXPORT_OUT/manifest.json" --split "$SPLIT_JSON" --relations "$RELATIONS_CSV" --topk 5 --out "$EVALUATION_OUT"
+```
+
+Windows (명령 프롬프트):
 
 ```bat
 PY -m psdl1.evaluate --ckpt D:\runs\dl1\dl1.pt --manifest D:\out\bundle1\manifest.json --split D:\data\split.json --relations D:\data\relations.csv --topk 5 --out D:\out\evaluation1.json
@@ -483,7 +501,8 @@ PY -m psdl1.evaluate --ckpt D:\runs\dl1\dl1.pt --manifest D:\out\bundle1\manifes
 | `nonopaque PNG pixels`, tRNS 오류 | 투명도가 있다. 불투명으로 다시 저장한다 |
 | `APNG is unsupported` | APNG 청크가 있다. 일반 PNG로 다시 저장한다 |
 | `shape mismatch` | 한 모델 안에 크기가 다른 PNG가 있다 |
-| `conflicting stack` | 같은 순번에 다른 layer 이름이 있다 |
+| `stack_order_case_collision` | 한 모델의 이름이 대소문자만 다르다. 어느 원본 이름이 맞는지 확인한다. 번호를 바꿔 해결하지 않는다 |
+| `ambiguous_cnt_asset_identity` | 같은 CNT 이름의 decoded full mask가 같다. 보고된 모든 파일의 중복 여부를 확인하고 안정된 source 식별 정책을 요청한다. 번호 변경·자동 병합으로 해결하지 않는다 |
 | `duplicate normalized binding` | 같은 전극·layer 파일이 둘이다(예: `6-X.png`와 `006_X.png`) |
 | `unsupported directory layout` | 모델/전극 폴더 구조가 아닌 폴더가 있다. 이전 실행의 출력이 입력 폴더 안에 남은 경우도 이렇게 나온다 |
 | DecompressionBomb 오류 | 이미지가 Pillow 기본 한도를 넘는다. `--png-max-image-pixels <픽셀 수>`를 직접 준다 |
@@ -514,6 +533,9 @@ PY -m psdl1.evaluate --ckpt D:\runs\dl1\dl1.pt --manifest D:\out\bundle1\manifes
 |---|---|
 | 중간 layer를 건너뛴 연결을 인정할지 | 구현 해석. preview에서 확인 필요 |
 | 같은 layer에 후보 전극이 여럿일 때의 규칙 | 미정. 지금은 미해결로 둔다 |
+| 같은 전극 연결 규칙 | 사용자가 확인했지만 relations에는 아직 미적용(`same_electrode_required: false`); 다른 전극 간 관계도 나올 수 있는 알려진 gap |
+| 동일 이름·동일 CNT mask | 현재 거부. 별도 stable source ID 계약이 필요하며 prefix 변경은 해법이 아님 |
+| CNT 이름 whitelist | OCNT/GCNT/PCNT만으로 제한하지 않음; 선택적 순서 파일에 있는 다른 이름도 허용 |
 | 실제 grid와 최소 선폭 | 폐쇄망에서 4.7로 정한다 |
 | 계열·버전 정보, 역할/layer 별칭 대응 | 사용자가 공급. 별칭 대응 기능 없음 |
 | 정답 형식과 수락 기준(G6) | 미정 |
@@ -591,6 +613,150 @@ PNG 가져오기를 쓰지 않고 mask를 `.npy`로 직접 준비할 수도 있�
 
 `hotspot`, `CA`, `fab`이라는 이름의 필드, 알 수 없는 필드, 중복 key는 모두 오류다.
 
-## 11. 수치 저장소와의 연결
+## 11. 선택 사항 — 순서 파일로 relations 모드 사용
+
+기본 image_only 경로에는 이 장이 필요 없다. 원본 좌표의 연결 위치 후보를 검토할 때만
+`--stack-order PATH`를 준다. 이때 `cnt_mode: relations`가 된다. 잘못된 파일을 주면
+종료 코드 2로 끝나며 image_only로 자동 전환하지 않는다.
+
+**알려진 gap:** 사용자는 "한 CNT segment가 같은 전극의 layer 조각끼리 연결된다"고 확인했다.
+그러나 relations 모드는 아직 이 규칙을 적용하지 않는다(`same_electrode_required: false`, inactive).
+따라서 서로 다른 전극 폴더 사이의 관계도 만들 수 있다. 이 규칙을 구현·검토하기 전에는
+relations 결과를 실제 연결 판단에 의존하지 않는다. image_only는 이 관계 추출을 실행하지 않는다.
+
+### 11.1 순서 파일 준비 — 검사 전에 하는 별도 준비
+
+[configs/stack-order.json](../configs/stack-order.json)은 **2026-10-13 사용자가 공급한 13-name 참조**다.
+해당 자료에 대한 참조이며 다른 자료의 물리 순서나 보편적인 CNT 위치를 주장하지 않는다.
+파일을 PNG 입력 tree 밖에 둔다. 프로그램에는 CNT 이름별 위치가 하드코딩되어 있지 않다.
+
+아래는 **문법만 보이는 합성 예시(syntax only)**다. 실제 위치를 지정하는 예제가 아니다.
+
+```json
+{
+  "stack_order_schema_version": "dl1_png_stack_order_v1",
+  "order": ["SYNTHETIC_TOP", "SYNTHETIC_CNT", "SYNTHETIC_BOTTOM"]
+}
+```
+
+- 한 JSON의 `order` 목록을 모든 모델에 공통으로 적용한다. 위→아래로 전극 layer 이름과 CNT 이름을 섞어 적는다.
+- 모델에 없는 이름은 정상이며 `ignored_names`에 남는다. 모델에 있는 모든 전극 layer/CNT 이름은 목록에 있어야 한다(흰색 CNT 파일도 포함).
+- 이름 매칭은 `casefold`로 대소문자를 무시한다. PXL ↔ pxl 매칭은 `matched_pairs`에 기록되지만 manifest·identity·vocabulary에는 원본 pxl 철자가 남는다.
+- 한 모델의 두 source 이름 또는 order의 두 항목이 대소문자만 다르면 오류다. NFC/NFD는 합치지 않는다.
+- 같은 CNT 이름의 여러 파일은 하나의 order 위치를 공유하지만 source asset/component는 별개다. 관계 추출에서 파일을 합치지 않는다.
+- 전극·cno의 숫자는 여기서도 provenance only다. 순서에 맞춰 원본 파일을 이름 변경하지 않는다.
+- UTF-8(LF/CRLF, 한 개의 선행 BOM 허용)로 저장한다. UTF-16/UTF-32, NUL, 주석, trailing JSON, 중복 key, NaN/Infinity는 거부된다.
+- root key는 `stack_order_schema_version`과 `order` 두 개뿐이다. `models`/`default` override는 없다. 이름은 비어 있거나 공백·control·unpaired surrogate를 포함하면 안 된다.
+- 같은 전극 폴더의 같은 layer 중복은 여전히 오류다. 서로 다른 폴더의 같은 layer는 번호가 달라도 같은 이름 위치에 놓인다.
+- 이미지 겹침, 파일 번호, CNT 이름 자체에서 상하 순서를 추정하지 않는다.
+
+### 11.2 선택적 검사·내보내기·확인
+
+POSIX에서는 아래 경로 변수를 사용자 값으로 설정한다. `STACK_ORDER_JSON`은 실제 입력의 참조이고
+`RELATIONS_INSPECT_OUT`/`RELATIONS_EXPORT_OUT`은 입력 밖의 새 폴더다. grid 값은 합성 문법 예시일 뿐 권장값이 아니다.
+
+```bash
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$RELATIONS_INSPECT_OUT" --stack-order "$STACK_ORDER_JSON"
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$RELATIONS_EXPORT_OUT" --stack-order "$STACK_ORDER_JSON" --export --metadata "$METADATA_JSON" --candidate-grid "$CANDIDATE_GRID"
+.venv/bin/python -m psdl1.import_png --verify-bundle "$RELATIONS_EXPORT_OUT"
+```
+
+Windows (명령 프롬프트; 경로에 공백/한글이 있어도 한 인수로 전달):
+
+```bat
+PY -m psdl1.import_png --root "D:\png_root" --out "D:\out\relations-inspect1" --stack-order "D:\meta\stack-order.json"
+PY -m psdl1.import_png --root "D:\png_root" --out "D:\out\relations-bundle1" --stack-order "D:\meta\stack-order.json" --export --metadata "D:\meta\meta.json" --candidate-grid 512
+PY -m psdl1.import_png --verify-bundle "D:\out\relations-bundle1"
+```
+
+`--verify-bundle`은 단독 모드다. 다른 입력 flag나 `--stack-order`를 같이 주지 않는다.
+원본 PNG와 순서 파일이 없어도 bundle에 저장된 document·hash·order evidence로 확인한다.
+Windows 형태의 argv, native 경로의 공백/한글, CRLF/BOM/snapshot은 합성 테스트로 확인하지만
+실제 Windows 호스트에서 실행됐다는 의미는 아니다. 기존 게시 방식과 Windows 제한은 8장 그대로다.
+
+### 11.3 선택적 관계 규칙과 preview
+
+preview의 **CNT mode: relations**와 `Resolved top-to-bottom order (user_supplied_order_file)`을 먼저 본다.
+표시되는 0-based 위치는 모델에 실제 있는 이름으로 필터한 order이며 번호가 아니다.
+
+1. 각 CNT 파일을 따로 4-neighbour component로 나눈다(사용자 확인됨).
+2. component와 겹치는 전극 중 order_index가 가장 가까운 위/아래 layer를 먼저 선택한다.
+3. 선택된 각 layer에서 전극이 하나여야 한다. 공통 교집합이 없거나 떨어진 영역이 여러 개면 미해결이다.
+4. CNT·위·아래 전극의 공통 교집합 내부 픽셀을 공유 끝점으로 쓴다(centroid 거리, y/x 동률 순).
+5. 가까운 pair가 실패해도 더 먼 pair로 넘어가지 않는다. CNT component당 관계는 최대 하나다.
+
+건너뛴 layer는 `skipped_upper_layers`/`skipped_lower_layers`에서 전극과 cno를 나눠 기록한다.
+같은 이름의 CNT 파일은 source 참조가 여러 개여도 한 plane으로 센다. 모델에 없는 참조 이름은
+건너뛴 layer가 아니다. 건너뜀의 물리적 해석과 같은 layer의 다중 전극 해소 규칙은 아직 미정이다.
+
+| preview 표시 | 뜻 |
+|---|---|
+| 초록 원/십자 | 추출된 공통 위치; 전기적 검증 아님 |
+| 주황 사각형+원 | 건너뛴 layer가 있어 확인 필요 |
+| 빨간 X | 미해결; 관계를 만들지 않음 |
+| 파랑 / 분홍 | 선택된 위 / 아래 전극 |
+| 회색 / 검정 / 노랑 | 다른 전극 / CNT 테두리 / 공통 교집합 |
+
+| component 사유 | 뜻 |
+|---|---|
+| `missing_upper_overlap`, `missing_lower_overlap` | 해당 쪽에 겹치는 전극 없음 |
+| `multiple_upper_electrodes_on_selected_layer`, `multiple_lower_electrodes_on_selected_layer` | 선택된 layer에 후보가 여럿 |
+| `same_bound_element` | 동일 element를 양 끝점으로 사용할 수 없음 |
+| `empty_common_intersection` | 두 전극이 CNT의 서로 다른 위치에서만 겹침 |
+| `disconnected_common_intersection_possible_multicontact` | 공통 영역이 여러 개라 한 접촉으로 확정하지 않음 |
+| `invalid_stack_order` | 순서 오류로 관계 추출이 막힘; 구체적 errors를 확인 |
+
+미해결 foreground도 전체 CNT 이미지에 남는다. `complete`는 추출 범위이며 전기적 검증이 아니다.
+이 규칙은 image_only에 적용되지 않으며 image_only의 geometry-only reason은 `cnt_image_only_no_relations`다.
+
+### 11.4 순서·migration 오류와 조치
+
+| 코드/진단 | 원인 | 조치 |
+|---|---|---|
+| `stack_order_read_error` | 파일 없음·directory·권한 오류 | 실제 파일과 접근 권한 확인; 절대 경로가 보고서에 복사되지 않음 |
+| `stack_order_encoding` | UTF-8이 아님 또는 raw NUL | UTF-8로 저장(선행 BOM 한 개 허용) |
+| `stack_order_json` | 주석·trailing content·잘못된 JSON | 표시된 line/column에서 strict JSON 문법 수정 |
+| `stack_order_duplicate_key` | 중복 JSON key | 중복 제거; nested key도 해당 |
+| `stack_order_nonfinite` | NaN/Infinity 또는 nonfinite 숫자 | 비유한 숫자 제거 |
+| `stack_order_schema` | root가 object가 아님 | 두 key를 가진 object 사용 |
+| `stack_order_fields` | key 누락/unknown(`models`/`default` 포함) | schema와 order 두 key만 남김 |
+| `stack_order_version` | version/type이 다름 | 정확한 `dl1_png_stack_order_v1` 사용 |
+| `stack_order_list_type` | order가 배열이 아님 | 이름 배열로 수정 |
+| `stack_order_identifier` | 빈 이름, 양끝 공백, control, surrogate, 잘못된 type | 원본 layer 이름의 유효한 문자열 사용 |
+| `stack_order_duplicate_name` | 목록의 exact 중복(모델에 없는 이름도 검사) | 항목 하나만 유지 |
+| `stack_order_case_collision` | order/source의 casefold 이름 충돌 | 보고된 두 이름과 경로를 확인; source spelling을 임의로 병합하지 않음 |
+| `stack_order_name_kind_collision` | 한 이름이 전극 layer와 cno 이름 모두로 쓰임 | 이름만으로 위치를 구분할 수 없으므로 원천 계약 확인 |
+| `stack_order_missing_electrode_names` | 모델의 전극 layer가 목록에 없음 | 해당 이름을 실제 위치에 추가; 위치를 추측하지 않음 |
+| `stack_order_missing_cnt_names` | 모델의 CNT 이름이 목록에 없음 | 흰색 파일도 이름을 추가; 임의 생략 금지 |
+| `ambiguous_cnt_asset_identity` | 같은 CNT 이름·동일 decoded full mask | 모든 파일의 중복 여부와 stable source ID 정책을 확인; 번호 변경으로 해결 안 됨 |
+| `invalid_stack_order` | 위 순서 오류가 있음 | 개별 errors 수정 후 새 output으로 다시 실행; 자동 image_only fallback 없음 |
+| `unsupported PNG report_schema_version` | v1/v2 또는 unknown sidecar | 원본 PNG에서 현재 importer로 다시 생성 |
+| `unsupported PNG algorithm_id/algorithm_version` | 현재 algorithm "2"가 아님 | 기존 endpoint를 재사용하지 말고 다시 생성 |
+| `invalid PNG stack order evidence` | mode/matched_pairs/index/digest 등 불일치 | bundle를 수정·재봉인하지 말고 원본에서 다시 생성 |
+| `unsupported bundle integrity version/algorithm` | v1/v2 또는 unknown integrity | 현재 v3 bundle을 새 directory에 생성 |
+
+### 11.5 Migration과 모드 일관성
+
+현재 sidecar는 **dl1_png_import_v3**, integrity는 **dl1_png_bundle_v3**, algorithm은 **"2"**다.
+예전 v1/v2 sidecar와 번호를 모델 공통 위치로 본 설명은 **superseded(폐기된 과거 규칙)**다.
+번호 비교 기반 동률·역전 검사와 순서 파일 없을 때의 export block도 현재 규칙이 아니다.
+
+기존 sidecar의 version label만 바꾸거나 endpoint를 그대로 재사용하지 않는다.
+원본 PNG·metadata·선택한 grid에서 새 output directory로 다시 가져오고 검증한다.
+image_only가 기본이며, 관계가 필요하면 실제 order 파일을 명시해서 다시 생성한다.
+이전 파일은 역사적 evidence로 남긴다. 바뀐 Product identity의 캐시/embedding은 재구축한다.
+
+같은 source의 image_only와 관계가 생성된 relations export는 **Product input identities가 다르다**.
+한 checkpoint/search 안에서 두 모드를 섞지 않는다. source geometry identity와 파일 번호 변경의
+불변성은 서로 다른 모드의 모델 입력이 같다는 뜻이 아니다. 관계가 없는 모델은 strict 입력이
+같을 수 있지만 checkpoint/search의 모드 정책은 일관되게 유지한다.
+
+strict `dl1_shape_v1_draft`, `SCHEMA_VERSION`, `MODEL_INPUT_VERSION` 및 NPY/checkpoint 숫자 계산은 그대로다.
+따라서 기존 manifest를 따로 떼어 generic NPY loader로 읽는 것은 여전히 가능하다.
+이미 생성된 static HTML도 열릴 수 있다. 새 PNG verifier/preview **reader**가 과거 sidecar를 거부하는
+것이지, 기존 NPY loader나 이미 열린 HTML을 소급해서 막는 기능은 아니다.
+resume의 코드·입력 provenance 검사는 계속 적용되며 hash/version bypass는 승인하지 않는다.
+
+## 12. 수치 저장소와의 연결
 
 검색 결과 JSON은 `particle-sim-compare`의 `simcompare.dl_results`가 파일로 읽어 원본 CA·line/pixel 값 옆에 붙인다. DL 점수는 수치 값을 바꾸지 않는다. 절차는 그 저장소의 `docs/handoff/commands.md`에 있다.

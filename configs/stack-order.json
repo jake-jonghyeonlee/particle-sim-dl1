@@ -1,0 +1,18 @@
+{
+  "stack_order_schema_version": "dl1_png_stack_order_v1",
+  "order": [
+    "PXL",
+    "SD2",
+    "SD1",
+    "OCNT",
+    "PCNT",
+    "GAT3",
+    "GCNT",
+    "OACT",
+    "GAT2",
+    "GATC",
+    "GAT1",
+    "ACT",
+    "BML"
+  ]
+}

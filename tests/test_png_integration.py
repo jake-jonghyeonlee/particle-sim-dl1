@@ -229,3 +229,32 @@ def test_png_offline_documents_preserve_pending_quality():
     assert "03bf3e33c7107af75297aa298fa323e24018f28d" in contract
     assert "No labels, split, aliases or grid" in readme
     assert "intensity" in training and "off by default" in training
+
+
+def test_order_cli_and_documented_preparation_contract(tmp_path):
+    """O17 follows A1/A2: main path has no flag, optional mode has its own prep."""
+    root = Path(__file__).resolve().parents[1]
+    usage = (root/'docs/USAGE.md').read_text()
+    readme = (root/'README.md').read_text()
+    contract = (root/'docs/data_contract.md').read_text()
+    main, optional = usage.split('## 11. 선택 사항 — 순서 파일로 relations 모드 사용',1)
+    main_commands = [fence for fence in main.split('```')[1::2] if fence.startswith(('bash','bat'))]
+    assert all('--stack-order' not in c for c in main_commands)
+    assert '기본 경로는 **image_only**' in main and '기록용(provenance only)' in main
+    assert optional.index('### 11.1 순서 파일 준비') < optional.index('### 11.2 선택적 검사')
+    assert '--stack-order "D:\\meta\\stack-order.json"' in optional
+    assert '2026-10-13 사용자가 공급한 13-name 참조' in optional
+    assert '문법만 보이는 합성 예시(syntax only)' in optional
+    assert '같은 전극' in optional and '아직 이 규칙을 적용하지 않는다' in optional
+    assert '한 checkpoint/search 안에서 두 모드를 섞지 않는다' in optional
+    for text in [usage,readme,contract]:
+        assert 'dl1_png_import_v3' in text and 'dl1_png_bundle_v3' in text
+        assert 'casefold' in text and 'same_electrode_required' in text and 'image_only' in text
+        assert 'superseded' in text and 'not_run_image_only' in text
+    document = json.loads((root/'configs/stack-order.json').read_text())
+    assert document == {'stack_order_schema_version':'dl1_png_stack_order_v1','order':[
+        'PXL','SD2','SD1','OCNT','PCNT','GAT3','GCNT','OACT','GAT2','GATC','GAT1','ACT','BML']}
+    helped = subprocess.run([sys.executable,'-m','psdl1.import_png','--help'],capture_output=True,text=True)
+    assert helped.returncode == 0 and '--stack-order' in helped.stdout and 'image only' in helped.stdout
+    denied = subprocess.run([sys.executable,'-m','psdl1.import_png','--verify-bundle','missing','--stack-order','missing-order'],capture_output=True,text=True)
+    assert denied.returncode == 2 and '--verify-bundle must be used alone' in denied.stderr

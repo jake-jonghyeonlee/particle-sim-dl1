@@ -100,18 +100,45 @@ The bridge example's stored check uses source shape `[16,24]`, grid 6, scale 0.2
 
 Inference checks the checkpoint grid against every manifest candidate grid. A mismatch requires `--allow-grid-override`, which retains the checkpoint grid and records both values; it does not approve the physical grid. Search and evaluation recompute thin-line and bridge diagnostics for query/candidate/held-out products at the applied grid. A failed query is unavailable and a failed candidate is excluded by default. `--allow-grid-check-failure` records a per-product bypass; the image baseline follows the same eligibility policy. Hand-computed grid reports without the loader's explicit `manifest_candidate_grid` field are diagnostics, not manifest provenance, and cannot supply an implicit trainer grid.
 
-## PNG source adapter contract (T1)
+## Current PNG source adapter contract — v3 / algorithm 2 (2026-10-13)
 
-The separate `png_source` adapter discovers `<root>/<model>/<electrode>/<seq>-<layer>.png`
-and `<root>/<model>/cno/<seq>_<layer>.png`. The first hyphen or underscore after a
-positive integer separates stack from the exact layer suffix; subsequent separators
-belong to the name. Zero padding normalizes the numeric stack, while original filenames
-and relative paths remain provenance. Stack numbers increase downwards and are model-wide.
-Same-stack conflicting names, duplicate electrode/layer bindings (including repeated
-bindings at another stack), malformed PNG names, shape mismatches, unsupported directory
-layouts and escaping symlinks invalidate the model. Unrelated files are inventory warnings.
-A repeated layer name at distinct stacks is reported and preserved, never merged; a
-binding collision blocks use in the existing v1 export. `cno` is reserved for CNT.
+The separate `png_source` adapter discovers `<root>/<model>/<electrode>/<number>-<layer>.png`
+and `<root>/<model>/cno/<number>_<layer>.png`. The first separator after a positive
+integer separates the provenance number from the exact layer suffix. **Every number
+is provenance only**, for both electrodes and cno; it never supplies ordering, identity
+or a conflict rule. Do not renumber files. The original filename and relative path stay
+in evidence. Different names may reuse a number; the same layer in different electrode
+folders may have different numbers. Duplicate electrode × layer inside one folder is
+an error naming both files. Same-name cno files with different decoded full masks stay
+separate assets/components; only the global CNT input channel unions them. Identical
+same-name full masks are rejected as `ambiguous_cnt_asset_identity`, never merged or
+number/path tie-broken. `cno` is reserved, case-sensitive folder spelling; its layer names
+are not limited to OCNT/GCNT/PCNT. Source layer casefold collisions reject per model.
+Malformed names, shape mismatch, unsupported layout and escaping symlinks still invalidate
+source; unrelated files warn. Earlier shared-stack-number statements are superseded.
+
+Without --stack-order, cnt_mode=image_only: order status is not_used, geometry inventory
+has no positions/candidates/relations and reason cnt_image_only_no_relations. Export keeps
+all decoded CNT foreground in the optional global cnt mask, connections=[], connectivity
+unavailable. Missing/empty cno does not require an order file. Inspect grids works for
+full-frame elements, valid and global CNT. Metadata and candidate grid remain required
+for export; any source-invalid model blocks the whole pool.
+
+With --stack-order, cnt_mode=relations. A strict two-key UTF-8 JSON document has
+stack_order_schema_version=dl1_png_stack_order_v1 and one top-to-bottom order array of
+mixed electrode/CNT names. The single reference is filtered to each model's present
+names (absent entries become ignored_names); every present name is required, including
+white-only CNT. Matching is casefold only; source spelling stays in IDs/manifest/vocabulary,
+matched_pairs records order spelling -> source spelling, and casefold collisions in
+source/reference reject. NFC/NFD are not normalized. No per-model/default overrides,
+number comparisons or overlap-derived order exist. No-cno models also validate any
+explicit file. Invalid supplied files never fall back to image_only.
+
+The user's reference of 2026-10-13 is [configs/stack-order.json](../configs/stack-order.json).
+It is input data for that user's optional workflow, not hard-coded general CNT physics.
+Other examples are syntax-only synthetic references. See [USAGE §11](USAGE.md) for strict
+JSON/identifier diagnostics, LF/CRLF/BOM behavior, quoted Windows commands and remedies.
+Bytes are read once, hashed before UTF-8-sig decoding, and that snapshot supplies parsing.
 
 Decoding requires optional `psdl1[png]` (Pillow 12.3.0, already in the lock snapshot);
 Pillow is imported lazily and the existing NPY path remains independent. Use approved
@@ -145,12 +172,20 @@ These inventories cannot certify checkpoint vocabulary coverage. Unknown symbols
 the existing embedding/search diagnostics; equal names share embedding symbols without
 proving electrical or functional equivalence. No aliases are inferred.
 
-Canonical identities use sorted UTF-8 JSON plus SHA-256, independent of source root and
-enumeration order. Asset binding identity contains model/kind/electrode/numeric stack/layer;
-frame identity contains the local geometry. Binary-mask hashes include shape and bool
-pixels, separately from source-file byte hashes. Component identity uses original bbox,
-frame shape and local binary geometry, with no full-frame component allocation. Original
-filename changes/re-encoding may change provenance without changing logical geometry.
+Canonical identities use UTF-8 canonical JSON plus SHA-256 and do not depend on root,
+enumeration, filename numbers or order-file bytes. Electrode asset/element binding is
+`[model,"electrode",electrode,layer]`; CNT asset binding is
+`[model,"cno",null,CNT_name,decoded_full_mask_sha256]`. Component payload is
+`[model,CNT_name,cnt_binding,shape_yx,bbox_xyxy_px,local_mask_sha256]`; connection payload
+is `[component_id,upper_element_id,lower_element_id,original_xy_px]` under its namespace.
+Model source identity includes the new bindings and mask hashes in a number-free sort.
+The semantic resolved-order digest hashes `[[kind,source_name],...]`; neither positions'
+file numbers nor raw byte hash enter that digest. Geometry identities survive prefix
+renaming/re-encoding, while provenance changes; a pixel change changes the content-bound
+CNT identity. Product input identities still come from unchanged data.input_identity:
+emitted relations/coverage change them, so modes must be consistent within checkpoint/search.
+No order or cnt_mode field is injected into the strict manifest. If no relations are emitted,
+strict numerical inputs can coincide across modes; this does not remove the mode policy.
 
 Metadata is a strict JSON object with exactly `metadata_schema_version` and `models`:
 
@@ -163,26 +198,39 @@ keys, unknown discovered-model names, wrong versions/types, extra fields and inv
 strings fail. Inspection permits partial metadata and explicitly lists pending models;
 export requires all discovered models mapped. Nothing is inferred from folder names.
 
-`png_contract` freezes source, metadata, report, CLI-options and resource records. The
-sidecar version is `report_schema_version: dl1_png_import_v1`; readers reject other
-versions. Resource estimates begin unknown with reasons until extraction fills N/E/K/R,
-CNT indicator U, generated-mask count, bool payload/actual NPY-header/total bytes,
-retained float32 loader bytes and the all-components-resolved scenario. They exclude
-manifest/report/preview bytes and do not predict peak RAM or runtime. Invalid inputs
-never receive reassuring zero estimates. Electrical and real-data verification remain
-`not_performed`. The 4-neighbour/skipped-layer policy is an implementation interpretation,
-not an additional user-confirmed physical fact. T1 emits no connections.
+Current sidecar/algorithm versions are `dl1_png_import_v3`, `dl1_png_bundle_v3`, and
+nearest_overlap_common_intersection / `"2"`. Historical T1 v1 and R-B v2 sidecars are
+superseded, not supported by current readers. cnt_mode appears at top/model/extraction
+levels and in completed CLI events/previews. Raw extractor_run_status is not_run_image_only
+for valid image-only inventory; relations uses ran, blocked, or aggregate partial.
+This is distinct from connectivity_observation and coverage.
 
-The frozen CLI spelling for subsequent T3 implementation is
-`python -m psdl1.import_png --root ROOT --out OUTPUT` for inspection,
-`--inspect-grids G [G ...]` for explicit optional grid evidence,
-`--png-max-image-pixels N` for the explicit finite decoder limit, and
-`--export --metadata METADATA_JSON --candidate-grid G` for model-ready export.
-`--verify-bundle BUNDLE` verifies a published bundle without sources. No grid is chosen
-by default. T1 supplies contracts/APIs; the importer CLI and export/preview are T3 work.
-Existing schema/model-input versions, NPY loader and requirements lock are unchanged.
+Top stack_order stores schema/source/raw file_sha256/validated document/errors, never
+an absolute source path. Each model stores status (not_used/resolved/invalid), source,
+selected_list, resolved_order, ignored_names, matched_pairs, semantic digest and errors.
+Resolved entries have order_index/kind/name/asset_ids only, covering all distinct same-name
+assets. Asset filename_number is provenance and order_index is null without resolution.
+Component cnt_order_index is null in image_only, cnt_filename_number is provenance;
+equal-number candidate fields and numeric stack tables are removed. Shared preview and
+bundle readers validate mode, algorithm, filtering, matched pairs, contiguous positions,
+coverage, digest, and no relation/endpoint/position on inactive modes; resealing corrupt
+evidence does not bypass these checks. Image-only manifest relations are rejected too.
 
-## Original-resolution CNT extraction (T2)
+Resource estimates begin unknown with reasons. Image-only uses R=0, no per-relation mask,
+all_components_resolved=null and all_components_resolved_applicability=not_applicable_image_only.
+Relations retains its all-components-resolved cost scenario. Invalid source costs remain
+unknown; these are not peak RAM/runtime predictions. Electrical/real-data verification
+remain not_performed. User accepted 4-neighbour; skipped-layer physics remains unconfirmed.
+
+CLI: `python -m psdl1.import_png --root ROOT --out NEW_OUTPUT` is image-only inspection;
+`--inspect-grids G [G ...]` adds explicit grid evidence; `--export --metadata FILE
+--candidate-grid G` exports image-only; --stack-order FILE optionally enables relations.
+`--verify-bundle BUNDLE` is exclusive of all input options and needs no source/order file.
+No grid, metadata, label, split or alias is inferred. Decoder finite-limit override and
+publication safeguards remain unchanged; existing schema/model-input/NPY/lock versions
+are unchanged.
+
+## Optional original-resolution CNT relations — current v3
 
 `png_connections.extract_model` operates without lineage/design metadata or grids.
 It labels each CNT source plane independently using horizontal-run union/find with
@@ -192,24 +240,25 @@ Each component retains a bbox-local bool mask. Candidate intersections, common-c
 checks, geometry hashing and centroid selection receive only bbox slices. Large or
 widely spanning bboxes may still be expensive; this is no universal sublinear guarantee.
 
-For CNT stack s, full overlapping electrode candidates are recorded above, below and
-at equal stack. The maximal overlapping upper stack and minimal overlapping lower stack
-are selected **before** their common intersection is tested. Multiple electrodes on a
-selected stack, missing side, same endpoint element, equal-stack contact, empty common
-intersection or disconnected common-contact regions leave the component unresolved with
-named reasons and no relation. A failed nearest pair never falls through to a deeper
-layer. Other lower overlaps retain the explicit reason
-`deeper_than_nearest_overlapping_lower`. Equal-stack electrode/cno overlap is reachable
-only with the same stack/name; conflicting names already invalidate source inventory.
+Only relations mode evaluates overlapping electrode candidates using resolved order_index.
+Select the maximal upper index and minimal lower index **before** common-intersection
+checks. Multiple candidates on a selected layer, missing side, same element, empty or
+disconnected common intersection leave it unresolved. A failed nearest pair never falls
+through to a deeper pair. Other lower overlaps retain deeper_than_nearest_overlapping_lower.
+There is no equal-position electrode/CNT branch; a shared name across kinds is rejected.
 
-A uniquely selected pair may skip modeled nonoverlapping layers and still emit one
-relation. Its `skipped_upper_layers` and `skipped_lower_layers` separately group actual
-electrode and cno stack/layer entries with asset/path references; numeric gaps do not
-invent layers. `needs_confirmation` and directional summary counts expose this rule.
-The nearest-overlap/skipped-layer and 4-neighbour rules are implementation interpretations,
-not independently established physical facts. A connected common intersection cannot
-prove one physical contact; disconnected common regions flag possible multicontact and
-are never heuristically split.
+Skipped upper/lower evidence groups actual order planes separately as electrode/cno,
+with all asset IDs and source paths. Same-name CNT files count as one skipped plane;
+absent reference names create no position or skipped entry. Numeric gaps have no meaning.
+needs_confirmation exposes skipped-layer interpretation, which remains physically
+unconfirmed; multi-electrode ambiguity resolution remains open. 4-neighbour components
+were accepted by the user. Connected common intersection still cannot prove one physical
+contact, while disconnected common regions are never heuristically split.
+
+**Known gap:** the user confirmed that one CNT segment joins layers of the same electrode,
+but relations mode still records same_electrode_required=false and may emit cross-electrode
+pairs. It has not been reviewed against that confirmed rule; do not rely on it for physical
+connectivity before implementation/review closes this gap. Image-only does not infer pairs.
 
 The representative is an actual common-intersection pixel closest to its centroid.
 Squared distances compare Python integer numerators, avoiding floating-point ties and
@@ -240,8 +289,7 @@ and U=1 when decoded CNT source files exist (including white-only), otherwise 0.
 Generated mask count M=E+1+U+R includes valid, optional global CNT and connection masks.
 Bool payload is N*M bytes; projected retained loader masks use 4*N*M bytes. Actual NumPy
 v1 bool header encoding is generated in memory, without creating any export-sized array,
-and its M-fold overhead is included in total projected NPY bytes. The upper scenario
-replaces R by K. Invalid source estimates remain unknown with a reason. Estimates exclude
+and its M-fold overhead is included in total projected NPY bytes. In relations only, the upper scenario replaces R by K. In image_only R=0 and the upper scenario is not applicable. Invalid source estimates remain unknown with a reason. Estimates exclude
 manifest/report/preview files and decoder/label/temporary/grid/Python/validation overhead;
 they predict neither peak RAM nor runtime and do not approve real resource suitability.
 
@@ -438,7 +486,7 @@ bundle (Darwin RENAME_EXCL/Linux RENAME_NOREPLACE/Windows refusing existing dest
 Even a concurrently created empty destination is refused. Failures preserve staging
 and report its location. The importer never removes/replaces an existing destination.
 
-`bundle-integrity.json` (`dl1_png_bundle_v1`) binds hashes of report/manifest/NPY/HTML/raster
+`bundle-integrity.json` (current `dl1_png_bundle_v3`; historical T3 v1 is superseded) binds hashes of report/manifest/NPY/HTML/raster
 files; the report also binds manifest/assets and records Product input identities.
 `--verify-bundle` validates contained paths, file hashes, supported versions, exact listed
 files, manifest/report/asset links and bool mask headers without source PNGs or a full
@@ -550,7 +598,11 @@ verification passed. The montage beside the bundle was visually checked. No real
 electrical verification or retrieval-quality claim follows.
 
 
-## R-B finding response: publication and sidecar v2 — 2026-10-12
+## Historical R-B response: publication and superseded sidecar v2 — 2026-10-12
+
+The publication/containment fixes below remain in force. Version/run-field descriptions
+are historical; current v3 mode/order/identity rules above supersede them. Historical
+validation counts apply only to their original candidate, not the present code.
 
 Containment now compares `os.path.samefile` for every existing output ancestor against
 the input root, and rejects the reverse nesting too, before any directory creation.
@@ -575,7 +627,7 @@ writing temporary avoids collisions with an abandoned `.writing` file and preser
 original exception. The handler also catches KeyboardInterrupt. Staging never becomes
 a consumable model bundle merely because validation, seal, verify or publication failed.
 
-Report shape changes are explicitly versioned as **dl1_png_import_v2**. The per-model
+At that historical candidate report shape changes were **dl1_png_import_v2** (superseded by v3). The per-model
 and top-level raw run field is `extractor_run_status` with `ran/blocked/not_run`, never
 `complete` for a run. Coverage `complete` remains extraction coverage only, not electrical
 verification. Report vocabulary separates `electrode_layers` from `cno_layers`, their
@@ -584,7 +636,7 @@ Combined names remain clearly labelled `all_source_*` audit fields. Internal ext
 records/semantics and emitted IDs/hashes are unchanged. Invalid metadata report diagnostics
 use the location-independent `metadata` label and omit absolute file paths.
 
-Integrity is **dl1_png_bundle_v2** and lists exact directories as well as files. Added
+At that historical candidate integrity was **dl1_png_bundle_v2** (superseded by v3) and lists exact directories as well as files. Added
 empty/nested directories and unlisted/non-file/missing entries reject. Missing/malformed
 report or manifest fields produce a clean diagnostic. V1 sidecar/integrity versions are
 explicitly unsupported by the new verifier; re-import to a new destination if needed.
@@ -599,3 +651,17 @@ follow-up **14 passed (6.34 s)**, full default suite **484 passed, 1 existing sk
 created. All eleven required scratch mutants failed their specified tests; exact commands,
 rows, fixture coordinates and evidence path are recorded in the new dated
 [validation record](validation.md). Independent refreshed review remains pending.
+
+
+## PNG v3 migration
+
+Re-import original PNGs with explicit metadata/grid into a **new output directory**, using
+image_only by default or an actual reference file for optional relations. Verify and inspect
+mode/order/geometry; never relabel old v1/v2 sidecars or reuse number-based endpoints. Retain
+old artifacts as historical evidence, rebuild identity-bound caches/embeddings, and keep one
+CNT mode consistently in checkpoint/search. Existing code/identity resume gates stay active.
+Current verifier rejects old bundle/report versions, algorithm 1, and malformed v3 evidence
+with the documented explicit diagnostics. Generic detached v1 NPY manifests and previously
+rendered static HTML still open; they are not retroactively blocked or certified by PNG readers.
+All compatibility/quality evidence is synthetic, not Windows-host, real-data, electrical or
+retrieval-performance validation. The strict manifest and core numerical versions are unchanged.

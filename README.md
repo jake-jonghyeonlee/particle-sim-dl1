@@ -34,7 +34,7 @@ See [docs/training.md](docs/training.md) for the complete configuration and resu
   --hard-negatives data/hard-negatives.json --topk 5 --out evaluation.json
 ```
 
-`configs/` contains illustrative filenames/IDs, not real data or approved real hyperparameters. Both manifests, labels, and split must be supplied with actual provenance before running user training. A 2×2 simulation domain is not automatically converted to a unit.
+`configs/` contains illustrative filenames/IDs and unapproved example hyperparameters, except for the explicitly user-supplied `stack-order.json` reference of 2026-10-13. Both manifests, labels, and split must be supplied with actual provenance before running user training. A 2×2 simulation domain is not automatically converted to a unit.
 
 The checked runtime is Python 3.12. The T8 `requirements.lock` records exact installed versions for the macOS runtime, including optional timm/test dependencies; it is not a portable wheel/build lock. Use the closed-network package process to obtain approved distributions and the build backend; no dependency updates or downloads were performed here.
 
@@ -80,13 +80,11 @@ or a grid. Explicit grid inspection compares candidates without approving/select
 one. Export requires exact per-model lineage/design metadata (see the conspicuously
 synthetic example in `configs/png-metadata.example.json`) and an explicit candidate
 grid; a bad model blocks the entire export pool. No labels, split, aliases or grid
-are inferred. Full-frame masks, original-resolution CNT relations and all unresolved
-CNT foreground survive export. No model-input crop/tiling is performed; context
+are inferred. Without --stack-order the default cnt_mode is image_only: full-frame masks and the union of every CNT foreground survive export, with connections: [] and connectivity_observation: unavailable. No relation, endpoint or vertical placement is inferred. No model-input crop/tiling is performed; context
 windows in the preview are display aids only.
 
 Resource and name inventories precede heavy export/grid allocations. Review N/E/K/R,
-bool export bytes, retained float32 loader bytes and the all-components-resolved
-scenario before use. Decoder temporaries, all retained source masks and per-relation
+bool export bytes and retained float32 loader bytes before use. Image-only uses R=0 and all_components_resolved=null (not_applicable_image_only); that upper scenario applies only to relations mode. Decoder temporaries, all retained source masks and per-relation
 full-frame masks add memory; estimates do not certify peak RAM or runtime. Exact role
 and layer names must be in the checkpoint's training vocabulary: unknown queries are
 unavailable, candidates excluded, and direct embedding fails with the missing names.
@@ -94,20 +92,43 @@ A shared symbol does not establish physical equivalence.
 
 **complete means extraction coverage only; electrical verification not performed.**
 Coverage reaches the model's connectivity embedding (`unavailable/partial/available`)
-and affects input identity. 4-neighbour and skipped-layer rules are implementation
-interpretations. Real grid/minimum linewidth, source-format compatibility and G6
+and affects input identity. 4-neighbour components are user accepted; skipped-layer physics and multi-electrode ambiguity resolution remain unconfirmed. Real grid/minimum linewidth, source-format compatibility and G6
 labels/quality acceptance remain pending. A **5–10 diverse product pilot** is an
 integration/connection-inspection pilot, never a required training corpus size or
 retrieval-quality acceptance. See USAGE for strict PNG re-save remedies and preview
 layer/endpoint interpretation.
 
 
-The current PNG report/integrity versions are `dl1_png_import_v2` and
-`dl1_png_bundle_v2`; strict v1 manifests and model/checkpoint versions stay unchanged.
+The current PNG report/integrity versions are `dl1_png_import_v3` and
+`dl1_png_bundle_v3`, algorithm `"2"`; v1/v2 sidecars and shared-number stack assumptions are superseded; strict v1 manifests and model/checkpoint versions stay unchanged.
 Electrode layer vocabulary and CNT-plane names are separate report lists; combined
-`all_source_*` lists are audit evidence. `extractor_run_status: ran` says only that
-extraction ran, while coverage and model status remain separate. The verifier rejects
+`all_source_*` lists are audit evidence. `cnt_mode` is recorded at top/model/extraction levels and in the completed event. Image-only records `not_run_image_only` and order `not_used`; `ran` applies to optional relation extraction, while coverage and model status remain separate. The verifier rejects
 unsupported old sidecars and added files/directories with clean diagnostics.
+
+
+Every electrode/cno filename number is positive syntax and provenance only; never
+renumber source files to encode placement. Electrode bindings use exact model/folder/layer
+names with no number. Same-name CNT files stay separate content-bound source assets;
+only the image channel uses their global union. Identical same-name decoded masks are
+rejected. OCNT/GCNT/PCNT are known names, not a hard-coded whitelist.
+
+Optional **relations** mode is documented in [USAGE §11](docs/USAGE.md#11-선택-사항--순서-파일로-relations-모드-사용):
+pass --stack-order with a common reference filtered per model, covering every present
+name. Matching uses casefold, collisions reject, and source spelling is preserved in
+IDs/manifest/vocabulary; matched_pairs records the spelling pair. The user's reference
+of 2026-10-13 is [configs/stack-order.json](configs/stack-order.json); it does not prescribe
+universal CNT positions. Other inline/test orders are syntax-only synthetic examples.
+**Known gap:** the user confirmed same-electrode contact semantics, but relations still
+has same_electrode_required=false and can emit cross-electrode pairs. Do not rely on it
+for physical connectivity before that gap is closed and reviewed. Invalid supplied order
+files fail; they never fall back to image_only. Keep one mode consistently within a
+checkpoint/search: emitted connections change Product input identities.
+
+Migration: re-import original PNGs with metadata/grid into a new output, optionally
+supplying a correct order for relations; verify and inspect before use. Do not relabel
+old sidecars or reuse old endpoints. Rebuild identity-bound caches. The generic strict
+NPY loader and existing static HTML are not retroactively blocked by PNG reader version
+rejection; code/identity resume checks still apply. See USAGE §11 for every order error.
 
 Output containment compares existing ancestor file identities, including case/Unicode
 spellings and symlinks. Publication uses native atomic no-replace rename when available,

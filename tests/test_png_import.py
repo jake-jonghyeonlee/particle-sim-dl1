@@ -744,3 +744,73 @@ def test_image_only_reader_rejects_inferred_evidence(image_only_pair, tmp_path, 
     (out / 'bundle-integrity.json').write_text(json.dumps(seal))
     with pytest.raises(ValueError, match='image-only manifest|invalid PNG stack order evidence'):
         importer.verify_bundle(out)
+
+
+@pytest.mark.parametrize('mutation', ['report_v2','integrity_v2','relabel_old_shape','top_algorithm','model_algorithm',
+                                    'duplicate_index','missing_index','reordered','bad_digest','inactive_relation'])
+def test_report_v3_bundle_v3_reject_baseline_versions(tmp_path, shared_export, image_only_pair, mutation):
+    from psdl1.png_preview import require_preview_report
+    base = image_only_pair[0] / 'image_only' if mutation == 'inactive_relation' else shared_export
+    out = tmp_path / 'bundle'; shutil.copytree(base, out)
+    assert importer.verify_bundle(out)['status'] == 'verified'  # self-contained; no source/order in this tree
+    doc = report(out)
+    expected = 'invalid PNG stack order evidence'
+    if mutation == 'integrity_v2':
+        seal = json.loads((out / 'bundle-integrity.json').read_text()); seal['bundle_schema_version'] = 'dl1_png_bundle_v2'
+        (out / 'bundle-integrity.json').write_text(json.dumps(seal))
+        with pytest.raises(ValueError, match='unsupported bundle integrity version/algorithm'): importer.verify_bundle(out)
+        return
+    if mutation in {'report_v2','relabel_old_shape'}:
+        # Baseline-shaped record: numeric positions and no new mode/order fields.
+        doc.pop('stack_order'); doc.pop('cnt_mode')
+        for model in doc['inventory']['models']:
+            model.pop('stack_order'); model.pop('cnt_mode'); model['stack_table'] = [[1,'U'],[6,'C6'],[7,'L']]
+        if mutation == 'report_v2':
+            doc['report_schema_version'] = 'dl1_png_import_v2'
+            expected = 'unsupported PNG report_schema_version'
+    elif mutation == 'top_algorithm':
+        doc['algorithm_version'] = '1'; expected = 'unsupported PNG algorithm_id/algorithm_version'
+    elif mutation == 'model_algorithm':
+        doc['extraction'][0]['algorithm_version'] = '1'; expected = 'unsupported PNG algorithm_id/algorithm_version'
+    elif mutation == 'duplicate_index': doc['inventory']['models'][0]['stack_order']['resolved_order'][1]['order_index'] = 0
+    elif mutation == 'missing_index': doc['inventory']['models'][0]['stack_order']['resolved_order'].pop()
+    elif mutation == 'reordered': doc['inventory']['models'][0]['stack_order']['resolved_order'].reverse()
+    elif mutation == 'bad_digest': doc['inventory']['models'][0]['stack_order']['resolved_order_sha256'] = '0'*64
+    elif mutation == 'inactive_relation':
+        doc['extraction'][0]['components'][0]['relation'] = report(image_only_pair[0] / 'relations')['extraction'][0]['components'][0]['relation']
+    with pytest.raises(ValueError, match=expected): require_preview_report(doc)
+    (out / 'import-report.json').write_text(json.dumps(doc))
+    seal = json.loads((out / 'bundle-integrity.json').read_text())
+    seal['files']['import-report.json'] = importer.file_sha256(out / 'import-report.json')
+    (out / 'bundle-integrity.json').write_text(json.dumps(seal))
+    with pytest.raises(ValueError, match=expected): importer.verify_bundle(out)
+
+
+def test_order_export_mixed_models_and_legacy_core_contract(tmp_path):
+    from png_helpers import write_model
+    root = tmp_path / 'source'; p = ((10,20),)
+    write_model(root, [('A','1-U.png',p),('B','1-L.png',p),('cno','1-CNT.png',p)], model='FIRST')
+    write_model(root, [('A','1-X.png',p),('B','1-Y.png',p),('cno','1-CNT.png',p)], model='SECOND')
+    mapping = tmp_path / 'metadata.json'
+    mapping.write_text(json.dumps({'metadata_schema_version':'dl1_png_metadata_v1','models':{
+        n:{'lineage_id':'SYNTHETIC-'+n,'design_version':'SYNTHETIC-V1'} for n in ['FIRST','SECOND']}}))
+    order = write_stack_order(tmp_path / 'order.json',['U','CNT','L'])  # syntax-only synthetic order
+    bad = tmp_path / 'bad'
+    assert importer.run_import(ImportOptions(root=root,out=bad,export=True,metadata=mapping,candidate_grid=128,stack_order=order))[1] == 2
+    doc = report(bad)
+    assert doc['extractor_run_status'] == 'partial'
+    assert doc['inventory']['models'][1]['stack_order']['errors'] == ['stack_order_missing_electrode_names: model "SECOND", missing ["X", "Y"]']
+    assert doc['extraction'][0]['summary']['resolved_relation_count'] == 1
+    assert doc['extraction'][1]['summary']['resolved_relation_count'] == 0
+    assert not (bad/'manifest.json').exists() and not (bad/'assets').exists()
+    write_stack_order(order,['U','X','CNT','L','Y'])  # each model filters a different absent subset
+    good = tmp_path / 'good'
+    assert importer.run_import(ImportOptions(root=root,out=good,export=True,metadata=mapping,candidate_grid=128,stack_order=order))[1] == 0
+    manifest = json.loads((good/'manifest.json').read_text())
+    assert set(manifest) == {'schema_version','candidate_grid','products'} and manifest['schema_version'] == 'dl1_shape_v1_draft'
+    assert all('stack_order' not in p and 'cnt_mode' not in p for p in manifest['products'])
+    products = load_manifest(good/'manifest.json')
+    assert [len(p.connections) for p in products] == [1,1]
+    assert importer.verify_bundle(good)['export_status'] == 'exported'
+    checked = subprocess.run([sys.executable,'-m','psdl1.data',str(good/'manifest.json'),'--report',str(tmp_path/'validator.json')],capture_output=True,text=True)
+    assert checked.returncode == 0, checked.stderr

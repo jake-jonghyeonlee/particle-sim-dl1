@@ -845,3 +845,60 @@ def test_no_cno_source_identity_is_number_free(tmp_path):
         [['M', 'electrode', 'A', 'U'], h.hexdigest()]]]]
     expected = 'model_' + hashlib.sha256(json.dumps(payload, separators=(',', ':')).encode()).hexdigest()
     assert model_identity(model) == expected
+
+
+def test_stack_order_windows_paths_crlf_bom_snapshot(tmp_path, monkeypatch):
+    """Portable parsing evidence only; actual Windows filesystem execution is unclaimed."""
+    from png_helpers import write_model
+    from psdl1.png_source import load_stack_order
+    from psdl1.png_connections import extract_model, to_product
+    from psdl1.data import input_identity
+    import psdl1.import_png as importer
+    from pathlib import Path
+    root = tmp_path / 'source'
+    write_model(root, [('A','1-U.png',((10,20),)), ('B','1-L.png',((10,20),)),
+                       ('cno','1-CNT.png',((10,20),))])
+    native = tmp_path / '공백 있는 폴더'; native.mkdir()
+    text = '{\n  "stack_order_schema_version": "dl1_png_stack_order_v1",\n  "order": ["U", "CNT", "L"]\n}\n'
+    buffers = [text.encode(), text.replace('\n','\r\n').encode(), b'\xef\xbb\xbf'+text.encode()]
+    observed, hashes = [], []
+    for index, raw in enumerate(buffers):
+        path = native / f'순서 {index}.json'; path.write_bytes(raw)
+        reference = load_stack_order(path)
+        assert reference.file_sha256 == hashlib.sha256(raw).hexdigest()
+        model, = discover_source(root, stack_order=reference).models
+        extraction = extract_model(model)
+        assert model.stack_order.resolved_order_sha256 == hashlib.sha256(b'[["electrode","U"],["cno","CNT"],["electrode","L"]]').hexdigest()
+        assert [e.name for e in model.stack_order.resolved_order] == ['U','CNT','L']
+        assert extraction.relations[0].representative_xy_px == (20,10)
+        observed.append(([a.asset_id for a in model.assets], model_identity(model),
+                         [c.component_id for c in extraction.components],
+                         [r.connection_id for r in extraction.relations], input_identity(to_product(model, extraction))))
+        hashes.append(reference.file_sha256)
+    assert observed[0] == observed[1] == observed[2] and len(set(hashes)) == 3
+    for raw, code in [(text.encode('utf-16'), 'stack_order_encoding'),
+                      (b'\xef\xbb\xbf\xef\xbb\xbf'+text.encode(), 'stack_order_json'),
+                      (b'\xef\xbb\xbf'+text.encode()+b'\xef\xbb\xbf', 'stack_order_json')]:
+        path = native / 'invalid.json'; path.write_bytes(raw)
+        assert load_stack_order(path).errors[0].startswith(code+':')
+    path = native / 'snapshot.json'; path.write_bytes(buffers[0])
+    original_read = Path.read_bytes
+    calls = []
+    def replace_after_read(current):
+        raw = original_read(current)
+        if current == path:
+            calls.append(current)
+            current.write_text('{"stack_order_schema_version":"dl1_png_stack_order_v1","order":["L","CNT","U"]}')
+        return raw
+    monkeypatch.setattr(Path, 'read_bytes', replace_after_read)
+    reference = load_stack_order(path)
+    assert calls == [path] and reference.document['order'] == ['U','CNT','L']
+    assert reference.file_sha256 == hashlib.sha256(buffers[0]).hexdigest()
+    model, = discover_source(root, stack_order=reference).models
+    assert extract_model(model).relations[0].representative_xy_px == (20,10)
+    captured = []
+    monkeypatch.setattr(importer, 'run_import', lambda options, **kwargs: (captured.append(options) or {}, 0))
+    # argv receives a single argument after the person's shell removed its quotes.
+    windows = r'D:\한글 폴더\stack-order.json'
+    assert importer.main(['--root','unused','--out','unused-out','--stack-order',windows]) == 0
+    assert str(captured[0].stack_order) == windows
