@@ -111,9 +111,17 @@ in evidence. Different names may reuse a number; the same layer in different ele
 folders may have different numbers. Duplicate electrode × layer inside one folder is
 an error naming both files. Same-name cno files with different decoded full masks stay
 separate assets/components; only the global CNT input channel unions them. Identical
-same-name full masks are rejected as `ambiguous_cnt_asset_identity`, never merged or
-number/path tie-broken. `cno` is reserved, case-sensitive folder spelling; its layer names
-are not limited to OCNT/GCNT/PCNT. Source layer casefold collisions reject per model.
+same-name full masks are accepted in image_only with warning `duplicate_cnt_mask_same_name`
+naming all files: one content asset keeps every decoded file in `provenance_files`
+(relative_path, original_filename, filename_number, file_sha256, decoded_mode).
+No filename number/path enters identity. Components describe that one geometry, not
+failed contacts; cnt_file_count still counts all observed files. In relations the
+`ambiguous_cnt_asset_identity` error stays, with no merging or number/path tie-breaking. `cno` is reserved, case-sensitive folder spelling; its layer names
+are not limited to OCNT/GCNT/PCNT. Without an order file, source layer case variants warn with `layer_name_case_variants`
+per model and at inventory level across models, preserving separate exact-spelling
+vocabulary entries. With an order file, per-model casefold collisions still reject.
+The .png extension alone is case-insensitive (.PNG, .Png); other filename syntax and
+strict decoding are unchanged, including unsupported-depth PNG classification.
 Malformed names, shape mismatch, unsupported layout and escaping symlinks still invalidate
 source; unrelated files warn. Earlier shared-stack-number statements are superseded.
 
@@ -204,6 +212,11 @@ superseded, not supported by current readers. cnt_mode appears at top/model/extr
 levels and in completed CLI events/previews. Raw extractor_run_status is not_run_image_only
 for valid image-only inventory; relations uses ran, blocked, or aggregate partial.
 This is distinct from connectivity_observation and coverage.
+New image_only summaries record geometry_only_component_count equal to component_count
+and unresolved_component_count=0; the components keep cnt_image_only_no_relations as
+geometry evidence. Relations summaries are unchanged. Readers validate these counts,
+accept earlier v3 image_only summaries where unresolved_component_count held the
+geometry count, and validate grouped duplicate-file provenance. Versions stay unchanged.
 
 Top stack_order stores schema/source/raw file_sha256/validated document/errors, never
 an absolute source path. Each model stores status (not_used/resolved/invalid), source,

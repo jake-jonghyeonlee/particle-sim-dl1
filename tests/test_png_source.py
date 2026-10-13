@@ -77,7 +77,8 @@ def test_numeric_stack_and_first_separator(tmp_path):
     assert parse_png_name("2-SD2.png") == (2, "SD2")
     assert parse_png_name("006_OCNT.png") == (6, "OCNT")
     assert parse_png_name("002-name_with-more_parts.png") == (2, "name_with-more_parts")
-    for name in ["0-X.png", "-1-X.png", "X.png", "2-.png", "2_X.PNG", "1.5-X.png", "1- X.png"]:
+    assert parse_png_name("2_X.PNG") == (2, "X")
+    for name in ["0-X.png", "-1-X.png", "X.png", "2-.png", "1.5-X.png", "1- X.png"]:
         with pytest.raises(ValueError):
             parse_png_name(name)
     for name in ["10-Z.png", "2-SD2.png", "1-pxl.png"]:
@@ -331,12 +332,14 @@ def test_truncated_loading_global_and_cycles_preserved(tmp_path, monkeypatch):
 def test_emitted_identity_collision_fails_and_repeated_cnt_layer_is_preserved(tmp_path, monkeypatch):
     for relative in ["M/A/1-X.png", "M/cno/2-C.png", "M/cno/3-C.png"]:
         write_png(tmp_path, relative)
-    inventory = discover_source(tmp_path)
+    from png_helpers import write_stack_order
+    order = write_stack_order(tmp_path / 'order.json', ['X', 'C'])
+    inventory = discover_source(tmp_path, stack_order=order)
     assert not inventory.valid
     assert any("ambiguous_cnt_asset_identity" in e.reason for e in inventory.models[0].errors)
     assert len(inventory.models[0].cnt_assets) == 2
     monkeypatch.setattr("psdl1.png_source.canonical_id", lambda kind, value: kind + "_collision")
-    inventory = discover_source(tmp_path)
+    inventory = discover_source(tmp_path, stack_order=order)
     assert not inventory.valid
     assert any("colliding" in e.reason for e in inventory.models[0].errors)
 

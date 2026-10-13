@@ -101,6 +101,7 @@ class SourceAsset:
     shape_yx: tuple[int, int]
     mask: np.ndarray = field(repr=False, compare=False)
     polarity: str = "black=1,white=0"
+    provenance_files: tuple[dict, ...] = ()
 
     @property
     def binding(self) -> tuple:
@@ -418,6 +419,7 @@ class ExtractionSummary:
     skipped_upper_cno_layers: int
     skipped_lower_electrode_layers: int
     skipped_lower_cno_layers: int
+    geometry_only_component_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -488,6 +490,15 @@ def _validate_order_evidence(report):
             require('stack' not in a and type(a['filename_number']) is int and a['filename_number'] > 0, 'asset number')
             require(a['kind'] in {'electrode', 'cno'}, 'asset kind')
             require('electrode_stack' not in a, 'obsolete asset number position')
+            if 'provenance_files' in a:
+                files = a['provenance_files']
+                require(mode == 'image_only' and a['kind'] == 'cno' and isinstance(files, list) and len(files) > 1, 'duplicate content provenance')
+                require(all(set(f) == {'relative_path', 'original_filename', 'filename_number', 'file_sha256', 'decoded_mode'} and
+                            isinstance(f['relative_path'], str) and type(f['filename_number']) is int and f['filename_number'] > 0 and
+                            isinstance(f['original_filename'], str) and digest(f['file_sha256']) and isinstance(f['decoded_mode'], str)
+                            for f in files), 'provenance file fields')
+                require(len({f['relative_path'] for f in files}) == len(files) and
+                        files[0] == {k: a[k] for k in files[0]}, 'provenance file coverage')
             groups.setdefault((a['kind'], a['layer']), []).append(a)
         if status == 'resolved':
             require(top['document'] is not None and order['source'] == 'user_supplied_order_file' and order['selected_list'] == 'order' and not order['errors'], 'resolved input')
@@ -538,6 +549,14 @@ def _validate_order_evidence(report):
             resources = extraction['resource_estimate']
             require(resources['all_components_resolved'] is None and resources['all_components_resolved_applicability'] == 'not_applicable_image_only', 'image-only resource scenario')
             require(extraction['summary']['resolved_relation_count'] == 0 and resources['resolved_relation_count'] in {0, None}, 'image-only relation count')
+            summary = extraction['summary']
+            count = len(extraction['components'])
+            require(summary['component_count'] == count, 'component count')
+            if 'geometry_only_component_count' in summary:
+                require(type(summary['geometry_only_component_count']) is int and summary['geometry_only_component_count'] == count and
+                        summary['unresolved_component_count'] == 0, 'geometry-only summary')
+            else:  # Earlier v3 image-only bundles used this count for geometry.
+                require(summary['unresolved_component_count'] == count, 'legacy geometry-only summary')
         assets_by_id = {a['asset_id']: a for a in assets}
         for component in extraction['components']:
             cnt = assets_by_id[component['source_asset_id']]

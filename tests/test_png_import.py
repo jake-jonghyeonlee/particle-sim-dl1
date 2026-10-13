@@ -814,3 +814,110 @@ def test_order_export_mixed_models_and_legacy_core_contract(tmp_path):
     assert importer.verify_bundle(good)['export_status'] == 'exported'
     checked = subprocess.run([sys.executable,'-m','psdl1.data',str(good/'manifest.json'),'--report',str(tmp_path/'validator.json')],capture_output=True,text=True)
     assert checked.returncode == 0, checked.stderr
+
+
+@pytest.mark.parametrize('pixels', [(), ((10,20),(10,21))], ids=['all_white','identical_shape'])
+def test_image_only_accepts_identical_same_name_cnt_files(tmp_path, pixels):
+    from png_helpers import write_model
+    root = tmp_path/'source'
+    write_model(root,[('A','1-U.png',((10,20),(10,21))),('B','1-L.png',((10,20),(10,21))),
+                     ('cno','1-OCNT.png',pixels),('cno','5-OCNT.png',pixels)])
+    mapping = tmp_path/'metadata.json'
+    mapping.write_text(json.dumps({'metadata_schema_version':'dl1_png_metadata_v1','models':{
+        'M':{'lineage_id':'SYNTHETIC','design_version':'V1'}}}))
+    out = tmp_path/'image_only'
+    assert importer.run_import(ImportOptions(root=root,out=out,export=True,metadata=mapping,candidate_grid=128))[1] == 0
+    doc = report(out); model, = doc['inventory']['models']
+    assert model['errors'] == []
+    warning, = [w['reason'] for w in model['warnings'] if w['reason'].startswith('duplicate_cnt_mask_same_name:')]
+    assert '"M/cno/1-OCNT.png", "M/cno/5-OCNT.png"' in warning
+    cnt, = [a for a in model['assets'] if a['kind'] == 'cno']
+    assert [f['relative_path'] for f in cnt['provenance_files']] == ['M/cno/1-OCNT.png','M/cno/5-OCNT.png']
+    assert model['resource_estimate']['cnt_file_count'] == 2
+    summary = doc['extraction'][0]['summary']
+    assert summary['geometry_only_component_count'] == (1 if pixels else 0)
+    assert summary['unresolved_component_count'] == summary['resolved_relation_count'] == 0
+    product, = load_manifest(out/'manifest.json')
+    expected = np.zeros((1001,1203), dtype=bool)
+    for y,x in pixels: expected[y,x] = True
+    np.testing.assert_array_equal(product.cnt, expected)
+    assert product.connections == () and product.connectivity_observation == 'unavailable'
+    assert importer.verify_bundle(out)['status'] == 'verified'
+    order = write_stack_order(tmp_path/'order.json',['U','OCNT','L'])
+    related = tmp_path/'relations'
+    assert importer.run_import(ImportOptions(root=root,out=related,export=True,metadata=mapping,candidate_grid=128,stack_order=order))[1] == 2
+    errors = report(related)['inventory']['models'][0]['errors']
+    ambiguous, = [e['reason'] for e in errors if e['reason'].startswith('ambiguous_cnt_asset_identity:')]
+    assert '"M/cno/1-OCNT.png", "M/cno/5-OCNT.png"' in ambiguous
+    assert not (related/'manifest.json').exists() and not (related/'assets').exists()
+
+
+def test_image_only_case_variants_warn_not_error(tmp_path):
+    from png_helpers import write_model
+    root = tmp_path/'source'
+    write_model(root,[('VDD','1-PXL.png',((10,20),)),('DATA','9-pxl.png',((30,40),))],model='WITHIN')
+    write_model(root,[('VDD','1-PXL.png',((10,20),))],model='UPPER')
+    write_model(root,[('DATA','9-pxl.png',((30,40),))],model='LOWER')
+    mapping = tmp_path/'metadata.json'
+    mapping.write_text(json.dumps({'metadata_schema_version':'dl1_png_metadata_v1','models':{
+        n:{'lineage_id':'SYNTHETIC-'+n,'design_version':'V1'} for n in ['WITHIN','UPPER','LOWER']}}))
+    out = tmp_path/'image_only'
+    assert importer.run_import(ImportOptions(root=root,out=out,export=True,metadata=mapping,candidate_grid=128))[1] == 0
+    doc = report(out)
+    assert doc['inventory']['electrode_layer_union'] == ['PXL','pxl']
+    assert all(m['errors'] == [] for m in doc['inventory']['models'])
+    within, = [m for m in doc['inventory']['models'] if m['model_id'] == 'WITHIN']
+    warning, = within['warnings']
+    assert warning['reason'].startswith('layer_name_case_variants:')
+    assert '"WITHIN/DATA/9-pxl.png", "WITHIN/VDD/1-PXL.png"' in warning['reason']
+    across, = doc['inventory']['warnings']
+    assert across['reason'].startswith('layer_name_case_variants:')
+    assert 'names ["PXL", "pxl"]' in across['reason'] and 'models ["LOWER", "UPPER", "WITHIN"]' in across['reason']
+    assert not any(e['reason'].startswith('stack_order_') for m in doc['inventory']['models'] for e in m['errors']+m['warnings'])
+    assert [{e.layer for e in p.elements} for p in load_manifest(out/'manifest.json')] == [{'pxl'},{'PXL'},{'PXL','pxl'}]
+    assert importer.verify_bundle(out)['status'] == 'verified'
+    order = write_stack_order(tmp_path/'order.json',['PXL'])
+    related = tmp_path/'relations'
+    assert importer.run_import(ImportOptions(root=root,out=related,export=True,metadata=mapping,candidate_grid=128,stack_order=order))[1] == 2
+    within, = [m for m in report(related)['inventory']['models'] if m['model_id'] == 'WITHIN']
+    assert any(e['reason'].startswith('stack_order_case_collision:') for e in within['errors'])
+
+
+def test_uppercase_png_extension_accepted(tmp_path):
+    from png_helpers import write_model
+    from psdl1.png_source import discover_source
+    root = tmp_path/'source'
+    write_model(root,[('A','1-U.PNG',((10,20),)),('B','2-L.Png',((10,20),)),
+        ('D','3-X.png',((30,40),)),('cno','1-OCNT.PNG',((10,20),)),('cno','2-PCNT.pNg',((30,40),))])
+    (root/'M/cno/Thumbs.db').write_text('unrelated')
+    mapping = tmp_path/'metadata.json'
+    mapping.write_text(json.dumps({'metadata_schema_version':'dl1_png_metadata_v1','models':{
+        'M':{'lineage_id':'SYNTHETIC','design_version':'V1'}}}))
+    for mode,order in [('image_only',None),('relations',write_stack_order(tmp_path/'order.json',['U','OCNT','L','PCNT','X']))]:
+        out = tmp_path/mode
+        assert importer.run_import(ImportOptions(root=root,out=out,export=True,metadata=mapping,candidate_grid=128,stack_order=order))[1] == 0
+        model, = report(out)['inventory']['models']
+        assert {a['original_filename'] for a in model['assets']} == {'1-U.PNG','2-L.Png','3-X.png','1-OCNT.PNG','2-PCNT.pNg'}
+        assert model['errors'] == []
+        assert [(w['path'],w['reason']) for w in model['warnings']] == [('M/cno/Thumbs.db','ignored unrelated non-PNG file')]
+        assert importer.verify_bundle(out)['status'] == 'verified'
+    # Classification is case-insensitive also at unsupported depths.
+    write_model(root,[('extra','1-X.PNG',((10,20),))],model='M/cno')
+    assert any('PNG at unsupported layout/depth' in e.reason for e in discover_source(root).models[0].errors)
+
+
+@pytest.mark.parametrize('mutation', ['count','unresolved','provenance'])
+def test_image_only_geometry_summary_and_duplicate_provenance_validated(tmp_path, mutation):
+    from png_helpers import write_model
+    from psdl1.png_preview import require_preview_report
+    root = tmp_path/'source'
+    write_model(root,[('A','1-U.png',((10,20),)),('cno','1-CNT.png',((10,20),)),('cno','5-CNT.png',((10,20),))])
+    out = tmp_path/'inspection'
+    assert importer.run_import(ImportOptions(root=root,out=out))[1] == 0
+    doc = report(out)
+    if mutation == 'count': doc['extraction'][0]['summary']['geometry_only_component_count'] = 2
+    elif mutation == 'unresolved': doc['extraction'][0]['summary']['unresolved_component_count'] = 1
+    else:
+        cnt = next(a for a in doc['inventory']['models'][0]['assets'] if a['kind'] == 'cno')
+        cnt['provenance_files'][1]['relative_path'] = cnt['provenance_files'][0]['relative_path']
+    with pytest.raises(ValueError, match='invalid PNG stack order evidence'): require_preview_report(doc)

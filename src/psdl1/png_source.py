@@ -69,7 +69,7 @@ class PNGSourceError(ValueError):
 
 
 def parse_png_name(filename: str) -> tuple[int, str]:
-    match = re.fullmatch(r"([0-9]+)[-_](.+)\.png", filename)
+    match = re.fullmatch(r"([0-9]+)[-_](.+)\.[pP][nN][gG]", filename)
     if match is None or int(match[1]) <= 0:
         raise ValueError(f"{filename}: expected positive numeric prefix and first '-'/'_' separator")
     return int(match[1]), identifier(match[2], "layer")
@@ -331,6 +331,8 @@ def decode_png(path, *, png_max_image_pixels=None):
 
 def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> SourceInventory:
     root = Path(root).resolve(strict=True)
+    reference = stack_order if isinstance(stack_order, StackOrderInput) else load_stack_order(stack_order)
+    image_only = reference.source is None
     if not root.is_dir():
         raise ValueError(f"{root}: source root must be a directory")
     models, errors, notices = [], [], []
@@ -430,7 +432,9 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                         if is_cnt:
                             source_binding = (model_dir.name, "cno", None, layer, geometry_hash)
                         asset_id = canonical_id("asset", source_binding)
-                        claim_id(asset_id, rel(path), model_errors)
+                        duplicate_content = is_cnt and image_only and any(a.kind == 'cno' and a.binding == source_binding for a in assets)
+                        if not duplicate_content:
+                            claim_id(asset_id, rel(path), model_errors)
                         assets.append(SourceAsset(
                             asset_id, model_dir.name, source_binding[1],
                             source_binding[2], source_binding[2], layer, filename_number, rel(path), path.name,
@@ -444,11 +448,20 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
             cnt_groups = {}
             for a in assets:
                 if a.kind == "cno":
-                    cnt_groups.setdefault((a.layer, a.mask_sha256), []).append(a.relative_path)
-            for (name, digest), paths in sorted(cnt_groups.items()):
-                if len(paths) > 1:
-                    model_errors.append(SourceIssue(rel(model_dir),
-                        f"ambiguous_cnt_asset_identity: model {json.dumps(model_dir.name, ensure_ascii=False)}, CNT {json.dumps(name, ensure_ascii=False)}, mask_sha256 {digest}, files {json.dumps(sorted(paths), ensure_ascii=False)}; separate stable source identifiers are required"))
+                    cnt_groups.setdefault((a.layer, a.mask_sha256), []).append(a)
+            for (name, digest), group in sorted(cnt_groups.items()):
+                if len(group) > 1:
+                    paths = sorted(a.relative_path for a in group)
+                    code = 'duplicate_cnt_mask_same_name' if image_only else 'ambiguous_cnt_asset_identity'
+                    (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
+                        f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, CNT {json.dumps(name, ensure_ascii=False)}, mask_sha256 {digest}, files {json.dumps(paths, ensure_ascii=False)}" +
+                        ("; shared content identity, all files retained as provenance" if image_only else "; separate stable source identifiers are required")))
+                    if image_only:
+                        # One content identity; filename numbers never distinguish assets.
+                        representative = group[0]
+                        files = tuple({k: getattr(a, k) for k in ('relative_path', 'original_filename', 'filename_number', 'file_sha256', 'decoded_mode')} for a in group)
+                        assets = [a for a in assets if a not in group] + [replace(representative, provenance_files=files)]
+            assets.sort(key=lambda a: (a.kind, a.layer, a.electrode or "", a.mask_sha256))
             frame = None
             if assets:
                 h, w = assets[0].shape_yx
@@ -467,8 +480,9 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                 folded_names.setdefault(a.layer.casefold(), set()).add(a.layer)
             for names in folded_names.values():
                 if len(names) > 1:
-                    model_errors.append(SourceIssue(rel(model_dir),
-                        f"stack_order_case_collision: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted(names), ensure_ascii=False)}, files {json.dumps(sorted(a.relative_path for a in assets if a.layer in names), ensure_ascii=False)}"))
+                    code = 'layer_name_case_variants' if image_only else 'stack_order_case_collision'
+                    (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
+                        f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted(names), ensure_ascii=False)}, files {json.dumps(sorted(a.relative_path for a in assets if a.layer in names), ensure_ascii=False)}"))
             estimate = ResourceEstimate(unknown_reasons=("invalid_source",) if model_errors else ("extraction_not_run",))
             models.append(ModelSource(model_dir.name, tuple(assets),
                                       tuple(sorted({a.role for a in assets if a.role is not None})),
@@ -484,9 +498,17 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
         return tuple(sorted(counts)), tuple(sorted(n for n, c in counts.items() if c == 1))
     roles, unique_roles = names("roles")
     layers, unique_layers = names("layers")
+    if image_only:
+        folded = {}
+        for name in layers:
+            folded.setdefault(name.casefold(), set()).add(name)
+        for variants in folded.values():
+            involved = sorted(m.model_id for m in models if set(m.layers) & variants)
+            if len(variants) > 1 and len(involved) > 1:
+                notices.append(SourceIssue('.', f'layer_name_case_variants: names {json.dumps(sorted(variants), ensure_ascii=False)}, models {json.dumps(involved, ensure_ascii=False)}; exact source vocabulary preserved'))
     inventory = SourceInventory(tuple(models), policy, roles, layers, unique_roles, unique_layers,
                            tuple(errors), tuple(notices))
-    return resolve_stack_order(inventory, stack_order if isinstance(stack_order, StackOrderInput) else load_stack_order(stack_order))
+    return resolve_stack_order(inventory, reference)
 
 
 def _strict_object(pairs):
@@ -543,7 +565,11 @@ def report_payload(report: ImportReport) -> dict:
                 result["cno_layers"] = list(value.cno_layers)
                 result["all_source_layers"] = result.pop("layers")
             if isinstance(value, SourceAsset):
+                if not value.provenance_files:
+                    result.pop('provenance_files')
                 result["order_index"] = next((m.order_index(value) for m in report.inventory.models if m.model_id == value.model), None)
+            if result.get('geometry_only_component_count', False) is None:
+                result.pop('geometry_only_component_count')
             if isinstance(value, SourceInventory):
                 for name in ("layer_union", "unique_layers"):
                     result["all_source_" + name] = result.pop(name)

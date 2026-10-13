@@ -108,9 +108,10 @@ unsupported old sidecars and added files/directories with clean diagnostics.
 
 Every electrode/cno filename number is positive syntax and provenance only; never
 renumber source files to encode placement. Electrode bindings use exact model/folder/layer
-names with no number. Same-name CNT files stay separate content-bound source assets;
+names with no number. Same-name CNT files with different masks stay separate content-bound source assets;
 only the image channel uses their global union. Identical same-name decoded masks are
-rejected. OCNT/GCNT/PCNT are known names, not a hard-coded whitelist.
+accepted in image_only with a duplicate_cnt_mask_same_name warning and all files recorded
+as provenance of one content asset; relations still rejects them. OCNT/GCNT/PCNT are known names, not a hard-coded whitelist.
 
 Optional **relations** mode is documented in [USAGE §11](docs/USAGE.md#11-선택-사항--순서-파일로-relations-모드-사용):
 pass --stack-order with a common reference filtered per model, covering every present

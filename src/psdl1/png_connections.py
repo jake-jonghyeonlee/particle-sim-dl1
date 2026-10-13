@@ -251,7 +251,7 @@ def estimate_resources(model, component_count, resolved_count):
             not 0 <= resolved_count <= component_count):
         raise ValueError("resource counts require 0 <= resolved <= components")
     h, w = model.frame.shape_yx
-    pixels, electrodes, cnt_files = h * w, len(model.electrodes), len(model.cnt_assets)
+    pixels, electrodes, cnt_files = h * w, len(model.electrodes), sum(len(a.provenance_files) or 1 for a in model.cnt_assets)
     # Export a global CNT mask when at least one observed CNT asset exists,
     # including all-white assets; a missing cno has no fabricated observation.
     indicator = int(cnt_files > 0)
@@ -275,7 +275,7 @@ def estimate_resources(model, component_count, resolved_count):
 def extract_model(model):
     """Inspect without metadata, grids or full-frame per-relation allocations."""
     if not model.valid:
-        return ModelExtraction(model.model_id, (), "unavailable", ExtractionSummary(*(0,) * 10),
+        return ModelExtraction(model.model_id, (), "unavailable", ExtractionSummary(*(0,) * 10, geometry_only_component_count=0 if model.cnt_mode == 'image_only' else None),
                                estimate_resources(model, 0, 0), ("invalid_source",), "blocked",
                                position_source=model.stack_order.source, cnt_mode=model.cnt_mode)
     by_id = {}
@@ -314,13 +314,14 @@ def extract_model(model):
     elif model.cnt_mode == "image_only":
         source_reasons += ("cnt_image_only_no_relations",)
     summary = ExtractionSummary(
-        count, resolved, count - resolved, sum(r.needs_confirmation for r in relations),
+        count, resolved, 0 if model.cnt_mode == 'image_only' else count - resolved, sum(r.needs_confirmation for r in relations),
         sum(r.skipped_upper_layers.present for r in relations),
         sum(r.skipped_lower_layers.present for r in relations),
         sum(len(r.skipped_upper_layers.electrode_layers) for r in relations),
         sum(len(r.skipped_upper_layers.cno_layers) for r in relations),
         sum(len(r.skipped_lower_layers.electrode_layers) for r in relations),
-        sum(len(r.skipped_lower_layers.cno_layers) for r in relations))
+        sum(len(r.skipped_lower_layers.cno_layers) for r in relations),
+        geometry_only_component_count=count if model.cnt_mode == 'image_only' else None)
     return ModelExtraction(model.model_id, tuple(components), status, summary,
                            estimate_resources(model, count, resolved), source_reasons,
                            extraction_status="blocked" if blocked else "not_run_image_only" if model.cnt_mode == "image_only" else "complete",

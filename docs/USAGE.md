@@ -73,7 +73,7 @@ uv pip install --no-index --find-links /approved/wheels -e ".[png]"
 
 ### 테스트 결과 보는 법
 
-O1c 개발 기기 검증은 `551 passed, 1 skipped`였다(약 91초, 합성 자료). O2에서 추가한 검증은 아래 절차와 함께 다시 실행한다. 수치는 해당 시점의 실행 기록이며 대상 OS의 성공을 보증하지 않는다. 건너뛴 1개는 선택형 학습 테스트다. Windows에서 실패가 나오면 실패한 테스트 이름과 메시지를 그대로 전달한다. 실제 자료를 넣기 전에 고칠 수 있다.
+O3(A3) 개발 기기 검증은 `573 passed, 1 skipped`였다(98.24초, 합성 자료; 앞선 O2는 565/1). 수치는 해당 시점의 실행 기록이며 대상 OS의 성공을 보증하지 않는다. 건너뛴 1개는 선택형 학습 테스트다. Windows에서 실패가 나오면 실패한 테스트 이름과 메시지를 그대로 전달한다. 실제 자료를 넣기 전에 고칠 수 있다.
 
 ## 3. PNG 폴더 준비
 
@@ -96,13 +96,13 @@ O1c 개발 기기 검증은 `551 passed, 1 skipped`였다(약 91초, 합성 자�
 | 모델명 폴더 | 그대로 제품 이름(`product_id`)이 된다 |
 | 전극명 폴더 | 그대로 전극 이름이자 역할 이름(`role`)이 된다 |
 | `cno` 폴더 | CNT 전용. 소문자 `cno`여야 한다. `CNO`처럼 대소문자가 다르면 오류다 |
-| 파일명 | `<번호>-<layer>.png` 또는 `<번호>_<layer>.png`. 숫자 뒤 첫 `-`/`_`가 구분자이고 나머지 전체가 layer 이름이다 |
+| 파일명 | `<번호>-<layer>.png` 또는 `<번호>_<layer>.png`. 숫자 뒤 첫 `-`/`_`가 구분자이고 나머지 전체가 layer 이름이다. 확장자는 대소문자 구분 없이 `.png`/`.PNG`/`.Png`를 받으며 원본 파일명은 보존한다 |
 | 파일명 숫자 | 전극·cno 모두 양의 정수와 파일명 문법만 검사한다. **기록용(provenance only)**이며 순서·identity에 쓰지 않는다. 원본 파일을 번호에 맞춰 **이름 변경하지 않는다** |
 | 번호 재사용 | 서로 다른 layer 이름에 같은 번호를 써도 된다. 다른 전극 폴더의 같은 layer가 다른 번호여도 된다 |
 | 중복 전극 × layer | 한 전극 폴더 안에서 같은 layer 파일이 둘이면 오류이며 두 경로를 보고한다 |
-| 같은 CNT 이름 | 여러 cno 파일을 허용하며 source asset과 component는 각각 보존한다. 이미지 채널에서만 전체 CNT를 합친다. 같은 이름·같은 decoded full mask는 identity를 구분할 수 없어 거부한다 |
+| 같은 CNT 이름 | 서로 다른 mask의 여러 cno 파일은 source asset과 component를 각각 보존한다. 이미지 채널에서 전체 CNT를 합친다. **image_only**에서 같은 이름·같은 decoded full mask(모두 흰색 포함)는 허용하고 `duplicate_cnt_mask_same_name` 경고를 낸다. 하나의 content identity에 모든 파일의 `provenance_files`를 남긴다. **relations**에서는 `ambiguous_cnt_asset_identity` 오류로 거부한다 |
 | CNT 이름 종류 | 지금까지 알려진 OCNT/GCNT/PCNT는 whitelist가 아니다. 다른 유효한 이름도 받는다 |
-| 이름 비교 | identity·manifest·vocabulary는 원본 철자를 보존한다. 선택적 순서 파일 매칭만 `casefold`로 대소문자를 무시한다. 한 모델 안의 두 layer 이름이 대소문자만 다르면 오류다. NFC/NFD는 정규화하지 않는다 |
+| 이름 비교 | identity·manifest·vocabulary는 원본 철자를 보존한다. 선택적 순서 파일 매칭만 `casefold`로 대소문자를 무시한다. image_only는 한 모델 안 또는 모델 간 대소문자만 다른 layer 이름을 `layer_name_case_variants` 경고로 보고하고 각각의 vocabulary 철자를 보존한다. 순서 파일을 주면 한 모델 안의 충돌은 오류다. NFC/NFD는 정규화하지 않는다 |
 | 그 밖의 폴더 | 입력 폴더 바로 아래의 모든 폴더는 모델로 본다. 모델이 아닌 폴더가 있으면 전체가 오류다 |
 
 ### 이미지 규칙
@@ -203,6 +203,7 @@ CNT 파일별 이름, bbox, 픽셀 수, `cnt_image_only_no_relations` 사유가 
 | `duplicate_geometry` | 형상이 완전히 같은 파일/모델(중복 제품 가능성). 자동으로 합치지 않는다 |
 | `extraction[].summary` | image_only는 geometry 덩어리 K/관계 0이며 실패한 접촉을 뜻하지 않음; relations는 해결·미해결·확인 필요 수 |
 | `extraction[].connectivity_observation` | 추출 범위: `complete`(전부 해결), `partial`, `unavailable`(해결 없음) |
+| `extraction[].summary` | image_only는 `geometry_only_component_count`로 형상 수를 기록하고 `unresolved_component_count: 0`; 미해결 접촉을 뜻하지 않는다. 이전 v3 묶음의 geometry용 unresolved count도 reader가 호환 검증한다 |
 | `extraction[].components[]` | geometry bbox/픽셀 수/source path/CNT 이름; image_only는 `cnt_order_index: null`, 후보 없음, `relation: null`; `cnt_filename_number`는 provenance |
 | `relation.representative_xy_px` | 연결 위치(원본 픽셀) |
 | `relation.needs_confirmation` | 건너뛴 layer가 있으면 true |
@@ -501,8 +502,10 @@ PY -m psdl1.evaluate --ckpt D:\runs\dl1\dl1.pt --manifest D:\out\bundle1\manifes
 | `nonopaque PNG pixels`, tRNS 오류 | 투명도가 있다. 불투명으로 다시 저장한다 |
 | `APNG is unsupported` | APNG 청크가 있다. 일반 PNG로 다시 저장한다 |
 | `shape mismatch` | 한 모델 안에 크기가 다른 PNG가 있다 |
-| `stack_order_case_collision` | 한 모델의 이름이 대소문자만 다르다. 어느 원본 이름이 맞는지 확인한다. 번호를 바꿔 해결하지 않는다 |
-| `ambiguous_cnt_asset_identity` | 같은 CNT 이름의 decoded full mask가 같다. 보고된 모든 파일의 중복 여부를 확인하고 안정된 source 식별 정책을 요청한다. 번호 변경·자동 병합으로 해결하지 않는다 |
+| `layer_name_case_variants` | image_only 경고이며 내보내기를 막지 않는다. 모델 안/모델 간 대소문자 차이가 별도 vocabulary로 남는다. 원본 자료를 확인하고 번호로 해결하지 않는다 |
+| `stack_order_case_collision` | 선택적 relations에서 순서 파일 또는 한 모델의 이름이 대소문자만 다르다. 어느 원본 이름이 맞는지 확인한다. 번호를 바꿔 해결하지 않는다 |
+| `duplicate_cnt_mask_same_name` | image_only 경고이며 내보내기를 막지 않는다. 같은 이름·같은 decoded mask의 모든 파일을 확인한다. 하나의 content asset에 provenance를 모으며 CNT union은 변하지 않는다 |
+| `ambiguous_cnt_asset_identity` | relations 오류. 같은 CNT 이름의 decoded full mask가 같다. 보고된 모든 파일의 중복 여부를 확인하고 안정된 source 식별 정책을 요청한다. 번호 변경으로 해결하지 않는다 |
 | `duplicate normalized binding` | 같은 전극·layer 파일이 둘이다(예: `6-X.png`와 `006_X.png`) |
 | `unsupported directory layout` | 모델/전극 폴더 구조가 아닌 폴더가 있다. 이전 실행의 출력이 입력 폴더 안에 남은 경우도 이렇게 나온다 |
 | DecompressionBomb 오류 | 이미지가 Pillow 기본 한도를 넘는다. `--png-max-image-pixels <픽셀 수>`를 직접 준다 |
@@ -534,7 +537,7 @@ PY -m psdl1.evaluate --ckpt D:\runs\dl1\dl1.pt --manifest D:\out\bundle1\manifes
 | 중간 layer를 건너뛴 연결을 인정할지 | 구현 해석. preview에서 확인 필요 |
 | 같은 layer에 후보 전극이 여럿일 때의 규칙 | 미정. 지금은 미해결로 둔다 |
 | 같은 전극 연결 규칙 | 사용자가 확인했지만 relations에는 아직 미적용(`same_electrode_required: false`); 다른 전극 간 관계도 나올 수 있는 알려진 gap |
-| 동일 이름·동일 CNT mask | 현재 거부. 별도 stable source ID 계약이 필요하며 prefix 변경은 해법이 아님 |
+| 동일 이름·동일 CNT mask | image_only는 경고와 전체 파일 provenance로 허용; relations는 계속 거부하며 별도 stable source ID 계약이 필요. prefix 변경은 해법이 아님 |
 | CNT 이름 whitelist | OCNT/GCNT/PCNT만으로 제한하지 않음; 선택적 순서 파일에 있는 다른 이름도 허용 |
 | 실제 grid와 최소 선폭 | 폐쇄망에서 4.7로 정한다 |
 | 계열·버전 정보, 역할/layer 별칭 대응 | 사용자가 공급. 별칭 대응 기능 없음 |

@@ -667,7 +667,7 @@ def test_order_names_match_case_insensitively(tmp_path):
     order = write_stack_order(tmp_path / 'collision.json', ['PXL', 'pxl', 'ABSENT'])
     assert load_stack_order(order).errors == ('stack_order_case_collision: order names ["PXL", "pxl"] at indexes [0, 1]',)
     write_png(tmp_path / 'source', 'M/D/1-PXL.png', pixels=((900, 900),))
-    for reference in [None, write_stack_order(tmp_path / 'valid.json', ['PXL', 'OCNT', 'LOWER'])]:
+    for reference in [write_stack_order(tmp_path / 'valid.json', ['PXL', 'OCNT', 'LOWER'])]:
         invalid, = discover_source(tmp_path / 'source', stack_order=reference).models
         assert not invalid.valid and not extract_model(invalid).relations
         error, = [e.reason for e in invalid.errors if e.reason.startswith('stack_order_case_collision:')]
@@ -702,3 +702,17 @@ def test_user_reference_order_filters_per_model(tmp_path):
     assert endpoint_ids(extract_model(second)) == [[expected_element('A', 'SD1', 'SECOND'), expected_element('B', 'GAT2', 'SECOND')]]
     for m in [first, second]:
         assert all(r.representative_xy_px == (20, 10) for r in extract_model(m).relations)
+
+
+def test_to_product_cnt_union_is_all_files(tmp_path):
+    # Three disjoint pixels and one overlap; final file covers only one of them.
+    write_model(tmp_path, [('A','1-U.png',((10,20),)),
+        ('cno','1-OCNT.png',((10,20),(30,40))),
+        ('cno','2-OCNT.png',((30,40),(50,60))),
+        ('cno','3-PCNT.png',((70,80),))])
+    model, = discover_source(tmp_path).models
+    product = to_product(model, extract_model(model))
+    expected = np.zeros((1001,1203), dtype=bool)
+    expected[10,20] = expected[30,40] = expected[50,60] = expected[70,80] = True
+    np.testing.assert_array_equal(product.cnt, expected)
+    assert product.connections == () and product.connectivity_observation == 'unavailable'
