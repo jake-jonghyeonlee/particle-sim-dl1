@@ -99,7 +99,7 @@ class SourceAsset:
     mask_sha256: str
     decoded_mode: str
     shape_yx: tuple[int, int]
-    mask: np.ndarray = field(repr=False, compare=False)
+    mask: np.ndarray | None = field(repr=False, compare=False)
     polarity: str = "black=1,white=0"
     provenance_files: tuple[dict, ...] = ()
 
@@ -140,7 +140,8 @@ class ResourceEstimate:
     overhead_note: str = ("Not peak RAM or runtime prediction; temporary arrays, labels, decoder "
                           "buffers, Python objects, grid tensors and validation add overhead; "
                           "PNG decoding can transiently use about 17–18 bytes/pixel plus its compressed "
-                          "snapshot, and inventory retains about one bool byte/pixel/asset across all models.")
+                          "snapshot. The streaming importer retains one model at a time; eager compatibility "
+                          "APIs retain all models. One model/Product and validation temporaries can still be large.")
 
     all_components_resolved_applicability: str = "relations_only"
 
@@ -267,8 +268,11 @@ class ImportOptions:
     png_max_image_pixels: int | None = None
     verify_bundle: Path | None = None
     stack_order: Path | None = None
+    no_preview: bool = False
 
     def __post_init__(self):
+        if type(self.no_preview) is not bool:
+            raise ValueError("no_preview must be a bool")
         for name, values in (("candidate_grid", (self.candidate_grid,)),
                              ("png_max_image_pixels", (self.png_max_image_pixels,)),
                              ("inspect_grids", self.inspect_grids)):
@@ -395,7 +399,7 @@ class ExtractedComponent:
     bbox_xyxy_px: tuple[int, int, int, int]
     pixel_count: int
     mask_sha256: str  # canonical bbox-local mask; bbox/shape bound by component_id
-    mask: np.ndarray = field(repr=False, compare=False)  # bbox-local only
+    mask: np.ndarray | None = field(repr=False, compare=False)  # bbox-local only
     above_candidates: tuple[OverlapCandidate, ...] = ()
     below_candidates: tuple[OverlapCandidate, ...] = ()
     selected_upper_candidates: tuple[OverlapCandidate, ...] = ()

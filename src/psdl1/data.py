@@ -137,48 +137,81 @@ def _components(mask):
 def check_resampling(source, transformed, *, threshold=0.5):
     """Conservative bridge/component diagnostic, also applicable after common crop."""
     src = binary_mask(source)
+    return _resampling_evidence((_components(src), int(src.sum())), transformed, threshold=threshold)
+
+
+def _resampling_evidence(source_stats, transformed, *, threshold=0.5):
     out = np.asarray(transformed)
     if out.ndim != 2 or not out.size or not np.isfinite(out).all() or (out < 0).any() or (out > 1).any():
         raise ValueError("transformed mask must be finite 2-D coverage in [0,1]")
     if not np.isfinite(threshold) or not 0 < threshold <= 1:
         raise ValueError("threshold must be in (0,1]")
-    before, after = _components(src), _components(out >= threshold)
+    before, active = source_stats
+    after = _components(out >= threshold)
     return {"threshold": threshold, "neighbours": 4,
             "source_components": before, "target_components": after,
-            "source_active_pixels": int(src.sum()), "target_active_pixels": int((out >= threshold).sum()),
+            "source_active_pixels": active, "target_active_pixels": int((out >= threshold).sum()),
             "bridge_or_component_loss": before != after,
             "connectivity_preserving": False,
             "certification": "not_certified: component equality and area similarity do not prove connectivity"}
 
 
-def grid_check(product: Product, grid: int):
+def iter_grid_checks(product: Product, grids):
+    """Yield complete grid records; source statistics live only for this evaluation.
+
+    Product masks must remain unchanged until this iterator is closed/exhausted.
+    A later grid failure does not invalidate previously yielded evidence.
+    """
     shape, valid = validate_product(product)
-    _grid(grid)
-    scale = grid / max(shape)
-    evidence = []
-    for name, mask in [(e.key, e.mask) for e in product.elements] + [(c.connection_id, c.mask) for c in product.connections] + ([("global_CNT", product.cnt)] if product.cnt is not None else []):
-        if mask is None:
-            evidence.append({"id": name, "observation": "missing"})
-            continue
-        source = binary_mask(mask) * valid
-        width = narrowest_run_px(source)
-        evidence.append({"id": name, "observation": "observed", "axis_run_px": width,
-                         "estimated_run_at_grid_px": width * scale,
-                         "thin_line_warning": bool(width and width * scale < 2),
-                         **check_resampling(source, normalize_unit(source, grid))})
-    reasons = []
-    if any(e.get("thin_line_warning") for e in evidence):
-        reasons.append("axis_run_below_2px; real_minimum_linewidth_unconfirmed")
-    if any(e.get("bridge_or_component_loss") for e in evidence):
-        reasons.append("bridge_or_component_loss_at_grid")
-    if any(e["observation"] == "missing" for e in evidence) or not valid.all():
-        reasons.append("missing_observations_or_valid_holes")
-    return {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
-            "transform": frame_transform(shape, grid, product.frame.pixel_pitch_um if product.frame else product.unit_size_um[0] / shape[1]).to_record(),
-            "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
-            "approval": approval_status(), "connectivity_status": product.connectivity_status,
-            "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",
-            "reasons": reasons, "elements": evidence}
+    entries = [(e.key, e.mask) for e in product.elements] + [(c.connection_id, c.mask) for c in product.connections] + ([("global_CNT", product.cnt)] if product.cnt is not None else [])
+    stats = None
+    for grid in grids:
+        _grid(grid)
+        if stats is None:
+            stats = []
+            # Cache scalars only; source coverage is always binary_mask(mask)*valid.
+            for _, mask in entries:
+                if mask is None:
+                    stats.append(None)
+                else:
+                    source = binary_mask(mask) * valid
+                    stats.append((narrowest_run_px(source), _components(source), int(source.sum())))
+                    del source
+        scale = grid / max(shape)
+        evidence = []
+        for (name, mask), measured in zip(entries, stats):
+            if mask is None:
+                evidence.append({"id": name, "observation": "missing"})
+                continue
+            source = binary_mask(mask) * valid
+            width, components, active = measured
+            evidence.append({"id": name, "observation": "observed", "axis_run_px": width,
+                             "estimated_run_at_grid_px": width * scale,
+                             "thin_line_warning": bool(width and width * scale < 2),
+                             **_resampling_evidence((components, active), normalize_unit(source, grid))})
+            del source
+        reasons = []
+        if any(e.get("thin_line_warning") for e in evidence):
+            reasons.append("axis_run_below_2px; real_minimum_linewidth_unconfirmed")
+        if any(e.get("bridge_or_component_loss") for e in evidence):
+            reasons.append("bridge_or_component_loss_at_grid")
+        if any(e["observation"] == "missing" for e in evidence) or not valid.all():
+            reasons.append("missing_observations_or_valid_holes")
+        yield {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
+                "transform": frame_transform(shape, grid, product.frame.pixel_pitch_um if product.frame else product.unit_size_um[0] / shape[1]).to_record(),
+                "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
+                "approval": approval_status(), "connectivity_status": product.connectivity_status,
+                "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",
+                "reasons": reasons, "elements": evidence}
+
+
+def grid_check(product: Product, grid: int):
+    """Compatibility one-grid evaluation, with the original validation order."""
+    checks = iter_grid_checks(product, (grid,))
+    try:
+        return next(checks)
+    finally:
+        checks.close()
 
 
 def input_identity(product: Product):
@@ -310,8 +343,11 @@ def augment(images: torch.Tensor, generator: torch.Generator, scale=(0.6, 1.0), 
     return out
 
 
-def load_manifest(path: str | Path, *, grid: int | None = None) -> list[Product]:
-    """Strict versioned draft manifest; store per-product grid evidence on load."""
+def _iter_manifest_products(path: str | Path, *, grid: int | None = None):
+    """Strict one-product iterator; consumers must exhaust before publishing.
+
+    Global duplicate-ID/pitch errors are raised at exhaustion, preserving eager
+    validation precedence. Close on early exit to release generator state."""
     path = Path(path)
     root = path.parent.resolve()
     def unique_object(pairs):
@@ -332,44 +368,61 @@ def load_manifest(path: str | Path, *, grid: int | None = None) -> list[Product]
         raise ValueError("products must be nonempty list")
     def read(rel):
         return binary_mask(np.load(asset_path(root, rel), allow_pickle=False))
-    products = []
+    ids, duplicate_ids = set(), False
+    first_pitch, same_pitch = None, True
     for raw in doc["products"]:
-        fields(raw, ("product_id", "lineage_id", "design_version", "unit_size_um", "frame", "valid", "elements", "connections", "connectivity_observation"), ("cnt",))
-        for key in ("product_id", "lineage_id", "design_version"):
-            identifier(raw[key], key)
-        fr = raw["frame"]
-        fields(fr, ("frame_id", "length_unit", "origin_xy_um", "pixel_pitch_um", "shape_yx", "axis_order"))
-        if not isinstance(fr["shape_yx"], list):
-            raise ValueError("shape_yx must be a list")
-        frame = Frame(fr["frame_id"], tuple(fr["shape_yx"]), fr["pixel_pitch_um"], fr["origin_xy_um"], fr["length_unit"], fr["axis_order"])
-        if not isinstance(raw["elements"], list) or not isinstance(raw["connections"], list):
-            raise ValueError("elements and connections must be lists")
-        elements = []
-        for e in raw["elements"]:
-            fields(e, ("element_id", "electrode_id", "role", "actual_layer", "observation", "mask"))
-            identifier(e["element_id"], "element_id")
-            identifier(e["electrode_id"], "electrode_id")
-            elements.append(Element(e["role"], e["actual_layer"], None if e["mask"] is None else read(e["mask"]), e["electrode_id"], e["element_id"], e["observation"]))
-        connections = []
-        for c in raw["connections"]:
-            fields(c, ("connection_id", "kind", "endpoints", "mask", "observation"))
-            if not isinstance(c["endpoints"], list):
-                raise ValueError("endpoints must be list")
-            endpoints = []
-            for ep in c["endpoints"]:
-                fields(ep, ("element_id", "xy_um"))
-                endpoints.append(Endpoint(ep["element_id"], numbers(ep["xy_um"], 2, "endpoint xy_um")))
-            connections.append(Connection(c["connection_id"], c["kind"], tuple(endpoints), None if c["mask"] is None else read(c["mask"]), c["observation"]))
-        product = Product(raw["product_id"], raw["unit_size_um"], tuple(elements), None if raw.get("cnt") is None else read(raw["cnt"]),
-                          raw["lineage_id"], raw["design_version"], frame, read(raw["valid"]), tuple(connections), raw["connectivity_observation"])
-        report = grid_check(product, chosen_grid)
-        report["manifest_candidate_grid"] = doc["candidate_grid"]
-        products.append(replace(product, grid_check=report))
-    if len({p.product_id for p in products}) != len(products):
+        product = _manifest_product(raw, read, chosen_grid, doc["candidate_grid"])
+        duplicate_ids |= product.product_id in ids
+        ids.add(product.product_id)
+        pitch = product.frame.pixel_pitch_um
+        if first_pitch is None:
+            first_pitch = pitch
+        same_pitch &= bool(np.isclose(pitch, first_pitch, atol=1e-9, rtol=1e-9))
+        yield product
+        del product
+    if duplicate_ids:
         raise ValueError("duplicate product_id")
-    if not all(np.isclose(p.frame.pixel_pitch_um, products[0].frame.pixel_pitch_um, atol=1e-9, rtol=1e-9) for p in products):
+    if not same_pitch:
         raise ValueError("products must share the same pixel pitch")
-    return products
+
+
+def _manifest_product(raw, read, chosen_grid, candidate_grid):
+    fields(raw, ("product_id", "lineage_id", "design_version", "unit_size_um", "frame", "valid", "elements", "connections", "connectivity_observation"), ("cnt",))
+    for key in ("product_id", "lineage_id", "design_version"):
+        identifier(raw[key], key)
+    fr = raw["frame"]
+    fields(fr, ("frame_id", "length_unit", "origin_xy_um", "pixel_pitch_um", "shape_yx", "axis_order"))
+    if not isinstance(fr["shape_yx"], list):
+        raise ValueError("shape_yx must be a list")
+    frame = Frame(fr["frame_id"], tuple(fr["shape_yx"]), fr["pixel_pitch_um"], fr["origin_xy_um"], fr["length_unit"], fr["axis_order"])
+    if not isinstance(raw["elements"], list) or not isinstance(raw["connections"], list):
+        raise ValueError("elements and connections must be lists")
+    elements = []
+    for e in raw["elements"]:
+        fields(e, ("element_id", "electrode_id", "role", "actual_layer", "observation", "mask"))
+        identifier(e["element_id"], "element_id")
+        identifier(e["electrode_id"], "electrode_id")
+        elements.append(Element(e["role"], e["actual_layer"], None if e["mask"] is None else read(e["mask"]), e["electrode_id"], e["element_id"], e["observation"]))
+    connections = []
+    for c in raw["connections"]:
+        fields(c, ("connection_id", "kind", "endpoints", "mask", "observation"))
+        if not isinstance(c["endpoints"], list):
+            raise ValueError("endpoints must be list")
+        endpoints = []
+        for ep in c["endpoints"]:
+            fields(ep, ("element_id", "xy_um"))
+            endpoints.append(Endpoint(ep["element_id"], numbers(ep["xy_um"], 2, "endpoint xy_um")))
+        connections.append(Connection(c["connection_id"], c["kind"], tuple(endpoints), None if c["mask"] is None else read(c["mask"]), c["observation"]))
+    product = Product(raw["product_id"], raw["unit_size_um"], tuple(elements), None if raw.get("cnt") is None else read(raw["cnt"]),
+                      raw["lineage_id"], raw["design_version"], frame, read(raw["valid"]), tuple(connections), raw["connectivity_observation"])
+    report = grid_check(product, chosen_grid)
+    report["manifest_candidate_grid"] = candidate_grid
+    return replace(product, grid_check=report)
+
+
+def load_manifest(path: str | Path, *, grid: int | None = None) -> list[Product]:
+    """Eager compatibility API for the shared strict manifest reader."""
+    return list(_iter_manifest_products(path, grid=grid))
 
 
 def main():

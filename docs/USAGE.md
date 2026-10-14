@@ -151,7 +151,13 @@ Windows에서는 출력 경로를 짧게 잡는다. 생성되는 파일 이름�
 | 0 | 성공 |
 | 2 | 입력 오류, 내보내기 조건 미충족, 출력 경로 거부, 실패 |
 
-화면에는 JSON이 두 줄 나온다. 첫 줄(`resource_inventory`)은 용량 추정과 이름 목록, 둘째 줄(`completed`)은 결과다.
+표준 출력(stdout)에는 JSON이 두 줄 나온다. 첫 줄(`resource_inventory`)은 용량 추정과 이름 목록, 둘째 줄(`completed`)은 결과다. 진행 상황은 별도의 stderr JSON 줄(`event: "progress"`)로 즉시 출력된다. 읽기, 모델, grid, preview, 내보내기, 검증 단계와 첫 파일·100개 단위·마지막 파일 수를 확인할 수 있다. 라이브러리 호출은 `progress_sink`를 지정할 때만 진행 상황을 전달한다. 진행 줄은 `event == "progress"`인 JSON 객체다. 오류·경고·argparse 메시지 등 다른 stderr 줄은 일반 텍스트이므로, 전체 stderr를 JSON으로 해석하지 말고 먼저 걸러낸다.
+
+```bash
+# stderr 전체 기록에서 진행 JSON 줄만 추출한 뒤 JSON으로 해석한다.
+grep '"event": "progress"' stderr.log > progress.jsonl
+```
+
 
 ### 4.2 만들어지는 파일
 
@@ -162,6 +168,27 @@ D:\out\inspect1\
   preview\                 preview가 쓰는 이미지
   bundle-integrity.json    위 파일들의 SHA-256 목록
 ```
+
+`--no-preview`를 지정하면 `preview.html`과 `preview/`를 만들지 않고, 보고서의 `preview`는 빈 목록이 된다. `diagnostics`에는 `preview_skipped_by_request: --no-preview`가 정확히 한 번 기록된다. 원본·추출·grid 근거 및 내보내는 mask는 모두 유지된다. 기본값은 preview 생성이다. 이 옵션은 `--verify-bundle`과 함께 사용할 수 없다.
+
+Linux/macOS 예시 (출력 경로는 새 경로로 지정):
+
+```bash
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$NEW_INSPECT_OUT" \
+  --inspect-grids 32 64 --no-preview > result.jsonl 2> progress.jsonl
+.venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$NEW_EXPORT_OUT" \
+  --export --metadata "$METADATA_JSON" --candidate-grid 64 --no-preview \
+  > export-result.jsonl 2> export-progress.jsonl
+```
+
+Windows PowerShell 예시:
+
+```powershell
+PY -m psdl1.import_png --root D:\png_root --out D:\out\inspect-new --inspect-grids 32 64 --no-preview 1> result.jsonl 2> progress.jsonl
+PY -m psdl1.import_png --root D:\png_root --out D:\out\export-new --export --metadata D:\metadata.json --candidate-grid 64 --no-preview 1> export-result.jsonl 2> export-progress.jsonl
+```
+
+중단/실패하면 표시된 staging 경로의 진단 근거를 보존하고 **새 `--out` 경로**로 다시 실행한다. 기존 출력이나 실패 stage를 자동 재사용·덮어쓰지 않는다. 읽기 패스 사이에 원본(병합 CNT의 모든 provenance 파일 포함)이 바뀌거나 없어지거나 루트 밖 링크로 바뀌면 출판을 중단한다.
 
 ### 4.3 preview로 CNT 형상 확인
 
@@ -228,6 +255,11 @@ image_only는 **R=0**이므로 연결별 mask를 만들지 않는다. 선택적 
 | `all_components_resolved_applicability` | image_only는 `not_applicable_image_only`; 이것을 실행 계획으로 해석하지 않는다 |
 
 이 값은 최대 메모리나 실행 시간 예측이 아니다. 디코딩 중에는 픽셀당 약 17~18바이트가 일시적으로 더 쓰인다. 자원이 충분한지는 이 숫자를 보고 사용자가 판단한다. 프로그램이 정한 한도는 없다.
+
+검사/내보내기는 원본 mask를 **모델 하나씩** 읽고 추출한 뒤, 보고서에는 배열 없는 기록만 보관한다. 전체 용량 추정은 grid/Product 할당 전에 기록된다. 이후 필요한 모델만 다시 읽어 PNG 바이트 해시·mode·shape·형상 해시를 검사하고 추출 결과를 대조한다. 모델의 각 관측 mask에서 원본 폭·성분 수·활성 픽셀 수를 한 번 계산해 후보 grid 사이에 재사용하며, 후보별 변환과 결과 검사는 그대로 수행한다. 내보내기는 별도 패스로 다시 읽는다. 반복 디코딩/추출 때문에 CPU·디스크 읽기 시간이 늘 수 있다.
+
+이 한도는 고정 RAM 한도가 아니라 **가장 큰 모델 기준**이다. 연결마다 전체 frame mask가 필요하며, 내보낸 NPY 검증은 한 모델의 Product를 float32(픽셀·mask당 약 4바이트)로 보관한다. 예를 들어 1500×1500 mask 900개는 **한 모델만 약 8.1 GB**이고 여기에 디코더·검증 임시 배열 등이 더해진다. 모델 하나가 너무 크면 여전히 메모리가 부족할 수 있다. 보고서·manifest·HTML 텍스트는 모델 수에 비례한다. 학습 및 공개 `data.load_manifest`는 모든 Product를 메모리에 유지하는 eager API다. 이 변경으로 실제 18,000 PNG 데이터 처리 성공을 확인한 것은 아니다.
+
 
 ### 4.7 grid 고르기
 

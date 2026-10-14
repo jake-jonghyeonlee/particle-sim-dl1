@@ -258,7 +258,7 @@ def test_grid_failure_preserves_diagnostics_preview_and_blocks_export(tmp_path, 
     out = tmp_path / "failed-grid"
     def failed_grid(*args):
         raise RuntimeError("synthetic grid runner failure")
-    monkeypatch.setattr(importer, "grid_check", failed_grid)
+    monkeypatch.setattr(importer, "iter_grid_checks", failed_grid)
     _, code = importer.run_import(ImportOptions(root, out, True, metadata(tmp_path / "metadata.json"),
                                                 16, inspect_grids=(8,), stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))
     assert code == 2 and report(out)["export_status"] == "blocked"
@@ -425,13 +425,13 @@ def test_rb_S15_multi_stage_failure_and_pending_manifest(tmp_path, monkeypatch, 
     root = tmp_path / "source"; write_import_fixture(root)
     out = tmp_path / "out"
     mapping = metadata(tmp_path / "metadata.json")
-    original_loader = importer.load_manifest
+    original_loader = importer._iter_manifest_products
     def guarded_loader(path):
         assert path.name == "manifest.pending.json"
         assert not (path.parent / "manifest.json").exists()
         if point == "validation": raise RuntimeError("synthetic validation fault")
         return original_loader(path)
-    monkeypatch.setattr(importer, "load_manifest", guarded_loader)
+    monkeypatch.setattr(importer, "_iter_manifest_products", guarded_loader)
     target = {"seal": "_seal_bundle", "verify": "verify_bundle", "publish": "_publish_noreplace", "interrupt-seal": "_seal_bundle"}.get(point)
     if target:
         def fail(*args):

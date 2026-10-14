@@ -68,12 +68,21 @@ unchanged and does not guarantee a portable wheelhouse; no online fallback exist
 # Paths and candidate grids must be supplied by the user; destinations must be new.
 .venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$INSPECT_OUT"
 .venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$GRID_INSPECT_OUT" \
-  --inspect-grids "$GRID_A" "$GRID_B"
+  --inspect-grids "$GRID_A" "$GRID_B" --no-preview 2> "$PROGRESS_JSONL"
 .venv/bin/python -m psdl1.import_png --root "$PNG_ROOT" --out "$EXPORT_OUT" \
   --export --metadata "$METADATA_JSON" --candidate-grid "$CANDIDATE_GRID"
 .venv/bin/python -m psdl1.import_png --verify-bundle "$EXPORT_OUT"
 .venv/bin/python -m psdl1.data "$EXPORT_OUT/manifest.json" --report "$VALIDATOR_REPORT"
 ```
+
+CLI progress lines are JSON objects with `event == "progress"`, flushed on stderr.
+Other stderr lines (errors, warnings and argparse messages) are plain text; filter them
+before parsing, for example `grep '"event": "progress"' stderr.log > progress.jsonl`.
+Stdout remains exactly the
+`resource_inventory` and `completed` result events. `--no-preview` skips HTML/preview
+rasters only, recording `preview_skipped_by_request: --no-preview`; all geometry,
+extraction, grids and export assets remain. After interruption, retain failure staging
+and retry with a fresh `--out`. No 18,000-PNG production success is claimed.
 
 Inspection writes a versioned report and offline full-frame preview without metadata
 or a grid. Explicit grid inspection compares candidates without approving/selecting
@@ -84,8 +93,12 @@ are inferred. Without --stack-order the default cnt_mode is image_only: full-fra
 windows in the preview are display aids only.
 
 Resource and name inventories precede heavy export/grid allocations. Review N/E/K/R,
-bool export bytes and retained float32 loader bytes before use. Image-only uses R=0 and all_components_resolved=null (not_applicable_image_only); that upper scenario applies only to relations mode. Decoder temporaries, all retained source masks and per-relation
-full-frame masks add memory; estimates do not certify peak RAM or runtime. Exact role
+bool export bytes and retained float32 loader bytes before use. Image-only uses R=0 and all_components_resolved=null (not_applicable_image_only); that upper scenario applies only to relations mode. The importer retains original rasters for one model at a time, verifies source hashes on
+reload, and validates staged Products sequentially. This trades repeated decoding/extraction
+for lower retention. Decoder buffers, per-relation full-frame masks and one float32 Product
+can still be large; 900 masks of 1500×1500 need about 8.1 GB in one float32 Product alone.
+Training and the public `data.load_manifest` API remain eager across all products; estimates
+do not certify peak RAM or runtime. Exact role
 and layer names must be in the checkpoint's training vocabulary: unknown queries are
 unavailable, candidates excluded, and direct embedding fails with the missing names.
 A shared symbol does not establish physical equivalence.

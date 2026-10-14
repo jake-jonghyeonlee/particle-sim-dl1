@@ -96,7 +96,6 @@ class _PNGBuffer:
         return BytesIO(self.data)
 
 
-
 class _PNGScanlines:
     """Stream inflated bytes into scanlines; retain at most two packed rows.
 
@@ -329,13 +328,44 @@ def decode_png(path, *, png_max_image_pixels=None):
         return mask, mode, policy
 
 
-def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> SourceInventory:
-    root = Path(root).resolve(strict=True)
-    reference = stack_order if isinstance(stack_order, StackOrderInput) else load_stack_order(stack_order)
+class _SourceScanner:
+    """Single-use shared scanner. Global state contains scalar vocabulary/IDs only.
+
+    Consume models one at a time, releasing each before advancing. Call finish
+    only after exhaustion, passing eager or detached records in traversal order.
+    Closing the iterator also restores the decoder policy after interruption.
+    """
+    def __init__(self, root, *, png_max_image_pixels=None, stack_order=None, progress=None):
+        self.progress = progress or (lambda **record: None)
+        self.root = Path(root).resolve(strict=True)
+        if not self.root.is_dir():
+            raise ValueError(f"{self.root}: source root must be a directory")
+        self.reference = stack_order if isinstance(stack_order, StackOrderInput) else load_stack_order(stack_order)
+        self.png_max_image_pixels = png_max_image_pixels
+        self.errors, self.notices, self.names = [], [], []
+        self.decoder = None
+        self.complete = False
+        self.started = False
+
+    def __iter__(self):
+        if self.started:
+            raise ValueError("source scanner is single-use")
+        self.started = True
+        return _scan_source(self)
+
+    def finish(self, models):
+        if not self.complete:
+            raise ValueError("source scanner must be exhausted before finalization")
+        models = tuple(models)
+        if tuple(m.model_id for m in models) != tuple(m[0] for m in self.names):
+            raise ValueError("scanner models must preserve traversal order")
+        return _finish_inventory(models, self)
+
+
+def _scan_source(scanner):
+    root, reference = scanner.root, scanner.reference
     image_only = reference.source is None
-    if not root.is_dir():
-        raise ValueError(f"{root}: source root must be a directory")
-    models, errors, notices = [], [], []
+    errors, notices = scanner.errors, scanner.notices
     emitted_ids = {}
 
     def rel(path):
@@ -373,121 +403,147 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
         else:
             warning_list.append(SourceIssue(rel(path), "ignored unrelated non-PNG file"))
 
-    with decoder_session(png_max_image_pixels) as policy:
+    def scan_model(model_dir, policy):
+        scanner.progress(stage="reading", state="started", model_id=model_dir.name)
+        model_errors, model_warnings, assets = [], [], []
+        warn_name(model_dir.name, model_dir, model_warnings)
+        try:
+            identifier(model_dir.name, "model")
+        except ValueError as exc:
+            model_errors.append(SourceIssue(rel(model_dir), str(exc)))
+        bindings = {}
+        files_done = 0
+        cno_present = False
+        for folder in sorted(model_dir.iterdir()):
+            if not safe(folder, model_errors):
+                continue
+            if not folder.is_dir():
+                unexpected(folder, model_errors, model_warnings)
+                continue
+            try:
+                identifier(folder.name, "electrode")
+            except ValueError as exc:
+                model_errors.append(SourceIssue(rel(folder), str(exc)))
+            warn_name(folder.name, folder, model_warnings)
+            if folder.name != "cno" and folder.name.casefold() == "cno":
+                model_errors.append(SourceIssue(rel(folder), "reserved CNT folder is exactly 'cno'; rename this case variant explicitly"))
+                continue
+            is_cnt = folder.name == "cno"
+            cno_present |= is_cnt
+            png_count = 0
+            for path in sorted(folder.iterdir()):
+                if not safe(path, model_errors):
+                    continue
+                if path.is_dir() or path.suffix.lower() != ".png":
+                    unexpected(path, model_errors, model_warnings)
+                    continue
+                png_count += 1
+                try:
+                    filename_number, layer = parse_png_name(path.name)
+                except ValueError as exc:
+                    model_errors.append(SourceIssue(rel(path), str(exc)))
+                    continue
+                warn_name(layer, path, model_warnings)
+                binding = (folder.name, layer)
+                if not is_cnt and binding in bindings:
+                    model_errors.append(SourceIssue(rel(path), f"duplicate normalized binding; also {bindings[binding]}"))
+                    model_errors.append(SourceIssue(bindings[binding], f"duplicate normalized binding; also {rel(path)}"))
+                elif not is_cnt:
+                    bindings[binding] = rel(path)
+                try:
+                    mask, mode, file_hash = _decode(path, rel(path), policy)
+                    source_binding = (model_dir.name, "cno" if is_cnt else "electrode",
+                                      None if is_cnt else folder.name, layer)
+                    geometry_hash = mask_hash(mask)
+                    if is_cnt:
+                        source_binding = (model_dir.name, "cno", None, layer, geometry_hash)
+                    asset_id = canonical_id("asset", source_binding)
+                    duplicate_content = is_cnt and image_only and any(a.kind == 'cno' and a.binding == source_binding for a in assets)
+                    if not duplicate_content:
+                        claim_id(asset_id, rel(path), model_errors)
+                    assets.append(SourceAsset(
+                        asset_id, model_dir.name, source_binding[1],
+                        source_binding[2], source_binding[2], layer, filename_number, rel(path), path.name,
+                        file_hash, geometry_hash, mode,
+                        tuple(mask.shape), None if duplicate_content else mask))
+                    del mask
+                except PNGSourceError as exc:
+                    model_errors.append(exc.issue)
+                files_done += 1
+                if files_done == 1 or files_done % 100 == 0:
+                    scanner.progress(stage="reading", state="advanced", model_id=model_dir.name, files_done=files_done)
+            if not is_cnt and not png_count:
+                model_warnings.append(SourceIssue(rel(folder), "electrode folder contains no PNG assets"))
+        scanner.progress(stage="reading", state="completed", model_id=model_dir.name, files_done=files_done, files_total=files_done)
+        assets.sort(key=lambda a: (a.kind, a.layer, a.electrode or "", a.mask_sha256))
+        cnt_groups = {}
+        for a in assets:
+            if a.kind == "cno":
+                cnt_groups.setdefault((a.layer, a.mask_sha256), []).append(a)
+        for (name, digest), group in sorted(cnt_groups.items()):
+            if len(group) > 1:
+                paths = sorted(a.relative_path for a in group)
+                code = 'duplicate_cnt_mask_same_name' if image_only else 'ambiguous_cnt_asset_identity'
+                (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
+                    f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, CNT {json.dumps(name, ensure_ascii=False)}, mask_sha256 {digest}, files {json.dumps(paths, ensure_ascii=False)}" +
+                    ("; shared content identity, all files retained as provenance" if image_only else "; separate stable source identifiers are required")))
+                if image_only:
+                    # One content identity; filename numbers never distinguish assets.
+                    representative = group[0]
+                    files = tuple({k: getattr(a, k) for k in ('relative_path', 'original_filename', 'filename_number', 'file_sha256', 'decoded_mode')} for a in group)
+                    assets = [a for a in assets if a not in group] + [replace(representative, provenance_files=files)]
+        assets.sort(key=lambda a: (a.kind, a.layer, a.electrode or "", a.mask_sha256))
+        frame = None
+        if assets:
+            h, w = assets[0].shape_yx
+            for a in assets:
+                if a.shape_yx != (h, w):
+                    model_errors.append(SourceIssue(a.relative_path, f"shape mismatch with {assets[0].relative_path}"))
+                if min(a.shape_yx) <= 1000:
+                    model_errors.append(SourceIssue(a.relative_path, "source frame requires W>1000 and H>1000"))
+            frame = FrameRecord(canonical_id("frame", [model_dir.name, h, w, 0.1, [0, 0]]),
+                                (h, w), (w * 0.1, h * 0.1), (500, 500, w - 500, h - 500))
+            claim_id(frame.frame_id, rel(model_dir), model_errors)
+        if not any(a.kind == "electrode" for a in assets):
+            model_errors.append(SourceIssue(rel(model_dir), "no decoded electrode assets"))
+        folded_names = {}
+        for a in assets:
+            folded_names.setdefault(a.layer.casefold(), set()).add(a.layer)
+        for names in folded_names.values():
+            if len(names) > 1:
+                code = 'layer_name_case_variants' if image_only else 'stack_order_case_collision'
+                (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
+                    f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted(names), ensure_ascii=False)}, files {json.dumps(sorted(a.relative_path for a in assets if a.layer in names), ensure_ascii=False)}"))
+        estimate = ResourceEstimate(unknown_reasons=("invalid_source",) if model_errors else ("extraction_not_run",))
+        return ModelSource(model_dir.name, tuple(assets),
+                           tuple(sorted({a.role for a in assets if a.role is not None})),
+                           tuple(sorted({a.layer for a in assets})), frame, cno_present,
+                           tuple(model_errors), tuple(model_warnings), estimate)
+
+    with decoder_session(scanner.png_max_image_pixels) as policy:
+        scanner.decoder = policy
+        model_index = 0
         for model_dir in sorted(root.iterdir()):
             if not safe(model_dir, errors):
                 continue
             if not model_dir.is_dir():
                 unexpected(model_dir, errors, notices)
                 continue
-            model_errors, model_warnings, assets = [], [], []
-            warn_name(model_dir.name, model_dir, model_warnings)
-            try:
-                identifier(model_dir.name, "model")
-            except ValueError as exc:
-                model_errors.append(SourceIssue(rel(model_dir), str(exc)))
-            bindings = {}
-            cno_present = False
-            for folder in sorted(model_dir.iterdir()):
-                if not safe(folder, model_errors):
-                    continue
-                if not folder.is_dir():
-                    unexpected(folder, model_errors, model_warnings)
-                    continue
-                try:
-                    identifier(folder.name, "electrode")
-                except ValueError as exc:
-                    model_errors.append(SourceIssue(rel(folder), str(exc)))
-                warn_name(folder.name, folder, model_warnings)
-                if folder.name != "cno" and folder.name.casefold() == "cno":
-                    model_errors.append(SourceIssue(rel(folder), "reserved CNT folder is exactly 'cno'; rename this case variant explicitly"))
-                    continue
-                is_cnt = folder.name == "cno"
-                cno_present |= is_cnt
-                png_count = 0
-                for path in sorted(folder.iterdir()):
-                    if not safe(path, model_errors):
-                        continue
-                    if path.is_dir() or path.suffix.lower() != ".png":
-                        unexpected(path, model_errors, model_warnings)
-                        continue
-                    png_count += 1
-                    try:
-                        filename_number, layer = parse_png_name(path.name)
-                    except ValueError as exc:
-                        model_errors.append(SourceIssue(rel(path), str(exc)))
-                        continue
-                    warn_name(layer, path, model_warnings)
-                    binding = (folder.name, layer)
-                    if not is_cnt and binding in bindings:
-                        model_errors.append(SourceIssue(rel(path), f"duplicate normalized binding; also {bindings[binding]}"))
-                        model_errors.append(SourceIssue(bindings[binding], f"duplicate normalized binding; also {rel(path)}"))
-                    elif not is_cnt:
-                        bindings[binding] = rel(path)
-                    try:
-                        mask, mode, file_hash = _decode(path, rel(path), policy)
-                        source_binding = (model_dir.name, "cno" if is_cnt else "electrode",
-                                          None if is_cnt else folder.name, layer)
-                        geometry_hash = mask_hash(mask)
-                        if is_cnt:
-                            source_binding = (model_dir.name, "cno", None, layer, geometry_hash)
-                        asset_id = canonical_id("asset", source_binding)
-                        duplicate_content = is_cnt and image_only and any(a.kind == 'cno' and a.binding == source_binding for a in assets)
-                        if not duplicate_content:
-                            claim_id(asset_id, rel(path), model_errors)
-                        assets.append(SourceAsset(
-                            asset_id, model_dir.name, source_binding[1],
-                            source_binding[2], source_binding[2], layer, filename_number, rel(path), path.name,
-                            file_hash, geometry_hash, mode,
-                            tuple(mask.shape), mask))
-                    except PNGSourceError as exc:
-                        model_errors.append(exc.issue)
-                if not is_cnt and not png_count:
-                    model_warnings.append(SourceIssue(rel(folder), "electrode folder contains no PNG assets"))
-            assets.sort(key=lambda a: (a.kind, a.layer, a.electrode or "", a.mask_sha256))
-            cnt_groups = {}
-            for a in assets:
-                if a.kind == "cno":
-                    cnt_groups.setdefault((a.layer, a.mask_sha256), []).append(a)
-            for (name, digest), group in sorted(cnt_groups.items()):
-                if len(group) > 1:
-                    paths = sorted(a.relative_path for a in group)
-                    code = 'duplicate_cnt_mask_same_name' if image_only else 'ambiguous_cnt_asset_identity'
-                    (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
-                        f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, CNT {json.dumps(name, ensure_ascii=False)}, mask_sha256 {digest}, files {json.dumps(paths, ensure_ascii=False)}" +
-                        ("; shared content identity, all files retained as provenance" if image_only else "; separate stable source identifiers are required")))
-                    if image_only:
-                        # One content identity; filename numbers never distinguish assets.
-                        representative = group[0]
-                        files = tuple({k: getattr(a, k) for k in ('relative_path', 'original_filename', 'filename_number', 'file_sha256', 'decoded_mode')} for a in group)
-                        assets = [a for a in assets if a not in group] + [replace(representative, provenance_files=files)]
-            assets.sort(key=lambda a: (a.kind, a.layer, a.electrode or "", a.mask_sha256))
-            frame = None
-            if assets:
-                h, w = assets[0].shape_yx
-                for a in assets:
-                    if a.shape_yx != (h, w):
-                        model_errors.append(SourceIssue(a.relative_path, f"shape mismatch with {assets[0].relative_path}"))
-                    if min(a.shape_yx) <= 1000:
-                        model_errors.append(SourceIssue(a.relative_path, "source frame requires W>1000 and H>1000"))
-                frame = FrameRecord(canonical_id("frame", [model_dir.name, h, w, 0.1, [0, 0]]),
-                                    (h, w), (w * 0.1, h * 0.1), (500, 500, w - 500, h - 500))
-                claim_id(frame.frame_id, rel(model_dir), model_errors)
-            if not any(a.kind == "electrode" for a in assets):
-                model_errors.append(SourceIssue(rel(model_dir), "no decoded electrode assets"))
-            folded_names = {}
-            for a in assets:
-                folded_names.setdefault(a.layer.casefold(), set()).add(a.layer)
-            for names in folded_names.values():
-                if len(names) > 1:
-                    code = 'layer_name_case_variants' if image_only else 'stack_order_case_collision'
-                    (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
-                        f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted(names), ensure_ascii=False)}, files {json.dumps(sorted(a.relative_path for a in assets if a.layer in names), ensure_ascii=False)}"))
-            estimate = ResourceEstimate(unknown_reasons=("invalid_source",) if model_errors else ("extraction_not_run",))
-            models.append(ModelSource(model_dir.name, tuple(assets),
-                                      tuple(sorted({a.role for a in assets if a.role is not None})),
-                                      tuple(sorted({a.layer for a in assets})), frame, cno_present,
-                                      tuple(model_errors), tuple(model_warnings), estimate))
+            model_index += 1
+            scanner.progress(stage="model", state="started", model_id=model_dir.name, model_index=model_index)
+            model = scan_model(model_dir, policy)
+            model = replace(model, stack_order=resolve_model_order(model, reference),
+                            cnt_mode="image_only" if image_only else "relations")
+            scanner.names.append((model.model_id, model.roles, model.layers))
+            yield model
+            del model
+            scanner.progress(stage="model", state="completed", model_id=model_dir.name, model_index=model_index)
+    scanner.complete = True
+
+
+def _finish_inventory(models, scanner):
+    errors, notices = list(scanner.errors), list(scanner.notices)
+    policy, image_only = scanner.decoder, scanner.reference.source is None
     if not models:
         errors.append(SourceIssue(".", "no source models discovered"))
     def names(field):
@@ -508,7 +564,62 @@ def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> Sou
                 notices.append(SourceIssue('.', f'layer_name_case_variants: names {json.dumps(sorted(variants), ensure_ascii=False)}, models {json.dumps(involved, ensure_ascii=False)}; exact source vocabulary preserved'))
     inventory = SourceInventory(tuple(models), policy, roles, layers, unique_roles, unique_layers,
                            tuple(errors), tuple(notices))
-    return resolve_stack_order(inventory, reference)
+    return inventory
+
+
+def discover_source(root, *, png_max_image_pixels=None, stack_order=None) -> SourceInventory:
+    """Eager compatibility API; arrays remain resident for all returned models."""
+    scanner = _SourceScanner(root, png_max_image_pixels=png_max_image_pixels, stack_order=stack_order)
+    return scanner.finish(tuple(scanner))
+
+
+def _detach_model(model):
+    """Private report snapshot: None marks detached, never an empty observation."""
+    return replace(model, assets=tuple(replace(a, mask=None) for a in model.assets))
+
+
+def _require_model_masks(model):
+    if any(a.mask is None for a in model.assets):
+        raise ValueError("detached source model requires verified reload before mask consumption")
+
+
+def _reload_model(root, model, policy, *, progress=None):
+    """Reload only recorded paths, checking each immutable decoder snapshot."""
+    try:
+        root = Path(root).resolve(strict=True)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"source changed: source root unavailable: {root}") from exc
+    progress = progress or (lambda **record: None)
+    files_total = sum(len(a.provenance_files) or 1 for a in model.assets)
+    files_done = 0
+    progress(stage="reading", state="started", model_id=model.model_id, files_total=files_total)
+    assets = []
+    for asset in model.assets:
+        representative = None
+        files = asset.provenance_files or ({"relative_path": asset.relative_path,
+                  "file_sha256": asset.file_sha256, "decoded_mode": asset.decoded_mode},)
+        for provenance in files:
+            relative = provenance["relative_path"]
+            path = root / relative
+            try:
+                path.resolve(strict=True).relative_to(root)
+                mask, mode, digest = _decode(path, relative, policy)
+                if (digest != provenance["file_sha256"] or mode != provenance["decoded_mode"] or
+                        tuple(mask.shape) != asset.shape_yx or mask_hash(mask) != asset.mask_sha256):
+                    raise ValueError("snapshot differs from inventory")
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise ValueError(f"source changed: {relative}: {exc}") from exc
+            if relative == asset.relative_path:
+                representative = mask
+            del mask
+            files_done += 1
+            if files_done == 1 or files_done % 100 == 0 or files_done == files_total:
+                progress(stage="reading", state="advanced", model_id=model.model_id, files_done=files_done, files_total=files_total)
+        if representative is None:
+            raise ValueError(f"source changed: missing representative provenance: {asset.relative_path}")
+        assets.append(replace(asset, mask=representative))
+    progress(stage="reading", state="completed", model_id=model.model_id, files_done=files_done, files_total=files_total)
+    return replace(model, assets=tuple(assets))
 
 
 def _strict_object(pairs):

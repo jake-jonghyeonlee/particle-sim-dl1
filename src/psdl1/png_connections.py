@@ -274,6 +274,8 @@ def estimate_resources(model, component_count, resolved_count):
 
 def extract_model(model):
     """Inspect without metadata, grids or full-frame per-relation allocations."""
+    from .png_source import _require_model_masks
+    _require_model_masks(model)
     if not model.valid:
         return ModelExtraction(model.model_id, (), "unavailable", ExtractionSummary(*(0,) * 10, geometry_only_component_count=0 if model.cnt_mode == 'image_only' else None),
                                estimate_resources(model, 0, 0), ("invalid_source",), "blocked",
@@ -336,6 +338,8 @@ def extract_inventory(inventory):
 
 def component_mask(component):
     """Compatibility boundary ONLY: materialize one original-frame bool mask."""
+    if component.mask is None:
+        raise ValueError("detached component requires verified reload before mask consumption")
     mask = np.zeros(component.shape_yx, dtype=np.bool_)
     x0, y0, x1, y1 = component.bbox_xyxy_px
     mask[y0:y1, x0:x1] = component.mask
@@ -344,6 +348,7 @@ def component_mask(component):
 
 def iter_connections(extraction):
     """Export can consume/release one full-frame mask at a time."""
+    _require_extraction_masks(extraction)
     if extraction.cnt_mode == "image_only" and extraction.relations:
         raise ValueError("image-only products cannot contain relations")
     for component in extraction.components:
@@ -359,6 +364,9 @@ def to_product(model, extraction, *, metadata=None):
     Callers must surface resource_estimate BEFORE this potentially heavy boundary.
     Metadata stays absent for inspection unless explicitly supplied by the caller.
     """
+    from .png_source import _require_model_masks
+    _require_model_masks(model)
+    _require_extraction_masks(extraction)
     if not model.valid or extraction.extraction_status not in {"complete", "not_run_image_only"} or model.model_id != extraction.model_id:
         raise ValueError("valid source and matching completed extraction required")
     if metadata is not None and metadata.model_id != model.model_id:
@@ -378,3 +386,24 @@ def to_product(model, extraction, *, metadata=None):
                       extraction.connectivity_observation)
     validate_product(product)
     return product
+
+
+def _detach_extraction(extraction):
+    """Private report snapshot; component masks are absent, not empty."""
+    return replace(extraction, components=tuple(replace(c, mask=None) for c in extraction.components))
+
+
+def _require_extraction_masks(extraction):
+    if any(c.mask is None for c in extraction.components):
+        raise ValueError("detached extraction requires verified reload before mask consumption")
+
+
+def _reload_extraction(root, model, extraction, policy, *, progress=None):
+    """Verify source snapshots and replay pass-1 extraction/resource evidence."""
+    from .png_source import _reload_model
+    live = _reload_model(root, model, policy, progress=progress)
+    replay = extract_model(live)
+    if (_detach_extraction(replay) != _detach_extraction(extraction) or
+            replay.resource_estimate != model.resource_estimate):
+        raise ValueError(f"source changed: extraction evidence differs for {model.model_id}")
+    return live, replay

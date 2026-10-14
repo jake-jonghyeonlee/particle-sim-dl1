@@ -481,23 +481,71 @@ for valid models, and lists all source warnings/errors, exact per-model/union/un
 vocabulary, duplicate geometry and resource estimates. These records are saved and
 surfaced before full-frame grid/Product allocations or export writes. Explicit
 `--inspect-grids` only compares supplied candidates; there is no automatic grid choice.
-The interim rounded transform records match the existing recipe; T4 consolidates them.
+Rounded transform records match the existing full-frame recipe exactly.
 
 Export requires complete explicit metadata and a candidate grid. One invalid model blocks
 the entire export pool; missing/invalid metadata/grid yields a diagnostic-only published
 bundle and nonzero exit. Valid unresolved CNT components remain in the global CNT union.
 Every generated NPY is bool, and full frame extent goes into the unchanged strict v1
 manifest's compatibility size field. Connection masks are materialized/written one at
-a time; the staged `load_manifest` and `validate_product` boundary is still eager and
-adds its documented float32/validation/grid allocations. Report Product input identities
-come from that unchanged staged loader.
+a time. The shared strict manifest iterator validates one staged float32 Product at a
+time and collects scalar input identities/grid evidence. It must be exhausted before
+manifest promotion: late duplicate IDs, pitch differences and bad final assets still
+fail publication. Public `data.load_manifest` remains an eager list API for training.
+
+Inventory discovery/extraction streams one model, attaches its exact resource estimate,
+then privately detaches every source and bbox-component mask (`mask=None`, never empty
+observed data). No arrays enter retained reports. The shared scanner preserves global
+identity claims, exact role/layer vocabulary, notices and CNT provenance/merge rules.
+After the complete initial resource report, a verified per-model reload supports grids
+and preview; a separate verified reload supports export only after all global gates pass.
+Every recorded file, including all merged CNT provenance files, is checked using the
+single immutable `_decode` snapshot's file hash, mode, shape and geometry hash; replayed
+extraction/resource evidence must equal pass one. Source changes abort publication;
+new unrelated files are not added after the discovery snapshot. Metadata/order snapshots
+are not reread. Skip reloads when they have no work. Repeated decoding/extraction costs
+CPU/I/O in return for bounded cross-model raster retention.
+
+Grid-independent source width, 4-neighbour components and active pixels are computed
+once per logical observed mask on `binary_mask(mask)*valid` within one Product evaluation.
+Only scalars are cached, with no mutable cross-call cache; missing masks remain missing.
+Area resize, frame mapping, target topology/counts and warning order remain unchanged.
+Completed grid records are yielded incrementally so a later failure preserves earlier evidence.
+Preview renders one model into scalar rows/HTML strings; final HTML uses all final warnings.
+
+`--no-preview` omits preview HTML/rasters only, sets `preview=[]`, and adds exactly one
+`preview_skipped_by_request: --no-preview` diagnostic after grid diagnostics. Verification
+rejects inconsistent skipped-preview evidence and unknown report fields. No field or version
+is added: report/bundle remain v3 and algorithm remains version 2; existing v3 bundles work.
+CLI progress is flushed stderr JSON lines (`event=progress`, phase/stage/state, model/grid/file
+counts when known), separate from unchanged stdout/event_sink resource_inventory/completed. Inventory reading emits started for every model, even when no files can be decoded.
+In inventory progress, files_done/files_total count completed decode attempts: contained
+non-directory PNG paths in supported immediate electrode/CNT folders whose filename passed
+parse_png_name, including attempts rejected by the decoder. Unsupported layouts, escaping/
+broken paths, non-PNGs and malformed PNG filenames are not counted. files_done is cumulative
+per model; inventory files_total is known/reported only at reading completion. Reload
+progress counts every recorded provenance file (including each merged CNT file), with
+files_total known before reading starts and files_done incremented after each verified
+snapshot; a failed snapshot aborts before its completion increment.
+Library `run_import` accepts a keyword-only `progress_sink` and otherwise stays quiet.
+
+The bound is the largest model, not fixed RAM or a per-file guarantee. Source/component
+arrays, relation masks and a staged float32 Product can still be large: 900 masks at
+1500×1500×4 bytes require about 8.1 GB for ONE Product before validation temporaries.
+Report/manifest/HTML metadata scales with model count, and public/training load_manifest
+still holds all Products. The weakref regression measures unique retained array backing
+bytes at source/extraction/Product/loader boundaries, not total RSS or decoder transient
+buffers. The opt-in `scripts/benchmark_png_import.py --models 2 8 --modes image_only relations
+--preview both --operation both` separately reports tracemalloc-instrumented time/peak and
+process-lifetime peak RSS; synthetic results do not prove production-scale success.
 
 Output must be new and outside the source tree. A sibling `.staging-*` receives the
 report, local previews and assets; a pending manifest becomes `manifest.json` only after
 staged validation. Native atomic no-replace directory rename publishes the complete
 bundle (Darwin RENAME_EXCL/Linux RENAME_NOREPLACE/Windows refusing existing destinations).
 Even a concurrently created empty destination is refused. Failures preserve staging
-and report its location. The importer never removes/replaces an existing destination.
+and report its location. Retry with a fresh `--out`; the importer never resumes/reuses
+a failed stage or removes/replaces an existing destination.
 
 `bundle-integrity.json` (current `dl1_png_bundle_v3`; historical T3 v1 is superseded) binds hashes of report/manifest/NPY/HTML/raster
 files; the report also binds manifest/assets and records Product input identities.
@@ -511,7 +559,8 @@ The coordinator-authorized R-A3 C1 fix captures each PNG's compressed bytes once
 validates, decodes via BytesIO and hashes that immutable snapshot. Replacing a source
 file after validation cannot change its decoded geometry/provenance hash. Resource notes
 now separately disclose observed transient decoder cost (~17–18 bytes/pixel), compressed
-snapshot storage and retained bool source masks across all models. These notes do not
+snapshot storage and a largest-model raster bound in the streaming importer. Eager
+compatibility discovery/extraction retains all requested arrays. These notes do not
 bound peak RAM or approve real resources. Duplicate mask/model geometry produces explicit
 possible-alias/duplicate warnings; no source name or product is merged or silently omitted.
 Actual runtime Pillow version is recorded and a different version from pinned/tested

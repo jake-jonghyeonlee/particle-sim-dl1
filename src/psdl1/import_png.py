@@ -1,4 +1,5 @@
 """Offline PNG inspection/export; strict v1 manifest plus versioned provenance."""
+from contextlib import closing
 import argparse
 import ctypes
 import errno
@@ -12,14 +13,21 @@ import tempfile
 
 import numpy as np
 
-from .data import frame_transform, grid_check, input_identity, load_manifest
-from .png_connections import element_id, extract_inventory, iter_connections, to_product
+from .data import frame_transform, iter_grid_checks, input_identity, _iter_manifest_products
+from .png_connections import (element_id, extract_model, iter_connections, to_product,
+                              _detach_extraction, _reload_extraction)
 from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_id,
                            require_report_version)
-from .png_source import decoder_session, discover_source, load_metadata, report_payload, load_stack_order
+from .png_source import (decoder_session, load_metadata, report_payload, load_stack_order,
+                         _SourceScanner, _detach_model, _require_model_masks)
 from .schema import SCHEMA_VERSION, validate_product
 
 BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v3"
+
+
+class _ProgressSinkError(RuntimeError):
+    """Transport failure must abort, never become recoverable grid evidence."""
+
 
 
 def file_sha256(path):
@@ -116,6 +124,11 @@ def _verify_bundle(bundle):
                       ("status_summary", list), ("diagnostics", list)):
         if not isinstance(report.get(key), kind):
             raise ValueError("invalid or incomplete import report: " + key)
+    skipped = sum(isinstance(issue, dict) and issue.get("reason") == "preview_skipped_by_request: --no-preview"
+                  for issue in report["diagnostics"])
+    if skipped and (skipped != 1 or report["preview"] or "preview.html" in files or
+                    any(p == "preview" or p.startswith("preview/") for p in actual)):
+        raise ValueError("inconsistent skipped-preview evidence")
     if report.get("export_status") not in {"exported", "not_requested", "blocked"}:
         raise ValueError("invalid or incomplete import report export_status")
     if report["export_status"] == "exported":
@@ -307,7 +320,8 @@ def _duplicates(inventory):
 
 
 def _write_assets(stage, model, extraction, metadata):
-    """One bool connection mask at a time; staged legacy validation remains eager."""
+    """One bool connection mask at a time; return scalar manifest evidence."""
+    _require_model_masks(model)
     hashes = []
     def save(identity, mask):
         relative = "assets/" + identity + ".npy"
@@ -347,9 +361,78 @@ def _write_assets(stage, model, extraction, metadata):
     return product, hashes
 
 
-def run_import(options, *, event_sink=None):
+def _scan_inventory(root, options, reference, progress):
+    """Only detached records leave this inventory phase."""
+    scanner = _SourceScanner(root, png_max_image_pixels=options.png_max_image_pixels,
+                             stack_order=reference, progress=progress)
+    models, extractions = [], []
+    with closing(iter(scanner)) as stream:
+        for model in stream:
+            result = extract_model(model)
+            models.append(_detach_model(replace(model, resource_estimate=result.resource_estimate)))
+            extractions.append(_detach_extraction(result))
+            del model, result
+    return scanner.finish(models), tuple(extractions)
+
+
+def _inspect_preview_model(root, model, result, policy, grids, stage, no_preview, progress):
+    """All live source/Product/image references end before returning scalar evidence."""
+    evidence, diagnostics, rows, section = [], [], (), None
+    failed = False
+    blocked = result.extraction_status == "blocked"
+    if grids and blocked:
+        evidence.append({"model_id": model.model_id, "purpose": "inspect_not_evaluated",
+                         "reason": "invalid_source_inventory" if not model.valid else "invalid_stack_order"})
+        progress(stage="grid", state="skipped", model_id=model.model_id, reason=evidence[-1]["reason"])
+    if model.valid and ((grids and not blocked) or not no_preview):
+        # Source-change failures abort the import, outside recoverable grid errors.
+        model, result = _reload_extraction(root, model, result, policy, progress=progress)
+    if grids and model.valid and not blocked:
+        product = None
+        grid_record = {}
+        try:
+            product = to_product(model, result)
+            with closing(iter_grid_checks(product, grids)) as checks:
+                for index, grid in enumerate(grids, 1):
+                    grid_record = {"grid": grid, "grid_index": index, "grid_count": len(grids)}
+                    progress(stage="grid", state="started", model_id=model.model_id, **grid_record)
+                    check = next(checks)
+                    evidence.append({"model_id": model.model_id, "purpose": "inspect_only_not_approved",
+                                     "transform": frame_transform(model.frame.shape_yx, grid, model.frame.pixel_pitch_um).to_record(),
+                                     "grid_check": check})
+                    progress(stage="grid", state="completed", model_id=model.model_id,
+                             grid=grid, grid_index=index, grid_count=len(grids))
+        except Exception as exc:
+            if isinstance(exc, _ProgressSinkError):
+                raise
+            failed = True
+            diagnostics.append(SourceIssue(model.model_id, "inspect grid evaluation failed: " + str(exc), type(exc).__name__))
+            evidence.append({"model_id": model.model_id, "purpose": "inspect_failed_not_approved", "error": str(exc)})
+            progress(stage="grid", state="failed", model_id=model.model_id, error=str(exc), **grid_record)
+        finally:
+            del product
+    if not no_preview:
+        from .png_preview import render_model_preview
+        progress(stage="preview", state="started", model_id=model.model_id)
+        try:
+            rows, section = render_model_preview(stage, model, result)
+        except BaseException:
+            progress(stage="preview", state="failed", model_id=model.model_id)
+            raise
+        progress(stage="preview", state="completed", model_id=model.model_id)
+    return evidence, diagnostics, failed, rows, section
+
+
+def _export_model(stage, root, model, result, metadata, policy, progress):
+    model, result = _reload_extraction(root, model, result, policy, progress=progress)
+    return _write_assets(stage, model, result, metadata)
+
+
+def run_import(options, *, event_sink=None, progress_sink=None):
     """Build in a new sibling stage; leave failed stages for explicit inspection."""
     if options.verify_bundle is not None:
+        if options.no_preview:
+            raise ValueError("--verify-bundle must be used alone")
         return verify_bundle(options.verify_bundle), 0
     if options.root is None or options.out is None:
         raise ValueError("--root and --out are required for inspection/export")
@@ -366,14 +449,24 @@ def run_import(options, *, event_sink=None):
         raise ValueError("--candidate-grid requires --export; inspection uses --inspect-grids")
     stage = None
     report = None
+    published = False
     def emit(payload):
         if event_sink is not None:
             event_sink(payload)
+    def progress(phase, **record):
+        if progress_sink is not None:
+            try:
+                progress_sink({"event": "progress", "phase": phase, **record})
+            except Exception as exc:
+                raise _ProgressSinkError(str(exc)) from exc
     try:
         # Nested source session retains the explicit guard for the whole import.
         with decoder_session(options.png_max_image_pixels) as decoder_policy:
             reference = load_stack_order(options.stack_order)
-            inventory, extraction = extract_inventory(discover_source(root, png_max_image_pixels=options.png_max_image_pixels, stack_order=reference))
+            progress("inventory", stage="inventory", state="started")
+            inventory, extraction = _scan_inventory(root, options, reference,
+                                                    lambda **record: progress("inventory", **record))
+            progress("inventory", stage="inventory", state="completed", model_count=len(inventory.models))
             inventory = replace(inventory, decoder=decoder_policy)
             diagnostics = []
             metadata_error = False
@@ -427,50 +520,75 @@ def run_import(options, *, event_sink=None):
                   "cno_layer_union": initial_payload["inventory"]["cno_layer_union"],
                   "unique_roles": inventory.unique_roles, "unique_electrode_layers": initial_payload["inventory"]["unique_electrode_layers"],
                   "unique_cno_layers": initial_payload["inventory"]["unique_cno_layers"]})
-            evidence = []
+            evidence, preview_rows, sections = [], [], []
             grid_error = False
-            for model, result in zip(inventory.models, extraction):
-                if result.extraction_status == "blocked" and options.inspect_grids:
-                    evidence.append({"model_id": model.model_id, "purpose": "inspect_not_evaluated",
-                                     "reason": "invalid_source_inventory" if not model.valid else "invalid_stack_order"})
-                elif model.valid and options.inspect_grids:
-                    product = None
-                    try:
-                        product = to_product(model, result)
-                        for grid in sorted(set(options.inspect_grids)):
-                            evidence.append({"model_id": model.model_id, "purpose": "inspect_only_not_approved",
-                                             "transform": frame_transform(model.frame.shape_yx, grid, model.frame.pixel_pitch_um).to_record(), "grid_check": grid_check(product, grid)})
-                    except Exception as exc:
-                        grid_error = True
-                        diagnostics.append(SourceIssue(model.model_id, "inspect grid evaluation failed: " + str(exc), type(exc).__name__))
-                        evidence.append({"model_id": model.model_id, "purpose": "inspect_failed_not_approved", "error": str(exc)})
-                    finally:
-                        del product
+            grids = tuple(sorted(set(options.inspect_grids)))
+            if not options.no_preview:
+                (stage / "preview").mkdir()
+            for index, (model, result) in enumerate(zip(inventory.models, extraction), 1):
+                progress("inspect_preview", stage="model", state="started", model_id=model.model_id,
+                         model_index=index, model_count=len(inventory.models))
+                model_evidence, model_diagnostics, failed, rows, section = _inspect_preview_model(
+                    root, model, result, decoder_policy, grids, stage, options.no_preview,
+                    lambda **record: progress("inspect_preview", **record))
+                evidence.extend(model_evidence)
+                diagnostics.extend(model_diagnostics)
+                grid_error |= failed
+                preview_rows.extend(rows)
+                if section is not None:
+                    sections.append(section)
+                progress("inspect_preview", stage="model", state="completed", model_id=model.model_id,
+                         model_index=index, model_count=len(inventory.models))
             if grid_error and options.export:
                 pending.append("inspect_grid_evaluation_failed")
+            if options.no_preview:
+                diagnostics.append(SourceIssue(".", "preview_skipped_by_request: --no-preview"))
+                progress("inspect_preview", stage="preview", state="skipped", reason="by_request")
             report = replace(report, grid_evidence=tuple(evidence), diagnostics=tuple(diagnostics),
-                             pending_prerequisites=tuple(pending), export_status="blocked" if pending and options.export else report.export_status)
-            from .png_preview import write_preview
-            preview = write_preview(stage, inventory, extraction, report=report)
-            report = replace(report, preview=preview)
+                             preview=tuple(preview_rows), pending_prerequisites=tuple(pending),
+                             export_status="blocked" if pending and options.export else report.export_status)
+            if not options.no_preview:
+                from .png_preview import write_preview_index
+                progress("inspect_preview", stage="preview_index", state="started")
+                write_preview_index(stage, inventory, extraction, sections, report=report)
+                progress("inspect_preview", stage="preview_index", state="completed")
             if options.export and not pending:
                 (stage / "assets").mkdir()
                 entries, hashes = [], []
                 mapping = {m.model_id: m for m in metadata.models}
-                for model, result in zip(inventory.models, extraction):
-                    raw, asset_hashes = _write_assets(stage, model, result, mapping[model.model_id])
+                for index, (model, result) in enumerate(zip(inventory.models, extraction), 1):
+                    progress("export", stage="model", state="started", model_id=model.model_id,
+                             model_index=index, model_count=len(inventory.models))
+                    raw, asset_hashes = _export_model(stage, root, model, result, mapping[model.model_id], decoder_policy,
+                                                     lambda **record: progress("export", **record))
                     entries.append(raw); hashes.extend(asset_hashes)
+                    progress("export", stage="model", state="completed", model_id=model.model_id,
+                             model_index=index, model_count=len(inventory.models))
                 manifest = {"schema_version": SCHEMA_VERSION, "candidate_grid": options.candidate_grid, "products": entries}
                 pending_manifest = stage / "manifest.pending.json"
                 _write_json(pending_manifest, manifest)
-                loaded = load_manifest(pending_manifest)
-                for product in loaded:
-                    validate_product(product)
-                identities = tuple(sorted((p.product_id, input_identity(p)) for p in loaded))
-                export_evidence = tuple({"model_id": p.product_id, "purpose": "export_candidate_not_approved",
-                                         "transform": frame_transform(p.frame.shape_yx, options.candidate_grid, p.frame.pixel_pitch_um).to_record(), "grid_check": p.grid_check}
-                                        for p in loaded)
-                del loaded
+                identities, export_evidence = [], []
+                progress("validation", stage="validation", state="started")
+                with closing(_iter_manifest_products(pending_manifest)) as products:
+                    index = 0
+                    # enumerate caches its last tuple, retaining the previous
+                    # Product during the next loader allocation. Count scalars.
+                    for product in products:
+                        index += 1
+                        progress("validation", stage="model", state="started", model_id=product.product_id,
+                                 model_index=index, model_count=len(entries))
+                        validate_product(product)
+                        identities.append((product.product_id, input_identity(product)))
+                        export_evidence.append({"model_id": product.product_id, "purpose": "export_candidate_not_approved",
+                                                "transform": frame_transform(product.frame.shape_yx, options.candidate_grid, product.frame.pixel_pitch_um).to_record(),
+                                                "grid_check": product.grid_check})
+                        model_id = product.product_id
+                        del product
+                        progress("validation", stage="model", state="completed", model_id=model_id,
+                                 model_index=index, model_count=len(entries))
+                identities = tuple(sorted(identities))
+                export_evidence = tuple(export_evidence)
+                progress("validation", stage="validation", state="completed")
                 pending_manifest.rename(stage / "manifest.json")
                 report = replace(report, export_status="exported", generated_manifest_sha256=file_sha256(stage / "manifest.json"),
                                  generated_asset_hashes=tuple(sorted(hashes)), product_input_identities=identities,
@@ -479,12 +597,21 @@ def run_import(options, *, event_sink=None):
             _seal_bundle(stage)
             verify_bundle(stage)
             _publish_noreplace(stage, out)
+            published = True
             status = 2 if (options.export and pending) or order_invalid or not inventory.valid or metadata_error or grid_error else 0
             summary = {"event": "completed", "output": str(out), "export_status": report.export_status,
                        "source_valid": inventory.valid, "cnt_mode": report.cnt_mode, "pending_prerequisites": pending}
+            progress("publication", stage="complete", state="completed")
             emit(summary)
             return summary, status
     except BaseException as exc:
+        if published:
+            message = (f"bundle was published at {out} and verified, but progress/event "
+                       f"transport failed: {exc}")
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                exc.add_note(message)
+                raise
+            raise RuntimeError(message) from exc
         if stage is not None:
             try:
                 _failure_evidence(stage, report, exc)
@@ -519,16 +646,18 @@ def main(argv=None):
     parser.add_argument("--candidate-grid", type=_positive)
     parser.add_argument("--inspect-grids", type=_positive, nargs="+", default=[])
     parser.add_argument("--png-max-image-pixels", type=_positive, help="explicit finite Pillow pixel guard override, recorded; never disables guard")
+    parser.add_argument("--no-preview", action="store_true", help="skip preview rasters and HTML; preserve all source, extraction and grid evidence")
     parser.add_argument("--verify-bundle", type=Path, help="verify published hashes without source PNGs")
     args = parser.parse_args(argv)
-    if args.verify_bundle and (args.root or args.out or args.export or args.metadata or args.stack_order or args.candidate_grid or args.inspect_grids or args.png_max_image_pixels):
+    if args.verify_bundle and (args.root or args.out or args.export or args.metadata or args.stack_order or args.candidate_grid or args.inspect_grids or args.png_max_image_pixels or args.no_preview):
         parser.error("--verify-bundle must be used alone")
     options = ImportOptions(root=args.root, out=args.out, export=args.export, metadata=args.metadata,
                             candidate_grid=args.candidate_grid, inspect_grids=tuple(args.inspect_grids),
                             png_max_image_pixels=args.png_max_image_pixels, verify_bundle=args.verify_bundle,
-                            stack_order=args.stack_order)
+                            stack_order=args.stack_order, no_preview=args.no_preview)
     try:
-        summary, code = run_import(options, event_sink=lambda event: print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True))
+        summary, code = run_import(options, event_sink=lambda event: print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True),
+                                   progress_sink=lambda event: print(json.dumps(event, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True))
         if args.verify_bundle:
             print(json.dumps(summary, sort_keys=True))
         return code

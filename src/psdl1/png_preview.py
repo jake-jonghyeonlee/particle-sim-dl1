@@ -97,135 +97,142 @@ def _stack_text(model, component):
     return '<p>Involved layers, top to bottom: ' + escape(' → '.join(lines)) + '</p>'
 
 
-def write_preview(stage, inventory, extraction, *, report=None):
+def render_model_preview(stage, model, result):
+    """Render one live model; only rows and HTML strings leave this frame."""
     from PIL import Image, ImageDraw
-    directory = stage / "preview"
-    directory.mkdir()
-    rows, sections = [], []
+    from .png_source import _require_model_masks
+    from .png_connections import _require_extraction_masks
+    rows = []
+    if not model.valid:
+        return (), f"<section><h2>{escape(model.model_id)}</h2><p>Invalid source; no raster preview.</p></section>"
+    _require_model_masks(model)
+    _require_extraction_masks(result)
+    h, w = model.frame.shape_yx
+    scale = min(1.0, DISPLAY_MAX_EDGE / max(h, w))
+    ow, oh = max(1, round(w * scale)), max(1, round(h * scale))
+    sx, sy = ow / w, oh / h
+    model_key = canonical_id("preview", model.model_id)
+    base_relative = "preview/" + model_key + "-overview.png"
+    overview = Image.new("RGB", (ow, oh), "white")
+    overlays, toggles = [], []
+    display_assets = sorted(model.assets, key=lambda a: (
+        model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode or "", a.mask_sha256))
+    for index, asset in enumerate(display_assets):
+        colour = (30, 30, 30) if asset.kind == "cno" else COLOURS[index % len(COLOURS)]
+        image = _layer_image(asset.mask, (ow, oh), colour)
+        overview.paste(image, (0, 0), image)
+        layer_relative = "preview/" + asset.asset_id + "-layer.png"
+        image.save(stage / layer_relative)
+        target = "layer-" + asset.asset_id
+        overlays.append(f'<img class="overlay" id="{target}" src="{layer_relative}" alt="{escape(asset.relative_path, quote=True)}">')
+        toggles.append(f'<label><input type="checkbox" checked data-layer="{target}"> {escape(asset.electrode or "cno")} / {escape(asset.layer)} / filename number (provenance only) {asset.filename_number}</label>')
+    annotation = Image.new("RGBA", (ow, oh), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(annotation)
+    bbox = model.frame.core_bbox_xyxy_px
+    draw.rectangle((bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy), outline="#6648aa", width=2)
+    draw.text((bbox[0] * sx + 3, bbox[1] * sy + 3), "core: reference only", fill="#6648aa")
+    component_sections, crops = [], []
+    for number, component in enumerate(result.components, 1):
+        r = component.relation
+        state = "geometry_only" if result.cnt_mode == "image_only" else "unresolved" if r is None else "needs_confirmation" if r.needs_confirmation else "resolved"
+        x0, y0, x1, y1 = component.bbox_xyxy_px
+        position = r.representative_xy_px if r is not None else ((x0 + x1 - 1) / 2, (y0 + y1 - 1) / 2)
+        _draw_marker(draw, ((position[0] + 0.5) * sx, (position[1] + 0.5) * sy), state, number)
+        # Display-only crop, exactly one source pixel per image pixel. Include
+        # electrode overlays within the original bbox, without full C raster.
+        crop = Image.new("RGBA", (x1 - x0, y1 - y0), "white")
+        for index, asset in enumerate(model.electrodes):
+            layer = _layer_image(asset.mask[y0:y1, x0:x1], crop.size, COLOURS[index % len(COLOURS)])
+            crop.alpha_composite(layer)
+        black = Image.new("RGBA", crop.size, (20, 20, 20, 0))
+        black.putalpha(Image.fromarray(component.mask.astype(np.uint8) * 180))
+        crop.alpha_composite(black)
+        if r is not None:
+            # A 1-pixel endpoint indicates source cell, preserving crop size.
+            cx, cy = r.representative_xy_px[0] - x0, r.representative_xy_px[1] - y0
+            ImageDraw.Draw(crop).point((cx, cy), fill="#bb7100" if r.needs_confirmation else "#087b4c")
+        crop_relative = "preview/" + component.component_id + "-crop.png"
+        crop.convert("RGB").save(stage / crop_relative)
+        context, context_box = _context_image(model, component)
+        context_relative = "preview/" + component.component_id + "-context.png"
+        context.save(stage / context_relative)
+        display_factor = max(1, min(4, 512 // max(context.size)))
+        enlarged_relative = "preview/" + component.component_id + "-context-display.png"
+        context.resize((context.width * display_factor, context.height * display_factor), Image.Resampling.NEAREST).save(stage / enlarged_relative)
+        anchor = "component-" + component.component_id
+        above = ", ".join(f"{c.electrode}@{c.order_index}:{c.layer}" for c in component.selected_upper_candidates) or "none"
+        below = ", ".join(f"{c.electrode}@{c.order_index}:{c.layer}" for c in component.selected_lower_candidates) or "none"
+        reasons = "; ".join(component.unresolved_reasons) or "resolved under implementation rule"
+        details = f'<p>Selected upper: {escape(above)}; lower: {escape(below)}. {escape(reasons)}</p>'
+        if r is not None:
+            details += f'<p>Endpoint source XY: {escape(str(r.representative_xy_px))}; µm: {escape(str(r.endpoints[0].xy_um))}; both endpoints share this centre.</p>'
+            details += '<p>Skipped upper — ' + _skipped_text(r.skipped_upper_layers) + '</p>'
+            details += '<p>Skipped lower — ' + _skipped_text(r.skipped_lower_layers) + '</p>'
+        details += _stack_text(model, component)
+        ignored = "; ".join(f"{c.candidate.electrode}@{c.candidate.order_index}:{c.candidate.layer}: {c.reason}" for c in component.ignored_lower_candidates) or "none"
+        details += f'<p>Ignored lower candidates: {escape(ignored)}</p>'
+        details += '<details><summary>All overlapping source candidates</summary><p>' + escape(str([
+            (c.electrode, c.order_index, c.layer, c.overlap_pixels) for c in
+            component.above_candidates + component.below_candidates])) + '</p></details>'
+        if result.cnt_mode == "image_only":
+            details = '<p>Geometry only: ' + escape(component.source_path + ' / CNT ' + component.cnt_layer +
+                f' / bbox {component.bbox_xyxy_px} / pixels {component.pixel_count}') + '</p><p>cnt_image_only_no_relations</p>'
+        component_sections.append(f'<article class="{state}" id="{anchor}"><h3>{number}. {state.replace("_", " ")}</h3>'
+                                  f'<code>{component.component_id}</code><p>Source bbox XYXY: {component.bbox_xyxy_px}; '
+                                  f'crop offset XY=({x0},{y0}); 1 source pixel / display image pixel.</p>'
+                                  f'<p>Context window XYXY={context_box}; source offset {context_box[0]},{context_box[1]}; nearest-neighbour display ×{display_factor}.</p>'
+                                  f'<a href="{context_relative}"><img class="crop" src="{enlarged_relative}" '
+                                  f'alt="Original-resolution component {number} at source offset {x0},{y0}"></a>{details}</article>')
+        crops.append({"component_id": component.component_id, "image": crop_relative, "bbox_xyxy_px": list(component.bbox_xyxy_px),
+                      "source_offset_xy_px": [x0, y0], "shape_yx": [y1 - y0, x1 - x0], "source_pixels_per_image_pixel": 1,
+                      "state": state, "model_input": False,
+                      "context_image": context_relative, "context_bbox_xyxy_px": list(context_box),
+                      "context_source_offset_xy_px": list(context_box[:2]),
+                      "context_shape_yx": [context.height, context.width], "context_margin_px": CONTEXT_MARGIN_PX,
+                      "context_source_pixels_per_image_pixel": 1, "display_image": enlarged_relative,
+                      "display_integer_scale": display_factor, "display_resampling": "nearest"})
+    annotation_relative = "preview/" + model_key + "-annotations.png"
+    annotation.save(stage / annotation_relative)
+    overview.paste(annotation, (0, 0), annotation)
+    overview.save(stage / base_relative)
+    # Layer controls operate on separate raster layers above a plain white
+    # canvas; downloadable overview is the composited full-frame evidence.
+    view = (f'<div class="viewport"><div class="stack" style="width:{ow}px;height:{oh}px">' +
+            ''.join(overlays) + f'<img class="overlay" src="{annotation_relative}" alt="Core reference and source-coordinate markers"></div></div>')
+    model_status = "available" if result.connectivity_observation == "complete" else result.connectivity_observation
+    if model.stack_order.status == "resolved":
+        order_html = '<p>Resolved top-to-bottom order (user_supplied_order_file)</p><ol start="0">' + ''.join(
+            '<li>' + escape(f"position {e.order_index}: {e.kind} / {e.name}" +
+                            " / assets " + ', '.join(e.asset_ids)) + '</li>'
+            for e in model.stack_order.resolved_order) + '</ol>'
+    elif result.cnt_mode == "image_only":
+        order_html = '<p><strong>CNT mode: image_only — CNT is an image only; no relations or contact locations are inferred.</strong></p><p>Unordered source inventory.</p>'
+    else:
+        order_html = '<p>Unordered source inventory. ' + escape('; '.join(model.stack_order.errors)) + '</p>'
+    marker_legend = ('Gray boxes mark geometry display centres only; purple rectangle=reference-only core.' if result.cnt_mode == 'image_only' else 'Green circle=resolved; amber square/circle=needs confirmation; red X=unresolved; purple rectangle=reference-only core.')
+    section = (f'<section><h2>{escape(model.model_id)}</h2><p><strong>CNT mode: {escape(result.cnt_mode)}</strong></p>' + order_html + f'<p>Extractor run: {"ran" if result.extraction_status == "complete" else result.extraction_status}; '
+                    f'extraction coverage: {result.connectivity_observation}; model connectivity status: {model_status}.</p>'
+                    f'<p>Full source frame H×W={h}×{w}; origin (0,0), x→right, y→down; x=0…{w-1}, y=0…{h-1}; '
+                    f'pitch 0.1 µm/pixel. Overview scale XY=({sx:.8f},{sy:.8f}).</p><p><a href="{base_relative}">Download full-frame overview</a></p>'
+                    '<div class="controls">' + ''.join(toggles) + '</div>' + view +
+                    '<p>Pan with the scrollbars; browser zoom or the source crops provides magnification. ' + marker_legend + '</p>' +
+                    ''.join(component_sections) + '</section>')
+    rows.append({"model_id": model.model_id, "overview": base_relative, "source_shape_yx": [h, w],
+                 "overview_shape_yx": [oh, ow], "display_scale_xy": [sx, sy], "comparison_scope": "full_frame",
+                 "core_bbox_use": "reference_only", "component_crops": crops})
+    return tuple(rows), section
+
+
+def write_preview_index(stage, inventory, extraction, sections, *, report=None):
+    """Assemble final global warnings after all models/grids have finished."""
     warnings = []
     warnings.extend(f"{w.path}: {w.reason}" for w in inventory.warnings)
     if report is not None:
         warnings.extend(f"{w.path}: {w.reason}" for w in report.diagnostics)
         warnings.extend("Possible alias/duplicate geometry: " + str(entry) for entry in report.duplicate_geometry)
-    for model, result in zip(inventory.models, extraction):
+    for model in inventory.models:
         warnings.extend(f"{w.path}: {w.reason}" for w in model.warnings)
         warnings.extend(f"{e.path}: {e.reason}" for e in model.errors)
-        if not model.valid:
-            sections.append(f"<section><h2>{escape(model.model_id)}</h2><p>Invalid source; no raster preview.</p></section>")
-            continue
-        h, w = model.frame.shape_yx
-        scale = min(1.0, DISPLAY_MAX_EDGE / max(h, w))
-        ow, oh = max(1, round(w * scale)), max(1, round(h * scale))
-        sx, sy = ow / w, oh / h
-        model_key = canonical_id("preview", model.model_id)
-        base_relative = "preview/" + model_key + "-overview.png"
-        overview = Image.new("RGB", (ow, oh), "white")
-        overlays, toggles = [], []
-        display_assets = sorted(model.assets, key=lambda a: (
-            model.order_index(a) if model.order_index(a) is not None else -1, a.layer, a.electrode or "", a.mask_sha256))
-        for index, asset in enumerate(display_assets):
-            colour = (30, 30, 30) if asset.kind == "cno" else COLOURS[index % len(COLOURS)]
-            image = _layer_image(asset.mask, (ow, oh), colour)
-            overview.paste(image, (0, 0), image)
-            layer_relative = "preview/" + asset.asset_id + "-layer.png"
-            image.save(stage / layer_relative)
-            target = "layer-" + asset.asset_id
-            overlays.append(f'<img class="overlay" id="{target}" src="{layer_relative}" alt="{escape(asset.relative_path, quote=True)}">')
-            toggles.append(f'<label><input type="checkbox" checked data-layer="{target}"> {escape(asset.electrode or "cno")} / {escape(asset.layer)} / filename number (provenance only) {asset.filename_number}</label>')
-        annotation = Image.new("RGBA", (ow, oh), (255, 255, 255, 0))
-        draw = ImageDraw.Draw(annotation)
-        bbox = model.frame.core_bbox_xyxy_px
-        draw.rectangle((bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy), outline="#6648aa", width=2)
-        draw.text((bbox[0] * sx + 3, bbox[1] * sy + 3), "core: reference only", fill="#6648aa")
-        component_sections, crops = [], []
-        for number, component in enumerate(result.components, 1):
-            r = component.relation
-            state = "geometry_only" if result.cnt_mode == "image_only" else "unresolved" if r is None else "needs_confirmation" if r.needs_confirmation else "resolved"
-            x0, y0, x1, y1 = component.bbox_xyxy_px
-            position = r.representative_xy_px if r is not None else ((x0 + x1 - 1) / 2, (y0 + y1 - 1) / 2)
-            _draw_marker(draw, ((position[0] + 0.5) * sx, (position[1] + 0.5) * sy), state, number)
-            # Display-only crop, exactly one source pixel per image pixel. Include
-            # electrode overlays within the original bbox, without full C raster.
-            crop = Image.new("RGBA", (x1 - x0, y1 - y0), "white")
-            for index, asset in enumerate(model.electrodes):
-                layer = _layer_image(asset.mask[y0:y1, x0:x1], crop.size, COLOURS[index % len(COLOURS)])
-                crop.alpha_composite(layer)
-            black = Image.new("RGBA", crop.size, (20, 20, 20, 0))
-            black.putalpha(Image.fromarray(component.mask.astype(np.uint8) * 180))
-            crop.alpha_composite(black)
-            if r is not None:
-                # A 1-pixel endpoint indicates source cell, preserving crop size.
-                cx, cy = r.representative_xy_px[0] - x0, r.representative_xy_px[1] - y0
-                ImageDraw.Draw(crop).point((cx, cy), fill="#bb7100" if r.needs_confirmation else "#087b4c")
-            crop_relative = "preview/" + component.component_id + "-crop.png"
-            crop.convert("RGB").save(stage / crop_relative)
-            context, context_box = _context_image(model, component)
-            context_relative = "preview/" + component.component_id + "-context.png"
-            context.save(stage / context_relative)
-            display_factor = max(1, min(4, 512 // max(context.size)))
-            enlarged_relative = "preview/" + component.component_id + "-context-display.png"
-            context.resize((context.width * display_factor, context.height * display_factor), Image.Resampling.NEAREST).save(stage / enlarged_relative)
-            anchor = "component-" + component.component_id
-            above = ", ".join(f"{c.electrode}@{c.order_index}:{c.layer}" for c in component.selected_upper_candidates) or "none"
-            below = ", ".join(f"{c.electrode}@{c.order_index}:{c.layer}" for c in component.selected_lower_candidates) or "none"
-            reasons = "; ".join(component.unresolved_reasons) or "resolved under implementation rule"
-            details = f'<p>Selected upper: {escape(above)}; lower: {escape(below)}. {escape(reasons)}</p>'
-            if r is not None:
-                details += f'<p>Endpoint source XY: {escape(str(r.representative_xy_px))}; µm: {escape(str(r.endpoints[0].xy_um))}; both endpoints share this centre.</p>'
-                details += '<p>Skipped upper — ' + _skipped_text(r.skipped_upper_layers) + '</p>'
-                details += '<p>Skipped lower — ' + _skipped_text(r.skipped_lower_layers) + '</p>'
-            details += _stack_text(model, component)
-            ignored = "; ".join(f"{c.candidate.electrode}@{c.candidate.order_index}:{c.candidate.layer}: {c.reason}" for c in component.ignored_lower_candidates) or "none"
-            details += f'<p>Ignored lower candidates: {escape(ignored)}</p>'
-            details += '<details><summary>All overlapping source candidates</summary><p>' + escape(str([
-                (c.electrode, c.order_index, c.layer, c.overlap_pixels) for c in
-                component.above_candidates + component.below_candidates])) + '</p></details>'
-            if result.cnt_mode == "image_only":
-                details = '<p>Geometry only: ' + escape(component.source_path + ' / CNT ' + component.cnt_layer +
-                    f' / bbox {component.bbox_xyxy_px} / pixels {component.pixel_count}') + '</p><p>cnt_image_only_no_relations</p>'
-            component_sections.append(f'<article class="{state}" id="{anchor}"><h3>{number}. {state.replace("_", " ")}</h3>'
-                                      f'<code>{component.component_id}</code><p>Source bbox XYXY: {component.bbox_xyxy_px}; '
-                                      f'crop offset XY=({x0},{y0}); 1 source pixel / display image pixel.</p>'
-                                      f'<p>Context window XYXY={context_box}; source offset {context_box[0]},{context_box[1]}; nearest-neighbour display ×{display_factor}.</p>'
-                                      f'<a href="{context_relative}"><img class="crop" src="{enlarged_relative}" '
-                                      f'alt="Original-resolution component {number} at source offset {x0},{y0}"></a>{details}</article>')
-            crops.append({"component_id": component.component_id, "image": crop_relative, "bbox_xyxy_px": list(component.bbox_xyxy_px),
-                          "source_offset_xy_px": [x0, y0], "shape_yx": [y1 - y0, x1 - x0], "source_pixels_per_image_pixel": 1,
-                          "state": state, "model_input": False,
-                          "context_image": context_relative, "context_bbox_xyxy_px": list(context_box),
-                          "context_source_offset_xy_px": list(context_box[:2]),
-                          "context_shape_yx": [context.height, context.width], "context_margin_px": CONTEXT_MARGIN_PX,
-                          "context_source_pixels_per_image_pixel": 1, "display_image": enlarged_relative,
-                          "display_integer_scale": display_factor, "display_resampling": "nearest"})
-        annotation_relative = "preview/" + model_key + "-annotations.png"
-        annotation.save(stage / annotation_relative)
-        overview.paste(annotation, (0, 0), annotation)
-        overview.save(stage / base_relative)
-        # Layer controls operate on separate raster layers above a plain white
-        # canvas; downloadable overview is the composited full-frame evidence.
-        view = (f'<div class="viewport"><div class="stack" style="width:{ow}px;height:{oh}px">' +
-                ''.join(overlays) + f'<img class="overlay" src="{annotation_relative}" alt="Core reference and source-coordinate markers"></div></div>')
-        model_status = "available" if result.connectivity_observation == "complete" else result.connectivity_observation
-        if model.stack_order.status == "resolved":
-            order_html = '<p>Resolved top-to-bottom order (user_supplied_order_file)</p><ol start="0">' + ''.join(
-                '<li>' + escape(f"position {e.order_index}: {e.kind} / {e.name}" +
-                                " / assets " + ', '.join(e.asset_ids)) + '</li>'
-                for e in model.stack_order.resolved_order) + '</ol>'
-        elif result.cnt_mode == "image_only":
-            order_html = '<p><strong>CNT mode: image_only — CNT is an image only; no relations or contact locations are inferred.</strong></p><p>Unordered source inventory.</p>'
-        else:
-            order_html = '<p>Unordered source inventory. ' + escape('; '.join(model.stack_order.errors)) + '</p>'
-        marker_legend = ('Gray boxes mark geometry display centres only; purple rectangle=reference-only core.' if result.cnt_mode == 'image_only' else 'Green circle=resolved; amber square/circle=needs confirmation; red X=unresolved; purple rectangle=reference-only core.')
-        sections.append(f'<section><h2>{escape(model.model_id)}</h2><p><strong>CNT mode: {escape(result.cnt_mode)}</strong></p>' + order_html + f'<p>Extractor run: {"ran" if result.extraction_status == "complete" else result.extraction_status}; '
-                        f'extraction coverage: {result.connectivity_observation}; model connectivity status: {model_status}.</p>'
-                        f'<p>Full source frame H×W={h}×{w}; origin (0,0), x→right, y→down; x=0…{w-1}, y=0…{h-1}; '
-                        f'pitch 0.1 µm/pixel. Overview scale XY=({sx:.8f},{sy:.8f}).</p><p><a href="{base_relative}">Download full-frame overview</a></p>'
-                        '<div class="controls">' + ''.join(toggles) + '</div>' + view +
-                        '<p>Pan with the scrollbars; browser zoom or the source crops provides magnification. ' + marker_legend + '</p>' +
-                        ''.join(component_sections) + '</section>')
-        rows.append({"model_id": model.model_id, "overview": base_relative, "source_shape_yx": [h, w],
-                     "overview_shape_yx": [oh, ow], "display_scale_xy": [sx, sy], "comparison_scope": "full_frame",
-                     "core_bbox_use": "reference_only", "component_crops": crops})
     warnings_html = ''.join('<li>' + escape(text) + '</li>' for text in warnings) or '<li>None recorded.</li>'
     mode = report.cnt_mode if report is not None else (extraction[0].cnt_mode if extraction else "image_only")
     legend = ('<p>Geometry inventory only. Gray boxes mark component display centres, not inferred contact locations. Gray=electrodes; black=CNT outline. No relation extraction was run.</p>'
@@ -244,6 +251,17 @@ def write_preview(stage, inventory, extraction, *, report=None):
             '<main><details open><summary>Source warnings and possible duplicates</summary><ul>' + warnings_html + '</ul></details>' + ''.join(sections) + '</main>'
             '<script>document.querySelectorAll("[data-layer]").forEach(x=>x.addEventListener("change",()=>{document.getElementById(x.dataset.layer).hidden=!x.checked;}));</script></html>')
     (stage / "preview.html").write_text(html, encoding="utf-8")
+
+
+def write_preview(stage, inventory, extraction, *, report=None):
+    """Eager compatibility renderer, sharing the per-model implementation."""
+    (stage / "preview").mkdir()
+    rows, sections = [], []
+    for model, result in zip(inventory.models, extraction):
+        model_rows, section = render_model_preview(stage, model, result)
+        rows.extend(model_rows)
+        sections.append(section)
+    write_preview_index(stage, inventory, extraction, sections, report=report)
     return tuple(rows)
 
 
