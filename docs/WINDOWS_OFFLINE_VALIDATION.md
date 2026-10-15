@@ -85,6 +85,24 @@ helper 원본에는 `text eol=lf`를 적용했습니다. 무결성 검사는 그
 회귀 테스트는 보호 설정이 없을 때 같은 오류를 재현하고, 보호 설정이 있을 때 동일 Git 설정으로
 checkout한 전달 파일이 원본과 바이트 단위로 같고 재결합까지 통과함을 검증합니다.
 `tests/test_windows_bundle.py`: **60 passed** (0.93초).
-기존 분할본·최종 ZIP hash는 변경하지 않았습니다. 이미 변환된 파일의 해시 확인 후 LF 복구 명령은
+기존 네 개 part와 최종 ZIP hash는 변경하지 않았습니다. 이미 변환된 파일의 해시 확인 후 LF 복구 명령은
 [CMD 가이드](WINDOWS_OFFLINE.md#git-반입-중-reassembly-script-hash-differs가-발생할-때)에 있습니다.
 이 재현은 Git의 파일 변환 동작 검증이며 실제 Windows DL1 실행 검증은 아닙니다.
+
+## 재결합기 v2: 이미 변환된 파일도 처리
+
+Git 속성 수정만으로 기존 체크아웃 파일이 복원되지 않는 한계를 보완하기 위해 실제 재결합기를
+`psdl1-transfer 2 (verified LF/CRLF/BOM)`로 갱신했습니다. raw hash가 다르더라도 UTF-8 BOM 제거와
+CRLF→LF만 적용한 바이트가 기대 SHA256과 정확히 같으면 진행합니다. 파일은 다시 쓰지 않습니다.
+실제 내용/버전 불일치에는 resolved file 경로, expected/actual/canonical_LF 해시를 표시하고 중단합니다.
+파트별 raw hash, 전체 목록, 최종 ZIP hash 검사는 유지합니다. 미래 split은 LF helper를 생성합니다.
+
+root의 transfer 도구와 parts 폴더의 helper, parts.json의 helper hash를 함께 갱신했습니다.
+네 개 큰 part와 ZIP은 그대로입니다. 기존 구버전 helper+manifest를 CRLF로 변환한 실제 분할본을
+새 root 도구로 재결합하고, 신버전 helper의 CRLF+BOM 복사본을 직접 실행해 재결합했습니다.
+두 경우 모두 원본 ZIP SHA256 `9d677ad8a5745422838f07fcd1045aa65dfc543d151020920f5c950546a7abdf`와
+일치했고 입력 helper는 수정되지 않았습니다. 실제 코드가 달라진 경우는 거절됨을 검사했습니다.
+
+회귀 테스트 **65 passed**, 0.31초. 증거: `outputs/crlf-v2-regression.log`,
+`outputs/crlf-v2-real-artifact.json`. 이 결과도 Windows CMD 실행 성공의 주장은 아닙니다.
+이전 수동 줄바꿈 복구 안내는 현재 가이드의 v2 버전 확인/자동 검증 절차로 대체했습니다.

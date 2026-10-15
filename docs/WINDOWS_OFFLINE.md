@@ -187,21 +187,31 @@ ignore 대상입니다. Git 전달이 필요하면 준비한 `bundles/windows_cp
 
 ## Git 반입 중 `reassembly script hash differs`가 발생할 때
 
-이 오류는 경로가 아니라 `reassemble.py`의 바이트가 `parts.json`에 기록된 값과 다르다는 뜻입니다.
-Windows Git의 `core.autocrlf=true`가 LF 줄바꿈을 CRLF로 바꾸는 경우를 실제 Git checkout으로
-재현했습니다. 저장소의 `.gitattributes`는 분할 폴더 전체를 `-text`로 지정하여 새 checkout의
-바이트 변환을 막습니다. 미래 빌더가 복사하는 helper 원본도 LF로 고정합니다.
+이 오류는 helper의 내용과 기록된 해시가 다르다는 뜻입니다. 경로만의 문제는 아닙니다.
+Git 속성을 고쳐도 이미 바뀐 파일은 복원되지 않아, 재결합기 자체를 **psdl1-transfer 2**로 수정했습니다.
+이 버전은 CRLF 줄바꿈/UTF-8 BOM만 원래 LF 표현으로 환산한 SHA256이 기대값과 정확히 일치할 때
+진행합니다. 파일을 수정하지 않으며 실제 내용/버전 불일치, part 손상, 최종 ZIP 불일치는 거절합니다.
 
-이미 반입한 파일은 최신 설정을 받더라도 자동으로 다시 기록되지 않을 수 있습니다. 저장소 루트의
-CMD에서 아래 명령을 실행하십시오. **CRLF→LF 변환 결과가 기록된 SHA256과 정확히 일치할 때만**
-스크립트를 다시 저장합니다. 실제 내용이 바뀌었으면 저장하지 않고 중단합니다. 해시 검사를 지우거나
-parts.json의 기대 해시를 새 값으로 바꾸지 마십시오.
+최신 수정본의 다음 작은 파일들을 같은 버전으로 반입하십시오. 큰 part001~part004와 최종 ZIP의
+바이트/hash는 그대로여서 다시 반입할 필요가 없습니다.
+
+- `scripts/transfer_windows_bundle.py`
+- `bundles/windows_cp312_win_amd64.parts/reassemble.py`
+- `bundles/windows_cp312_win_amd64.parts/parts.json`
+
+저장소 루트의 CMD에서 버전을 확인하고 새 출력 파일로 재결합합니다.
 
 ```bat
-py -3.12 -c "from pathlib import Path; import hashlib,json; d=Path('bundles/windows_cp312_win_amd64.parts'); p=d/'reassemble.py'; b=p.read_bytes().replace(b'\r\n',b'\n'); m=json.loads((d/'parts.json').read_text(encoding='utf-8')); assert hashlib.sha256(b).hexdigest()==m['reassemble_sha256'], 'Not only CRLF: stop and obtain matching files'; p.write_bytes(b); print('hash OK: LF restored')"
-py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py join bundles\windows_cp312_win_amd64.parts --output outputs\windows_cp312_win_amd64.zip
+py -3.12 scripts\transfer_windows_bundle.py --version
+py -3.12 scripts\transfer_windows_bundle.py join bundles\windows_cp312_win_amd64.parts --output outputs\dl1-cmd-v2.zip
 ```
 
-기존 출력 ZIP은 덮어쓰지 않으므로 이미 존재하면 `--output`에 새 파일 이름을 지정합니다.
-이 수정은 Python helper의 줄바꿈과 Git 전달 설정만 다룹니다. 네 개 part의 바이트,
-최종 ZIP SHA256과 설치된 DL1 wheel은 바꾸지 않습니다. 실제 Windows DL1 실행 성공은 여전히 별도 검증입니다.
+버전 출력은 `psdl1-transfer 2 (verified LF/CRLF/BOM)`이어야 합니다. part 폴더의
+`reassemble.py`로 실행해도 같은 방식으로 동작합니다. CRLF/BOM을 검증하여 허용한 경우
+`canonical LF SHA256 OK`를 출력합니다. 해시를 건너뛰는 옵션은 없습니다.
+
+같은 오류가 계속되면 표시되는 `file=`, `expected=`, `actual=`, `canonical_LF=`를 확인하십시오.
+세 값이 다르면 줄바꿈만의 문제가 아니라 서로 다른 release의 helper와 parts.json이 섞였거나
+파일 내용이 달라진 경우입니다. 두 파일을 같은 수정본에서 함께 가져오고, 기대 해시를 임의로
+바꾸지 마십시오. 이미 존재하는 ZIP을 덮어쓰지 않으므로 `--output`에는 새 이름을 사용합니다.
+실제 Windows DL1 실행은 별도 검증이며 이 수정은 Git 전달/재결합 단계만 다룹니다.

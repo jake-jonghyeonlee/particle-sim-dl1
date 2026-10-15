@@ -283,7 +283,7 @@ def test_failed_venv_creation_never_installs_and_preserves_partial_work(tmp_path
 
 
 @pytest.mark.parametrize('protect_bytes', [False, True])
-def test_git_windows_autocrlf_preserves_sealed_transfer_only_with_attributes(tmp_path, protect_bytes):
+def test_git_windows_autocrlf_transfer_with_and_without_attributes(tmp_path, protect_bytes):
     """Reproduce the field failure via real Git checkout, without a Windows shell."""
     import subprocess
     repo = tmp_path / 'repo'; repo.mkdir()
@@ -305,6 +305,48 @@ def test_git_windows_autocrlf_preserves_sealed_transfer_only_with_attributes(tmp
         assert (checkout_parts / 'reassemble.py').read_bytes() == (folder / 'reassemble.py').read_bytes()
     else:
         assert b'\r\n' in (checkout_parts / 'reassemble.py').read_bytes()
-        with pytest.raises(ValueError, match='reassembly script hash differs'):
-            transfer.join(checkout_parts, output)
-        assert not output.exists()
+        before = (checkout_parts / 'reassemble.py').read_bytes()
+        transfer.join(checkout_parts, output)
+        assert output.read_bytes() == archive.read_bytes()
+        assert (checkout_parts / 'reassemble.py').read_bytes() == before
+
+
+@pytest.mark.parametrize('bom,crlf', [(False, True), (True, False), (True, True)])
+def test_reassembly_accepts_only_hash_identical_text_representations(tmp_path, bom, crlf):
+    archive, folder = parts(tmp_path)
+    path = folder / 'reassemble.py'
+    data = path.read_bytes()
+    if crlf: data = data.replace(b'\n', b'\r\n')
+    if bom: data = b'\xef\xbb\xbf' + data
+    path.write_bytes(data)
+    out = tmp_path / 'joined.zip'
+    transfer.join(folder, out)
+    assert out.read_bytes() == archive.read_bytes()
+    assert path.read_bytes() == data
+
+
+def test_reassembly_rejects_changed_code_even_after_crlf_normalization(tmp_path):
+    _, folder = parts(tmp_path)
+    path = folder / 'reassemble.py'
+    data = path.read_bytes().replace(b'\n', b'\r\n') + b'\r\n# different release\r\n'
+    path.write_bytes(data)
+    out = tmp_path / 'joined.zip'
+    with pytest.raises(ValueError, match=r'file=.*expected=.*actual=.*canonical_LF='):
+        transfer.join(folder, out)
+    assert path.read_bytes() == data
+    assert not out.exists()
+
+
+def test_transfer_cli_version_and_actionable_mismatch(tmp_path):
+    import subprocess
+    import sys
+    tool = ROOT / 'scripts/transfer_windows_bundle.py'
+    result = subprocess.run([sys.executable, str(tool), '--version'], capture_output=True, text=True)
+    assert result.returncode == 0 and 'psdl1-transfer 2' in result.stdout
+    _, folder = parts(tmp_path)
+    script = folder / 'reassemble.py'; script.write_bytes(script.read_bytes() + b'\n# changed\n')
+    result = subprocess.run([sys.executable, str(tool), 'join', str(folder), '--output', str(tmp_path/'joined.zip')],
+                            capture_output=True, text=True)
+    assert result.returncode == 1 and 'Traceback' not in result.stderr
+    assert 'expected=' in result.stderr and 'actual=' in result.stderr and 'canonical_LF=' in result.stderr
+    assert not (tmp_path/'joined.zip').exists()

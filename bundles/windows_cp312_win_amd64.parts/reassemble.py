@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sys
 
 
 def digest(path):
@@ -13,6 +14,26 @@ def digest(path):
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             h.update(block)
     return h.hexdigest()
+
+
+def canonical_script(data):
+    # Git/editor text transport can change CRLF or add a UTF-8 BOM. Accept
+    # those representations only if the original canonical SHA256 still matches.
+    return data.removeprefix(b'\xef\xbb\xbf').replace(b'\r\n', b'\n')
+
+
+def verify_script(path, expected):
+    data = path.read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual == expected:
+        return
+    canonical = hashlib.sha256(canonical_script(data)).hexdigest()
+    if canonical == expected:
+        print('Reassembly helper: canonical LF SHA256 OK (CRLF/BOM transport difference; file preserved).', file=sys.stderr)
+        return
+    raise ValueError(f'reassembly script hash differs: file={path.resolve()} '
+                     f'expected={expected} actual={actual} canonical_LF={canonical}. '
+                     'Obtain matching reassemble.py and parts.json from the same release; do not edit expected hashes.')
 
 
 def split(archive, folder, part_bytes=48_000_000):
@@ -27,7 +48,7 @@ def split(archive, folder, part_bytes=48_000_000):
             (folder / name).write_bytes(block)
             records.append({'file': name, 'size_bytes': len(block), 'sha256': hashlib.sha256(block).hexdigest()})
             index += 1
-    shutil.copy2(__file__, folder / 'reassemble.py')
+    (folder / 'reassemble.py').write_bytes(canonical_script(Path(__file__).read_bytes()))
     manifest = {'schema_version': 'psdl1_split_zip_v1', 'archive': archive.name,
                 'size_bytes': archive.stat().st_size, 'sha256': digest(archive), 'parts': records,
                 'reassemble_sha256': digest(folder / 'reassemble.py')}
@@ -36,7 +57,8 @@ def split(archive, folder, part_bytes=48_000_000):
 
 
 def join(folder, output):
-    manifest = json.loads((folder / 'parts.json').read_text(encoding='utf-8'))
+    folder = Path(folder).resolve()
+    manifest = json.loads((folder / 'parts.json').read_text(encoding='utf-8-sig'))
     if manifest['schema_version'] != 'psdl1_split_zip_v1' or not manifest['parts']:
         raise ValueError('unsupported/empty parts manifest')
     names = [p['file'] for p in manifest['parts']]
@@ -49,8 +71,7 @@ def join(folder, output):
     for path in folder.iterdir():
         if path.is_symlink() or not path.is_file():
             raise ValueError('parts must be regular files')
-    if digest(folder / 'reassemble.py') != manifest['reassemble_sha256']:
-        raise ValueError('reassembly script hash differs')
+    verify_script(folder / 'reassemble.py', manifest['reassemble_sha256'])
     for record in manifest['parts']:
         path = folder / record['file']
         if path.stat().st_size != record['size_bytes'] or digest(path) != record['sha256']:
@@ -74,6 +95,7 @@ def join(folder, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version='psdl1-transfer 2 (verified LF/CRLF/BOM)')
     sub = parser.add_subparsers(dest='command', required=True)
     s = sub.add_parser('split')
     s.add_argument('archive', type=Path)
@@ -83,9 +105,14 @@ def main():
     j.add_argument('folder', type=Path)
     j.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    result = split(args.archive, args.folder, args.part_bytes) if args.command == 'split' else join(args.folder, args.output)
+    try:
+        result = split(args.archive, args.folder, args.part_bytes) if args.command == 'split' else join(args.folder, args.output)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f'bundle transfer failed (psdl1-transfer 2): {exc}', file=sys.stderr)
+        return 1
     print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

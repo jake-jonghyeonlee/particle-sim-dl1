@@ -44,6 +44,8 @@ pip/venv와 VC++ x64 런타임은 사전 설치되어 있어야 합니다. 관�
 `parts.json`, `reassemble.py` **총 6개 파일 모두** 필요합니다.
 
 ```bat
+rem 버전이 psdl1-transfer 2인지 먼저 확인
+py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py --version
 rem 1. 분할본의 목록/개별 hash를 확인하고 ZIP 재결합
 py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py join bundles\windows_cp312_win_amd64.parts --output outputs\dl1-cmd.zip
 rem 2. 쓰기 가능한 사용자 폴더에 압축 해제
@@ -57,8 +59,9 @@ cd /d "%USERPROFILE%\dl1-cmd\windows_cp312_win_amd64"
 성공 시 크기와 최종 SHA256을 출력합니다. 오류가 나면 다음 단계로 진행하지 마십시오.
 
 `reassembly script hash differs`는 Git의 줄바꿈 변환으로 생길 수 있습니다.
-[해시 확인 후 줄바꿈 복구 안내](WINDOWS_OFFLINE.md#git-반입-중-reassembly-script-hash-differs가-발생할-때)를
-따르십시오. 해시 검사를 지우거나 parts.json의 기대 해시를 바꾸지 마십시오.
+[v2 재결합기 확인 및 오류 안내](WINDOWS_OFFLINE.md#git-반입-중-reassembly-script-hash-differs가-발생할-때)를
+따르십시오. v2는 원래 해시와 일치하는 CRLF/BOM 차이를 자동 처리합니다.
+해시 검사를 지우거나 parts.json의 기대 해시를 바꾸지 마십시오.
 완성된 ZIP을 별도로 받은 경우에는 재결합을 생략하고 그 ZIP 경로로 압축 해제합니다.
 
 ### 2.2 설치 → help 확인 → 선택 smoke
