@@ -256,9 +256,9 @@ def test_cli_explicit_inspect_grids_and_invalid_metadata_are_diagnostic(tmp_path
 def test_grid_failure_preserves_diagnostics_preview_and_blocks_export(tmp_path, monkeypatch):
     root = tmp_path / "source"; write_import_fixture(root)
     out = tmp_path / "failed-grid"
-    def failed_grid(*args):
+    def failed_grid(*args, **kwargs):
         raise RuntimeError("synthetic grid runner failure")
-    monkeypatch.setattr(importer, "iter_grid_checks", failed_grid)
+    monkeypatch.setattr(importer, "inspect_grid_diagnostics", failed_grid)
     _, code = importer.run_import(ImportOptions(root, out, True, metadata(tmp_path / "metadata.json"),
                                                 16, inspect_grids=(8,), stack_order=write_stack_order(tmp_path / "stack-order.json", ['U', 'N', 'C4', 'U5', 'C6', 'L', 'X', 'Y', 'Z'])))
     assert code == 2 and report(out)["export_status"] == "blocked"

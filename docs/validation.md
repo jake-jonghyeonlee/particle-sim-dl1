@@ -328,3 +328,14 @@ command was rerun on the final code (484 passed above). The preceding targeted r
 was 246 passed in 67.39 s; the final targeted rerun was 249 passed as recorded above.
 This repeat was due to the new guard/tests, not an unchanged-candidate repetition.
 Environment: macOS 26.5.2 arm64 / Python 3.12.13 / Pillow 12.3.0 / NumPy 2.5.3.
+
+### N7 inspection diagnostics are additive
+
+N7 and the train/search legacy `thin_line_warning` / `bridge_or_component_loss` gates are unchanged.
+The optional `dl1_grid_diagnostic_v1` PNG/ledger is inspection evidence, including equal-count
+split/merge cases; it neither strengthens nor relaxes approval. Yellow run candidates and red
+component-correspondence events are separate counts. `no_change_detected` is not a connectivity,
+linewidth, topology or electrical certificate. Verification additionally checks canonical diagnostic
+references/hashes, fixed PNG IHDR, exact streamed record fields, finite bounds and count conservation.
+Old v3 bundles without diagnostic objects remain supported. See data_contract.md for the exact scope
+and known limitations; the synthetic demo is not validation of a production PNG dataset.

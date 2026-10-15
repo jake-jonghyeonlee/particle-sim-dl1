@@ -126,6 +126,24 @@ def normalize_notes(value):
     return value
 
 
+def project_diagnostic_addition(report):
+    """Remove only validated nested diagnostic objects; keep every legacy field."""
+    from copy import deepcopy
+    from psdl1.png_diagnostic import validate_diagnostic_metadata
+    report=deepcopy(report)
+    for row in report['grid_evidence']:
+        if 'diagnostic' in row:
+            validate_diagnostic_metadata(row['diagnostic'],row)
+            row.pop('diagnostic')
+    return report
+
+
+def is_diagnostic_artifact(relative):
+    # Candidate's own strict verifier has already checked canonical namespace,
+    # PNG dimensions, hashes, exact ledger fields and conservation, not just suffix.
+    return relative.startswith('diagnostics/')
+
+
 def compare_bundle(archived_oracle, name):
     (before, old), (after, new) = archived_oracle
     before, after = before/name, after/name
@@ -139,11 +157,13 @@ def compare_bundle(archived_oracle, name):
     assert events(old_run) == events(new_run)
     old_files = {p.relative_to(before).as_posix():p for p in before.rglob('*') if p.is_file()}
     new_files = {p.relative_to(after).as_posix():p for p in after.rglob('*') if p.is_file()}
-    assert old_files.keys() == new_files.keys()
+    diagnostic_files={p for p in new_files if is_diagnostic_artifact(p)}
+    assert all(p.endswith(('.png','.jsonl')) for p in diagnostic_files)
+    assert old_files.keys() == (new_files.keys()-diagnostic_files)
     for relative in old_files:
         a,b = old_files[relative].read_bytes(),new_files[relative].read_bytes()
         if relative == 'import-report.json':
-            assert normalize_notes(json.loads(a)) == normalize_notes(json.loads(b))
+            assert normalize_notes(json.loads(a)) == project_diagnostic_addition(normalize_notes(json.loads(b)))
             assert a == (json.dumps(json.loads(a),indent=2,sort_keys=True,ensure_ascii=False)+'\n').encode()
             assert b == (json.dumps(json.loads(b),indent=2,sort_keys=True,ensure_ascii=False)+'\n').encode()
         elif relative == 'bundle-integrity.json':
@@ -154,6 +174,8 @@ def compare_bundle(archived_oracle, name):
                 for path, digest in record['files'].items():
                     assert digest == hashlib.sha256(files[path].read_bytes()).hexdigest()
                 record['files']['import-report.json'] = '<report hash>'
+            y['files']={p:h for p,h in y['files'].items() if not is_diagnostic_artifact(p)}
+            y['directories']=[p for p in y['directories'] if p!='diagnostics' and not p.startswith('diagnostics/')]
             assert x == y
         else:
             assert a == b, relative
@@ -189,11 +211,11 @@ def test_no_preview_matches_d4dd896_except_preview(archived_oracle,name):
     old_report['preview'] = []
     assert new_report['diagnostics'].pop() == {'path':'.','reason':'preview_skipped_by_request: --no-preview',
         'exception_class':None,'shape_yx':None,'pixels':None,'effective_max_image_pixels':None}
-    assert old_report == new_report
+    assert old_report == project_diagnostic_addition(new_report)
     old_files = {p.relative_to(before/name).as_posix():p for p in (before/name).rglob('*') if p.is_file()
                  and not p.relative_to(before/name).as_posix().startswith('preview/') and p.name not in ('preview.html','import-report.json','bundle-integrity.json')}
     target = after/(name+'-no-preview')
     assert not (target/'preview').exists() and not (target/'preview.html').exists()
-    new_files = {p.relative_to(target).as_posix():p for p in target.rglob('*') if p.is_file() and p.name not in ('import-report.json','bundle-integrity.json')}
+    new_files = {p.relative_to(target).as_posix():p for p in target.rglob('*') if p.is_file() and p.name not in ('import-report.json','bundle-integrity.json') and not is_diagnostic_artifact(p.relative_to(target).as_posix())}
     assert old_files.keys() == new_files.keys()
     for path in old_files: assert old_files[path].read_bytes() == new_files[path].read_bytes()

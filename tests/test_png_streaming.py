@@ -434,12 +434,13 @@ def test_reload_source_change_never_publishes(tmp_path,change):
 
 def test_preview_final_warnings_include_later_models(tmp_path,monkeypatch):
     options=import_options(tmp_path,export=True,model_count=2)
-    original=importer.iter_grid_checks
-    def checks(product,grids):
+    original=importer.inspect_grid_diagnostics
+    def checks(product,descriptors,grids,sink_factory,**kwargs):
+        descriptors=tuple(descriptors)
         for grid in grids:
             if product.product_id=='M1' and grid==32:raise ValueError('late <grid> failure')
-            yield from original(product,[grid])
-    monkeypatch.setattr(importer,'iter_grid_checks',checks)
+            yield from original(product,descriptors,[grid],sink_factory,**kwargs)
+    monkeypatch.setattr(importer,'inspect_grid_diagnostics',checks)
     _,code=importer.run_import(options)
     assert code==2
     report=json.loads((options.out/'import-report.json').read_text())
@@ -482,8 +483,8 @@ def test_streaming_release_on_grid_and_preview_failure(tmp_path,monkeypatch,phas
         result=decode(*args);refs.append(weakref.ref(result[0]));return result
     monkeypatch.setattr(source,'_decode',track)
     if phase=='grid':
-        def fail(*args):raise ValueError('grid error')
-        monkeypatch.setattr(importer,'iter_grid_checks',fail)
+        def fail(*args,**kwargs):raise ValueError('grid error')
+        monkeypatch.setattr(importer,'inspect_grid_diagnostics',fail)
         importer.run_import(options)
     else:
         def fail(*args):raise ValueError('preview error')
@@ -581,3 +582,52 @@ def test_progress_empty_electrode_model_has_balanced_reading_events(tmp_path,mon
         assert 'files_total' not in marks[0]
         assert marks[-1]['files_done']==marks[-1]['files_total']==total
         assert [e['state'] for e in marks]==(['started','advanced','completed'] if total else ['started','completed'])
+
+
+@pytest.mark.parametrize('relations', [False, True])
+def test_diagnostic_descriptors_preserve_live_provenance_and_legacy(tmp_path, relations):
+    from psdl1 import png_diagnostic as diagnostic
+    if relations:
+        for name in ('A', 'B'):
+            write_model(tmp_path / 'src', [('E', '1-U.png', ((501, 501),)),
+                        ('B', '3-L.png', ((501, 501),)),
+                        ('cno', '2-C.png', ((501, 501),))], model=name)
+    else:
+        simple_tree(tmp_path / 'src')
+    order = write_stack_order(tmp_path / 'order.json', ['U', 'C', 'L']) if relations else None
+    inventory = source.discover_source(tmp_path / 'src', stack_order=order)
+    for model in inventory.models:
+        extraction = connections.extract_model(model)
+        product = connections.to_product(model, extraction)
+        descriptors = tuple(diagnostic.observation_descriptors(product, model, extraction))
+        assert len([d for d in descriptors if d.scope == 'electrode']) == len(model.electrodes)
+        assert len([d for d in descriptors if d.scope == 'connection']) == len(product.connections) == int(relations)
+        assert len([d for d in descriptors if d.scope == 'global_cnt_union']) == 1
+        cnt_source, = [d for d in descriptors if d.scope == 'cnt_source']
+        asset, = model.cnt_assets
+        assert cnt_source.source_asset_ids == (asset.asset_id,)
+        assert cnt_source.layer == asset.layer
+        assert set(cnt_source.source_paths) == {p['relative_path'] for p in
+                (asset.provenance_files or ({'relative_path': asset.relative_path},))}
+        assert cnt_source.mask is asset.mask
+        results = list(diagnostic.inspect_grid_diagnostics(product, descriptors, (16, 32)))
+        assert [r['grid_check'] for r in results] == list(data.iter_grid_checks(product, (16, 32)))
+        assert_no_arrays(results)
+
+
+def test_diagnostic_measurement_lifetime_is_one_observation(monkeypatch):
+    from psdl1 import png_diagnostic as diagnostic
+    references = []
+    original = diagnostic.measure_source
+    def measure(*args):
+        assert all(reference() is None for reference in references)
+        result = original(*args)
+        references.extend(weakref.ref(a) for a in (result.source, result.labels.image,
+                                                  result.horizontal, result.vertical))
+        return result
+    monkeypatch.setattr(diagnostic, 'measure_source', measure)
+    mask = np.eye(16, dtype=bool)
+    product = Product('lifetime', (16, 16), tuple(Element(f'E{i}', f'L{i}', mask) for i in range(4)))
+    results = list(diagnostic.inspect_grid_diagnostics(product, grids=(4, 8, 16)))
+    assert all(reference() is None for reference in references)
+    assert_no_arrays(results)

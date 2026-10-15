@@ -13,7 +13,9 @@ import tempfile
 
 import numpy as np
 
-from .data import frame_transform, iter_grid_checks, input_identity, _iter_manifest_products
+from .data import frame_transform, input_identity, _iter_manifest_products
+from .png_diagnostic import inspect_grid_diagnostics, observation_descriptors, VERSION
+from ._png_diagnostic_render import DiagnosticSink
 from .png_connections import (element_id, extract_model, iter_connections, to_product,
                               _detach_extraction, _reload_extraction)
 from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_id,
@@ -129,6 +131,8 @@ def _verify_bundle(bundle):
     if skipped and (skipped != 1 or report["preview"] or "preview.html" in files or
                     any(p == "preview" or p.startswith("preview/") for p in actual)):
         raise ValueError("inconsistent skipped-preview evidence")
+    from .png_diagnostic import verify_diagnostic_artifacts
+    verify_diagnostic_artifacts(root, report, files, bundle_path)
     if report.get("export_status") not in {"exported", "not_requested", "blocked"}:
         raise ValueError("invalid or incomplete import report export_status")
     if report["export_status"] == "exported":
@@ -380,35 +384,70 @@ def _inspect_preview_model(root, model, result, policy, grids, stage, no_preview
     evidence, diagnostics, rows, section = [], [], (), None
     failed = False
     blocked = result.extraction_status == "blocked"
-    if grids and blocked:
+    if grids and (blocked or not model.valid):
         evidence.append({"model_id": model.model_id, "purpose": "inspect_not_evaluated",
                          "reason": "invalid_source_inventory" if not model.valid else "invalid_stack_order"})
+        evidence[-1]["diagnostic"] = {"diagnostic_schema_version": VERSION, "state": "not_evaluated",
+                                      "reason": evidence[-1]["reason"], "requested_grids": list(grids)}
         progress(stage="grid", state="skipped", model_id=model.model_id, reason=evidence[-1]["reason"])
+        for grid in grids:
+            progress(stage="diagnostic", state="skipped", model_id=model.model_id, grid=grid,
+                     reason=evidence[-1]["reason"])
     if model.valid and ((grids and not blocked) or not no_preview):
         # Source-change failures abort the import, outside recoverable grid errors.
         model, result = _reload_extraction(root, model, result, policy, progress=progress)
     if grids and model.valid and not blocked:
         product = None
         grid_record = {}
+        diagnostic_started = set()
+        def record_failure(message, exception_class):
+            nonlocal failed
+            failed = True
+            diagnostics.append(SourceIssue(model.model_id, "inspect grid evaluation failed: " + message, exception_class))
+            evidence.append({"model_id": model.model_id, "purpose": "inspect_failed_not_approved", "error": message,
+                             "diagnostic": {"diagnostic_schema_version": VERSION, "state": "not_evaluated",
+                                            "reason": message, "requested_grids": [grid_record.get("grid", grids[0])]}})
+            progress(stage="diagnostic", state="failed", model_id=model.model_id, error=message, **grid_record)
+            progress(stage="grid", state="failed", model_id=model.model_id, error=message, **grid_record)
+            failed_index=grids.index(grid_record.get("grid",grids[0]))
+            for later in grids[failed_index+1:]:
+                if later in diagnostic_started:
+                    progress(stage="diagnostic",state="skipped",model_id=model.model_id,grid=later,reason="earlier_grid_failed")
         try:
             product = to_product(model, result)
-            with closing(iter_grid_checks(product, grids)) as checks:
+            def sink_factory(grid, transform, valid):
+                progress(stage="diagnostic", state="started", model_id=model.model_id, grid=grid)
+                diagnostic_started.add(grid)
+                directory = stage / "diagnostics" / canonical_id("model", [model.model_id])
+                return DiagnosticSink(directory / f"grid-{grid}.png", directory / f"grid-{grid}.jsonl",
+                                      model_id=model.model_id, transform=transform, valid=valid,
+                                      cnt_mode=model.cnt_mode,
+                                      observation_count=len(product.elements)+len(product.connections)+
+                                                        int(product.cnt is not None)+len(model.cnt_assets),
+                                      progress=lambda **record: progress(stage="diagnostic", model_id=model.model_id, **record))
+            descriptors = observation_descriptors(product, model, result)
+            with closing(inspect_grid_diagnostics(product, descriptors, grids, sink_factory,
+                         propagate_exceptions=(_ProgressSinkError,))) as checks:
                 for index, grid in enumerate(grids, 1):
                     grid_record = {"grid": grid, "grid_index": index, "grid_count": len(grids)}
                     progress(stage="grid", state="started", model_id=model.model_id, **grid_record)
-                    check = next(checks)
+                    outcome = next(checks)
+                    if outcome["state"] != "complete":
+                        record_failure(outcome["reason"], outcome["error_type"])
+                        break
+                    artifact = outcome["diagnostic"]
+                    for field in ("png", "evidence"):
+                        artifact[field] = Path(artifact[field]).relative_to(stage).as_posix()
                     evidence.append({"model_id": model.model_id, "purpose": "inspect_only_not_approved",
                                      "transform": frame_transform(model.frame.shape_yx, grid, model.frame.pixel_pitch_um).to_record(),
-                                     "grid_check": check})
+                                     "grid_check": outcome["grid_check"], "diagnostic": artifact})
+                    progress(stage="diagnostic", state="completed", model_id=model.model_id, grid=grid)
                     progress(stage="grid", state="completed", model_id=model.model_id,
                              grid=grid, grid_index=index, grid_count=len(grids))
         except Exception as exc:
             if isinstance(exc, _ProgressSinkError):
                 raise
-            failed = True
-            diagnostics.append(SourceIssue(model.model_id, "inspect grid evaluation failed: " + str(exc), type(exc).__name__))
-            evidence.append({"model_id": model.model_id, "purpose": "inspect_failed_not_approved", "error": str(exc)})
-            progress(stage="grid", state="failed", model_id=model.model_id, error=str(exc), **grid_record)
+            record_failure(str(exc), type(exc).__name__)
         finally:
             del product
     if not no_preview:

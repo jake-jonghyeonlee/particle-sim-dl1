@@ -148,9 +148,14 @@ def _resampling_evidence(source_stats, transformed, *, threshold=0.5):
         raise ValueError("threshold must be in (0,1]")
     before, active = source_stats
     after = _components(out >= threshold)
+    return _component_evidence(before, active, after, int((out >= threshold).sum()), threshold)
+
+
+def _component_evidence(before, active, after, target_active, threshold=0.5):
+    """Assemble legacy evidence from measured scalars (inspection shares this)."""
     return {"threshold": threshold, "neighbours": 4,
             "source_components": before, "target_components": after,
-            "source_active_pixels": active, "target_active_pixels": int((out >= threshold).sum()),
+            "source_active_pixels": active, "target_active_pixels": target_active,
             "bridge_or_component_loss": before != after,
             "connectivity_preserving": False,
             "certification": "not_certified: component equality and area similarity do not prove connectivity"}
@@ -190,20 +195,25 @@ def iter_grid_checks(product: Product, grids):
                              "thin_line_warning": bool(width and width * scale < 2),
                              **_resampling_evidence((components, active), normalize_unit(source, grid))})
             del source
-        reasons = []
-        if any(e.get("thin_line_warning") for e in evidence):
-            reasons.append("axis_run_below_2px; real_minimum_linewidth_unconfirmed")
-        if any(e.get("bridge_or_component_loss") for e in evidence):
-            reasons.append("bridge_or_component_loss_at_grid")
-        if any(e["observation"] == "missing" for e in evidence) or not valid.all():
-            reasons.append("missing_observations_or_valid_holes")
-        yield {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
-                "transform": frame_transform(shape, grid, product.frame.pixel_pitch_um if product.frame else product.unit_size_um[0] / shape[1]).to_record(),
-                "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
-                "approval": approval_status(), "connectivity_status": product.connectivity_status,
-                "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",
-                "reasons": reasons, "elements": evidence}
+        yield _assemble_grid_check(product, shape, valid, grid, evidence)
 
+
+def _assemble_grid_check(product, shape, valid, grid, evidence):
+    """Keep the legacy dictionary and reason order in one place."""
+    scale = grid / max(shape)
+    reasons = []
+    if any(e.get("thin_line_warning") for e in evidence):
+        reasons.append("axis_run_below_2px; real_minimum_linewidth_unconfirmed")
+    if any(e.get("bridge_or_component_loss") for e in evidence):
+        reasons.append("bridge_or_component_loss_at_grid")
+    if any(e["observation"] == "missing" for e in evidence) or not valid.all():
+        reasons.append("missing_observations_or_valid_holes")
+    return {"product_id": product.product_id, "grid": grid, "source_shape_yx": list(shape),
+            "transform": frame_transform(shape, grid, product.frame.pixel_pitch_um if product.frame else product.unit_size_um[0] / shape[1]).to_record(),
+            "scale": scale, "policy": "whole_unit_isotropic_area_pad_candidate",
+            "approval": approval_status(), "connectivity_status": product.connectivity_status,
+            "connectivity_preserving": False, "status": "warning" if reasons else "candidate_only",
+            "reasons": reasons, "elements": evidence}
 
 def grid_check(product: Product, grid: int):
     """Compatibility one-grid evaluation, with the original validation order."""

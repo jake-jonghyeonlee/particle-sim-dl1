@@ -324,6 +324,10 @@ def require_report_version(report: dict) -> None:
     for extraction in report["extraction"]:
         if extraction.get("algorithm_id") != ALGORITHM_ID or extraction.get("algorithm_version") != ALGORITHM_VERSION:
             raise ValueError("unsupported PNG algorithm_id/algorithm_version")
+    from .png_diagnostic import validate_diagnostic_metadata
+    for row in report.get("grid_evidence", []):
+        if "diagnostic" in row:
+            validate_diagnostic_metadata(row["diagnostic"], row)
     try:
         _validate_order_evidence(report)
     except (ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:

@@ -7,6 +7,8 @@ is process-lifetime RSS (including imports/warm-up), not retained-array payload.
 from __future__ import annotations
 
 import argparse
+import cProfile
+import pstats
 import importlib.metadata
 import itertools
 import json
@@ -59,9 +61,26 @@ def measured(args):
     options=ImportOptions(root=base/'source',out=output,export=args.export,
         metadata=base/'metadata.json',candidate_grid=args.grids[0] if args.export else None,
         inspect_grids=tuple(args.grids),stack_order=base/'order.json' if args.mode=='relations' else None,**kwargs)
+    import psdl1.png_source as source
+    decode=source._decode
+    calls={'decode':0,'reload':0}
+    def tracked_decode(*a,**kw):
+        calls['decode']+=1;return decode(*a,**kw)
+    source._decode=tracked_decode
+    import psdl1.import_png as importer
+    reload=importer._reload_extraction
+    def tracked_reload(*a,**kw):
+        calls['reload']+=1;return reload(*a,**kw)
+    importer._reload_extraction=tracked_reload
+    profile=cProfile.Profile() if args.profile else None
     tracemalloc.start(); start=time.perf_counter()
+    if profile:profile.enable()
     _,status=run_import(options)
     elapsed=time.perf_counter()-start
+    if profile:
+        profile.disable()
+        with output.with_suffix('.profile.txt').open('w') as stream:
+            pstats.Stats(profile,stream=stream).sort_stats('cumulative').print_stats(35)
     _,peak=tracemalloc.get_traced_memory();tracemalloc.stop()
     verified=verify_bundle(output)['status']
     rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -74,6 +93,8 @@ def measured(args):
         'shape_yx':args.frame,'assets_per_model':args.assets_per_model,'grids':args.grids,
         'mode':args.mode,'preview':args.show_preview,'operation':'export' if args.export else 'inspect',
         'compressed_bytes':sum(p.stat().st_size for p in files),'elapsed_seconds':elapsed,
+        'decode_calls':calls['decode'],'reload_calls':calls['reload'],
+        'profile':str(output.with_suffix('.profile.txt')) if profile else None,
         'timing':'tracemalloc_instrumented','tracemalloc_peak_bytes':peak,'process_peak_rss_bytes':rss_bytes,
         'rss_scope':'process_lifetime_including_imports_and_warmup',
         'output_bytes':sum(p.stat().st_size for p in output.rglob('*') if p.is_file()),
@@ -90,7 +111,10 @@ def main():
     parser.add_argument('--modes',nargs='+',choices=['image_only','relations'],default=['image_only','relations'])
     parser.add_argument('--preview',choices=['on','off','both'],default='both')
     parser.add_argument('--operation',choices=['inspect','export','both'],default='both')
-    parser.add_argument('--baseline-src',type=Path,help='archived baseline src directory; preview-enabled comparisons only')
+    parser.add_argument('--baseline-src',type=Path,help='archived baseline src directory')
+    parser.add_argument('--compare-baseline',action='store_true',help='archive --baseline-ref read-only and compare no-preview inspection')
+    parser.add_argument('--baseline-ref',default=None,help='Git revision/label (archive default: b8c8a22; --baseline-src default label: external-src-unverified-revision)')
+    parser.add_argument('--profile',action='store_true',help='record cProfile breakdown beside each measured output')
     parser.add_argument('--keep-output',type=Path,help='new benchmark-owned directory to retain fixtures and bundles')
     # Internal fresh-process invocation; parent never imports measured package.
     parser.add_argument('--measure',action='store_true',help=argparse.SUPPRESS)
@@ -102,23 +126,33 @@ def main():
     if min(args.models)<1 or min(args.frame)<=1000 or args.assets_per_model<3 or min(args.grids)<1:
         parser.error('positive model/grid counts, H/W>1000 and assets-per-model>=3 required')
     if args.measure:return measured(args)
+    if args.compare_baseline and args.baseline_src:parser.error('--compare-baseline and --baseline-src are mutually exclusive')
+    archive_ref=args.baseline_ref or 'b8c8a22'
     repo=Path(__file__).resolve().parents[1]
     commit=subprocess.run(['git','rev-parse','HEAD'],cwd=repo,capture_output=True,text=True,check=True).stdout.strip()
     preview=[True,False] if args.preview=='both' else [args.preview=='on']
     export=[False,True] if args.operation=='both' else [args.operation=='export']
     packages=[('candidate',repo/'src',commit+'+working-tree')]
-    if args.baseline_src:packages.append(('baseline',args.baseline_src.resolve(),'d4dd896d315d99c7e72e68570a95f659b24aa6ea'))
+    if args.baseline_src:packages.append(('baseline',args.baseline_src.resolve(),args.baseline_ref or 'external-src-unverified-revision'))
     def scenarios(base):
+        if args.compare_baseline:
+            archive_dir=base/'baseline-archive';archive_dir.mkdir()
+            archive=subprocess.Popen(['git','archive',archive_ref],cwd=repo,stdout=subprocess.PIPE)
+            extract=subprocess.run(['tar','-x','-C',str(archive_dir)],stdin=archive.stdout,capture_output=True)
+            archive.stdout.close()
+            if archive.wait() or extract.returncode:raise RuntimeError('baseline archive failed')
+            packages.append(('baseline',archive_dir/'src',archive_ref))
         warm=base/'warm'; fixtures(warm,1,args.frame,args.assets_per_model)
         for count in args.models:
             fixture=base/f'fixture-{count}';fixtures(fixture,count,args.frame,args.assets_per_model)
             for (label,package,revision),mode,show,do_export in itertools.product(packages,args.modes,preview,export):
-                if label=='baseline' and not show:continue
+                if label=='baseline' and not show and '    no_preview:' not in (package/'psdl1/png_contract.py').read_text():continue
                 name=f'{label}-{count}-{mode}-{show}-{do_export}'
                 command=[sys.executable,str(Path(__file__).resolve()),'--measure','--fixture',str(fixture),
                     '--output',str(base/name),'--warm',str(warm),'--package',str(package),'--label',label,
                     '--commit',revision,'--mode',mode,'--frame',*map(str,args.frame),
                     '--assets-per-model',str(args.assets_per_model),'--grids',*map(str,args.grids)]
+                if args.profile:command.append('--profile')
                 if show:command.append('--show-preview')
                 if do_export:command.append('--export')
                 run=subprocess.run(command,cwd=base,env=dict(os.environ,PYTHONPATH=str(package),

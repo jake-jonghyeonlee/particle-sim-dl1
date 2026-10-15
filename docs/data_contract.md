@@ -727,3 +727,91 @@ with the documented explicit diagnostics. Generic detached v1 NPY manifests and 
 rendered static HTML still open; they are not retroactively blocked or certified by PNG readers.
 All compatibility/quality evidence is synthetic, not Windows-host, real-data, electrical or
 retrieval-performance validation. The strict manifest and core numerical versions are unchanged.
+
+## Optional inspection diagnostic v1
+
+`dl1_png_import_v3`, bundle v3, extractor algorithm 2, manifests, generated NPY masks and Product
+identities are unchanged. Successful `inspect_only_not_approved` grid-evidence rows may additionally
+contain `diagnostic`. Export-candidate rows have no diagnostic, and genuine old v3 rows without it
+remain valid. No new ImportReport top-level field is added. Unique inspect grids produce one PNG plus
+one JSONL; candidate-grid alone produces neither. Full-preview suppression is independent.
+
+The complete object's exact fields are `diagnostic_schema_version` (`dl1_grid_diagnostic_v1`),
+`state` (`complete`), `png`, `png_sha256`, `evidence`, `evidence_sha256`, `shape_state`, `counts`,
+`insets_shown`, `eligible_insets`, `unshown_insets`, `all_sites_included` (true). Paths are exactly
+`diagnostics/<canonical_id("model", [model_id])>/grid-<g>.png|.jsonl`. Shape state is `change_detected`,
+`no_change_detected` or `observation_incomplete`. Counts have exactly `observations`, `thin_runs`,
+`thin_cells`, `disappearance`, `split`, `merge_suspected`, `sites`, `clusters`, all nonnegative integers.
+Inset eligibility counts events, up to three are shown, and the exact difference is explicit.
+
+For `inspect_not_evaluated`/`inspect_failed_not_approved`, the exact nested object instead has
+`diagnostic_schema_version`, `state: not_evaluated`, `reason`, `requested_grids`, with no file paths.
+Earlier complete grids survive a later failed grid; later grid rows are absent. A render/ledger error
+is a grid failure. Unfinished sinks remove only their own exclusively-created PNG/ledger files. The verified failure
+bundle publishes with exit 2, referencing earlier complete pairs and omitting later grids; export
+is blocked. Interruption, source mutation and progress-transport errors still abort without publication. No diagnostic changes approval or training/search gates.
+
+Each logical electrode, supplied connection mask, optional global CNT union and canonical source CNT
+asset is measured independently, with role/layer/asset/component identity and duplicate provenance.
+Source-CNT supplements are diagnostic-only; relations are never inferred in image-only. Counts are
+observation events, not deduplicated physical defects. `None` means unknown, never empty; an all-zero
+observed mask is explicitly observed-empty. Valid holes are removed before statistics and resizing.
+
+Effective source is `binary_mask(mask)*valid`; coverage is the actual whole-frame Torch area resize
+with rounded aspect-preserving size and central padding, foreground `>=0.5`, 4-neighbour labels.
+For unpadded target cell j, source support spans `floor(j*W/nw)` through `ceil((j+1)*W/nw)-1` on x,
+and the analogous y interval. Integer adaptive bins may overlap and also apply to upsampling.
+A source/target component edge exists only with a real foreground source pixel supporting a retained
+foreground target cell. Source degree zero means disappearance; source degree >=2 means split;
+target degree >=2 means merge_suspected. Both directions are evaluated even if total counts match.
+Split/merge sites use real support-edge witnesses nearest a representative of lost source material,
+when that component has foreground with no retained target support. The representative prefers lost
+material farthest from retained target foreground (city-block distance), with deterministic ties.
+Events record per-source lost counts; sites include optional lost_source_xy. Insets centre on that
+lost material. These are affected-region witnesses, not a claimed precise fracture position. Disappearance
+uses the projected first foreground source pixel. The full-frame centre mapping is
+`((x+.5)*nw/W+left, (y+.5)*nh/H+top)`; padding has no physical source material.
+
+Every oriented maximal source run satisfying `length*g/max(H,W)<2` contributes once into the target
+cell containing its transformed midpoint. Yellow evidence is losslessly aggregated at target-cell
+resolution: count, minimum length and horizontal/vertical counts per observation/cell. No per-run
+records, sampling or top-N filter. A singleton legitimately contributes two oriented run candidates.
+All red sites enter one fixed spatial cluster each, including coincident/covered evidence.
+
+The streamed ledger record types and exact field sets are defined by `png_diagnostic.RECORD_FIELDS`:
+header (version/model/grid/transform, threshold/connectivity/scope/mode, valid-hole flag and display
+mapping), observation (identity/provenance/state/scalar measurements), yellow_cell (cell/run/orientation
+counts/minimum), event (kind/component IDs/bounds/site count/ambiguity flag), adjacent site records
+(real source/target/grid coordinates, local index and cluster ID), cluster (site count/display bounds),
+summary (exact scalar metadata/counts plus legacy status). Unknown/extra fields, versions, nonfinite or
+out-of-frame coordinates, duplicate references, bad canonical namespaces and count inconsistencies
+are rejected. Verification reads the PNG signature/IHDR (fixed RGB 1100x1040), hashes and ledger stream;
+it retains one current observation/event and 144 cluster counters, not a global set of sites. Hashes
+provide integrity, not authenticity or electrical certification.
+
+Detection limits: absence of correspondence changes does not prove geometry, topology, linewidth or
+electrical connectivity preserved. Connected erosion, hole creation/closure, boundary motion and corner
+rounding can be missed. Support overlap can retain a tiny contributor that would vanish alone;
+per-source CNT views help expose union masking but cannot prove absence of damage. Four-neighbour
+diagonal contact is not a bridge. No skeleton, physical linewidth or electrical claim is introduced.
+The raster is a bounded view: reduced geometry is nearest-displayed, yellow uses OR/max for grids
+above 768, and at most three paired details are shown with exact unshown counts. All evidence remains
+in the stream; every layer's magnified view is not promised.
+
+Forward compatibility: existing v3 readers retain the unchanged legacy evidence but do not validate
+this optional diagnostic contract. An actual git-archive b8c8a22 verifier accepts a sealed new bundle
+with diagnostics files; it does not reject that namespace or validate its nested schema/counts.
+Use the updated verifier to validate diagnostic evidence. This corrects the accepted plan's factual
+old-reader rejection statement; it does not change historical code or bump the v3 contract.
+
+Red event/site counts are per observation: a CNT speck in global_cnt_union and cnt_source is counted twice.
+Insets reserve one slot for each present D/S/M kind, then prefer distinct observations. Tiny source
+foreground is enlarged for display only with an explicit 7px stamp caption; both panels mark the witness.
+
+Diagnostic transient memory is output- and foreground-sensitive, beyond the existing Product masks.
+The review measured roughly 100–170 bytes per foreground source pixel; the revised int32-coordinate
+kernel measured 217,764,855 bytes peak for a 1500x1500 frame with 1,440,000 foreground pixels at grids
+32/64 (151.2 B/foreground pixel, tracemalloc including source measurement, excluding raster/ledger).
+This is a synthetic observation, not an upper bound. Dense 6000x6000 half-filled masks can require
+several additional GB. Coordinates/bin arrays are int32 with promoted integer arithmetic; processing
+in row bands is deferred, so the full foreground working set still exists for one observation.

@@ -299,6 +299,55 @@ PY -m psdl1.import_png --root D:\png_root --out D:\out\grid1 --inspect-grids 256
 
 경고가 없는 가장 작은 grid가 출발점이다. 경고가 있는 grid도 내보낼 수는 있지만 학습·검색에서 기본으로 막힌다. **내보냈다고 grid가 승인된 것은 아니다.**
 
+#### 모델 × grid 진단 PNG
+
+```sh
+python -m psdl1.import_png --root ./png-source --out ./inspect-new \
+  --inspect-grids 32 64 --no-preview
+python -m psdl1.import_png --verify-bundle ./inspect-new
+```
+
+각 유효 모델과 중복 제거한 inspect grid마다 `diagnostics/model_<sha256>/grid-<g>.png`와
+근거 JSONL이 자동 생성됩니다. 모델별 실제 PNG 경로는 `import-report.json`의
+`grid_evidence[].diagnostic.png`에서 찾습니다. PNG는 1100×1040 고정 크기입니다. `--no-preview`는 기존 전체
+미리보기/HTML만 생략하며 이 진단은 유지합니다. `--candidate-grid`만 지정하면 진단은 생성하지 않습니다.
+
+- 파랑은 실제 축소 후 전극, 초록은 global CNT, 보라는 겹침입니다. 회색 패딩은 물리적 재료가
+  아니며 관측하지 못한 valid 영역은 회색 해치로 표시합니다.
+- 노랑은 원본 가로/세로 최대 run 중 `길이 × grid/max(H,W) < 2`인 후보의 중점을 포함하는
+  target cell입니다. `runs`는 모든 방향별 후보 수, `cells`는 관측별 cell 수입니다. 같은 XY라도
+  다른 층/관측이면 별도로 셉니다. 노랑은 확정된 손상이나 실제 최소 선폭이 아닙니다.
+- 빨간 큰 링은 원본/축소 연결 성분 대응의 변화입니다. `D`는 전체 성분 소실, `S`는 분리,
+  `M?`는 합쳐짐 의심입니다. 링은 실제 성분 witness 위치이며 정확한 단선 픽셀의 주장이 아닙니다.
+  빨간 수는 관측별 합계입니다. 같은 CNT 점도 global union과 cnt_source에서 두 번 셀 수 있습니다.
+  가까운 링의 숫자는 모든 빨간 site 수입니다. 이벤트 하나에 여러 site가 있을 수 있습니다.
+- 오른쪽은 같은 grid 창을 사용한 원본/축소 확대 쌍을 최대 3개 보여 줍니다. 잘린 범위와
+  `detail views not shown` 수를 확인하십시오. 다른 층이 원래 형상을 가려도 마커/개수는 남습니다.
+- `no shape change detected by this check`는 안전/승인 판정이 아닙니다. 경계 이동, 연결을 유지한
+  침식, 구멍 생성/폐쇄, 모서리 변화 등을 놓칠 수 있습니다. 4-neighbour 정의에서 대각 접촉은
+  bridge가 아니며 area-bin support가 작은 기여 성분을 대응에 남길 수도 있습니다.
+
+하단 `legacy grid status`와 기존 학습/검색/N7 차단 조건은 그대로입니다. 새 색/대응 결과로 기존
+경고를 무시하거나 전기적 연결성 보존을 승인하지 않습니다. 전체 관측 ID, 원본 경로, 중복 provenance,
+모든 노란 집계와 빨간 witness는 JSONL에서 확인할 수 있습니다. 진단의 원본 foreground 작업 배열은 일시적으로 픽셀당 약 100–170 B가 필요할 수 있습니다
+(수정 kernel의 합성 측정 151.2 B/foreground 픽셀; 상한 보장 아님). 큰 밀집 mask에서는 기존
+Product 메모리 위에 수 GB가 추가될 수 있습니다. 모델 수만큼 원본 label을 캐시하지
+않지만, 한 큰/복잡한 원본의 작업 배열과 grid별 고정 display 메모리 및 근거 파일 용량은 추가됩니다.
+
+재현 가능한 합성 예제(실제 데이터 성능/안전성 검증이 아님):
+
+```sh
+python scripts/demo_png_diagnostic.py --out ./fresh-synthetic-diagnostic
+```
+
+기존 경로를 덮어쓰지 않습니다. 지정한 경로 안에만 합성 입력과 grid64/128 검증 bundle을 만들고
+두 PNG 경로를 출력합니다. report v3와 기존 필드는 유지되며 새 중첩 diagnostic v1만 추가됩니다.
+
+호환성 주의: 기존 v3 reader는 legacy 근거를 읽을 수 있지만 새 diagnostic의 schema/개수/namespace를
+검증하지 않습니다. 실제 b8c8a22 verifier도 seal된 새 bundle을 받아들이므로, 그 `verified` 결과를
+새 진단 근거의 검증으로 해석하면 안 됩니다. 진단 검증에는 새 verifier를 사용하십시오.
+
+
 ## 5. 내보내기 — manifest 자동 생성
 
 ### 5.1 계보 파일 만들기
