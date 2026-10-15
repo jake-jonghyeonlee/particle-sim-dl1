@@ -2,6 +2,25 @@
 
 The user approved whole-unit isotropic resize + pad and electrode × actual-layer set aggregation on 2026-10-09. Shape/connectivity matching has priority over absolute linewidth. `use_unit_size` is off by default and remains an ablation switch. There is no second original-µm input. Real minimum linewidth/grid and the source CNT/VIA endpoint format remain G5 pending; all G6 label and acceptance criteria remain pending. This implementation is a model/training candidate, not a real-data performance claim.
 
+## Windows offline execution (CMD)
+
+Use the prepared [CMD offline bundle](WINDOWS_OFFLINE.md). From its extracted folder,
+run the installed interpreter directly; no shell activation or source checkout is needed.
+Replace paths with the actual CPU/tiny config, labels, split and checkpoint. Relative
+paths inside config files resolve from the current working directory.
+
+```bat
+set "DL1PY=%CD%\.venv-cmd\Scripts\python.exe"
+"%DL1PY%" -I -m psdl1.train --config "D:\DL1 config\train.json"
+"%DL1PY%" -I -m psdl1.train --config "D:\DL1 config\train.json" --use-unit-size --out "D:\DL1 runs\unit-size"
+"%DL1PY%" -I -m psdl1.train --config "D:\DL1 config\train.json" --augmentation intensity --out "D:\DL1 runs\intensity"
+"%DL1PY%" -I -m psdl1.train --config "D:\DL1 config\train.json" --resume "D:\DL1 runs\dl1.pt"
+```
+
+These are CMD commands. POSIX examples below describe the prepared developer environment.
+The bundle excludes timm, optional weights and GPU dependencies. Installation/help is
+separate from numerical smoke and real-data validation; Windows DL1 execution remains unverified.
+
 ## Inputs and splits
 
 Use the T8 `dl1_shape_v1_draft` manifest and explicit `lineage_id` values. Build the split JSON with `schema_version: dl1_split_v1` and `train`, `validation`, `test` lists of unique product IDs. Every product must occur exactly once, the training list must be nonempty, and all variants of a lineage must be in one partition. Size variants, patches and particle conditions are not independent products. `configs/split.example.json` shows the format with illustrative IDs.

@@ -17,7 +17,7 @@ DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품
 
 | 순서 | 하는 일 | 명령 | 필요한 것 | 만들어지는 것 |
 |---|---|---|---|---|
-| 0 | 설치와 확인 | `pip install`, `pytest` | Python 3.12, wheel 폴더 | `.venv` |
+| 0 | 설치와 확인 | `install_windows_bundle.cmd` | Python 3.12 x64, 동봉 wheel | `.venv-cmd` |
 | 1 | PNG 폴더 준비 | (사용자) | 모델별 전극·CNT PNG | 입력 폴더 |
 | 2 | 검사 | `psdl1.import_png` | 입력 폴더 | 보고서, preview |
 | 3 | 형상 확인(image_only) | (사용자) `preview.html` | 2의 결과 | CNT 형상·여백 확인 |
@@ -33,49 +33,32 @@ DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품
 
 ## 2. 설치와 확인
 
-Python 3.12 기준이다. 네트워크 내려받기는 쓰지 않는다. 승인된 wheel 폴더에서 설치한다.
-
-필요한 패키지:
-
-| 패키지 | 용도 | 비고 |
-|---|---|---|
-| numpy, torch | 필수 | `requirements.lock`에 개발 기기(macOS)의 버전이 적혀 있다. 대상 OS용 wheel로 같은 버전을 설치한다 |
-| Pillow **12.3.0** | PNG 입력 | 디코더 검증이 이 버전에서만 이루어졌다. 다른 버전이면 실행은 되지만 보고서에 경고가 남는다 |
-| pytest | 설치 확인 | |
-| hatchling | `pip install -e .`을 쓸 때만 | 아래 "설치 없이 실행"을 쓰면 필요 없다 |
-
-### Windows (명령 프롬프트)
+Windows 설치는 [CMD 폐쇄망 가이드](WINDOWS_OFFLINE.md)를 따릅니다. ZIP을 쓰기 가능한 사용자
+폴더에 풀고 그 안의 `windows_cp312_win_amd64`에서 **CMD**로 실행합니다. Python 3.12 x64,
+pip/venv와 VC++ x64 런타임은 사전 설치되어 있어야 합니다. 관리자 권한은 필요하지 않습니다.
 
 ```bat
-cd D:\work\particle-sim-dl1
-py -3.12 -m venv .venv
-.venv\Scripts\python -m pip install --no-index --find-links D:\wheels numpy torch Pillow==12.3.0 pytest
-
-rem 패키지를 설치하지 않고 실행 (hatchling 불필요)
-set PYTHONPATH=%CD%\src
-set PYTHONDONTWRITEBYTECODE=1
-
-rem 설치 확인: 실제 자료를 넣기 전에 반드시 한 번 실행
-.venv\Scripts\python -m pytest -p no:warnings
+install_windows_bundle.cmd
+.venv-cmd\Scripts\python.exe -I -m psdl1.import_png --help
+rem 선택: 새 출력 폴더에서 DL1 수치 smoke (설치/help와 별도)
+.venv-cmd\Scripts\python.exe -I smoke_windows_bundle.py --out "..\dl1-smoke-new"
 ```
 
-`set PYTHONPATH=...`은 창을 새로 열 때마다 다시 입력한다. 이후 명령의 `PY`는 `.venv\Scripts\python`을 뜻한다.
+설치기는 `.venv-cmd` 생성 → hash/inventory 검증 → 동봉 DL1 전용 wheel만 해시 고정 설치 →
+pip check → CPU import/help를 확인합니다. 기존 venv는 자동 삭제·업데이트하지 않습니다.
+재사용은 `install_windows_bundle.cmd --reuse-venv`로 정확 일치를 검사합니다.
+수동 venv/verify/pip 설치 순서도 [CMD 가이드](WINDOWS_OFFLINE.md)에 있습니다.
+Bash/PowerShell 설치기, uv, 온라인 설치, source checkout/PYTHONPATH, editable install은 쓰지 않습니다.
+pytest와 hatchling은 반입 PC 설치에 필요하지 않습니다. macOS `requirements.lock`를 Windows에 적용하지 않습니다.
 
-### macOS / Linux
+이후 Windows 명령은 이 설치 폴더에서 `.venv-cmd\Scripts\python.exe -I`로 실행합니다.
+다른 경로에서 실행할 때는 Python 실행 파일의 절대 경로를 큰따옴표로 감싸십시오.
+POSIX 예시는 미리 준비된 개발 환경의 `.venv/bin/python`을 뜻하며 Windows 설치 절차가 아닙니다.
+출력 경로는 매번 새 이름을 씁니다.
 
-```bash
-cd ~/work/particle-sim-dl1
-uv venv --python 3.12 .venv
-uv pip install --no-index --find-links /approved/wheels -r requirements.lock
-uv pip install --no-index --find-links /approved/wheels -e ".[png]"
-.venv/bin/python -m pytest -p no:warnings
-```
-
-이후 POSIX 명령의 `$PNG_ROOT`, `$INSPECT_OUT`, `$EXPORT_OUT`, `$METADATA_JSON` 및 grid·보고서 경로 변수는 사용자가 정한 값으로 설정한다. 출력 경로는 매번 새 이름을 쓴다. Windows의 `PY` 표기는 해당 Python 실행 파일로 바꾼다.
-
-### 테스트 결과 보는 법
-
-O3(A3) 개발 기기 검증은 `573 passed, 1 skipped`였다(98.24초, 합성 자료; 앞선 O2는 565/1). 수치는 해당 시점의 실행 기록이며 대상 OS의 성공을 보증하지 않는다. 건너뛴 1개는 선택형 학습 테스트다. Windows에서 실패가 나오면 실패한 테스트 이름과 메시지를 그대로 전달한다. 실제 자료를 넣기 전에 고칠 수 있다.
+compare에서 사용자 실제 성공은 CMD 설치/pip check/help 범위뿐입니다. 이는 DL1 설치·수치 smoke·
+실자료 성공의 근거가 아닙니다. DL1의 이 호스트 검증은 macOS 합성 자료이며 실제 Windows는 미검증입니다.
+선택 smoke 결과와 상세 검증 범위는 [검증 기록](WINDOWS_OFFLINE_VALIDATION.md)에 있습니다.
 
 ## 3. PNG 폴더 준비
 
@@ -141,7 +124,7 @@ O3(A3) 개발 기기 검증은 `573 passed, 1 skipped`였다(98.24초, 합성 �
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.import_png --root D:\png_root --out D:\out\inspect1
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\inspect1"
 ```
 
 Windows에서는 출력 경로를 짧게 잡는다. 생성되는 파일 이름이 70자 이상이라 경로가 깊으면 경로 길이 제한(260자)에 걸릴 수 있다(추정이며 실제로 확인되지는 않았다).
@@ -183,11 +166,11 @@ Linux/macOS 예시 (출력 경로는 새 경로로 지정):
   > export-result.jsonl 2> export-progress.jsonl
 ```
 
-Windows PowerShell 예시:
+Windows CMD 예시:
 
-```powershell
-PY -m psdl1.import_png --root D:\png_root --out D:\out\inspect-new --inspect-grids 32 64 --no-preview 1> result.jsonl 2> progress.jsonl
-PY -m psdl1.import_png --root D:\png_root --out D:\out\export-new --export --metadata D:\metadata.json --candidate-grid 64 --no-preview 1> export-result.jsonl 2> export-progress.jsonl
+```bat
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\inspect-new" --inspect-grids 32 64 --no-preview 1> result.jsonl 2> progress.jsonl
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\export-new" --export --metadata "D:\metadata.json" --candidate-grid 64 --no-preview 1> export-result.jsonl 2> export-progress.jsonl
 ```
 
 중단/실패하면 표시된 staging 경로의 진단 근거를 보존하고 **새 `--out` 경로**로 다시 실행한다. 기존 출력이나 실패 stage를 자동 재사용·덮어쓰지 않는다. 읽기 패스 사이에 원본(병합 CNT의 모든 provenance 파일 포함)이 바뀌거나 없어지거나 루트 밖 링크로 바뀌면 출판을 중단한다.
@@ -287,7 +270,7 @@ grid ≥ 2 × (이미지 긴 변 픽셀 수) ÷ (가장 가는 선폭 픽셀 수
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.import_png --root D:\png_root --out D:\out\grid1 --inspect-grids 256 512 1024
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\grid1" --inspect-grids 256 512 1024
 ```
 
 `grid_evidence`에서 grid별로 다음을 본다.
@@ -384,7 +367,7 @@ python scripts/demo_png_diagnostic.py --out ./fresh-synthetic-diagnostic
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.import_png --root D:\png_root --out D:\out\bundle1 --export --metadata D:\meta\meta.json --candidate-grid 512
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\bundle1" --export --metadata "D:\meta\meta.json" --candidate-grid 512
 ```
 
 - 계보 파일이나 grid가 빠지면 종료 코드 2로 끝나고 `manifest.json`을 만들지 않는다. 보고서와 preview만 남는다.
@@ -414,8 +397,8 @@ manifest의 `unit_size_um`에는 **전체 이미지 범위**(가로×0.1, 세로
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.import_png --verify-bundle D:\out\bundle1
-PY -m psdl1.data D:\out\bundle1\manifest.json --report D:\out\grid-report1.json
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --verify-bundle "D:\out\bundle1"
+".venv-cmd\Scripts\python.exe" -I -m psdl1.data "D:\out\bundle1\manifest.json" --report "D:\out\grid-report1.json"
 ```
 
 `--verify-bundle`은 원본 PNG 없이도 파일이 바뀌거나 빠지거나 추가됐는지 확인한다. 묶음을 복사한 뒤에도 실행할 수 있다. 손상 탐지일 뿐, 내용이 옳다는 인증은 아니다. 탐색기가 만든 숨김 파일이 들어가도 실패로 나온다.
@@ -459,10 +442,10 @@ MODEL-A,MODEL-C,different
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.train --manifest D:\out\bundle1\manifest.json --split D:\data\split.json --relations D:\data\relations.csv --out D:\runs\dl1 --epochs 100 --batch-size 8 --lr 0.0003
+".venv-cmd\Scripts\python.exe" -I -m psdl1.train --manifest "D:\out\bundle1\manifest.json" --split "D:\data\split.json" --relations "D:\data\relations.csv" --out "D:\runs\dl1" --epochs 100 --batch-size 8 --lr 0.0003
 
 rem 이어서 학습 (--epochs는 총 목표 횟수)
-PY -m psdl1.train --manifest D:\out\bundle1\manifest.json --split D:\data\split.json --relations D:\data\relations.csv --out D:\runs\dl1 --resume D:\runs\dl1\dl1.pt --epochs 150
+".venv-cmd\Scripts\python.exe" -I -m psdl1.train --manifest "D:\out\bundle1\manifest.json" --split "D:\data\split.json" --relations "D:\data\relations.csv" --out "D:\runs\dl1" --resume "D:\runs\dl1\dl1.pt" --epochs 150
 ```
 
 설정 파일(`--config configs/train.example.json`)로도 줄 수 있다. 명령줄 값이 우선한다.
@@ -494,7 +477,7 @@ manifest 두 개를 받는다. 둘 다 같은 grid로 내보낸 것이어야 한
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.search --ckpt D:\runs\dl1\dl1.pt --query-manifest D:\out\query1\manifest.json --query NEW-MODEL --candidates-manifest D:\out\bundle1\manifest.json --topk 5 --out D:\out\search1.json
+".venv-cmd\Scripts\python.exe" -I -m psdl1.search --ckpt "D:\runs\dl1\dl1.pt" --query-manifest "D:\out\query1\manifest.json" --query NEW-MODEL --candidates-manifest "D:\out\bundle1\manifest.json" --topk 5 --out "D:\out\search1.json"
 ```
 
 **이름 제한**: 전극 폴더명이 그대로 역할 이름이 된다. 학습에 없던 전극 이름이나 layer 이름을 가진 제품은 검색할 수 없다. 찾으려는 제품이 그러면 결과가 `unavailable`이 되고, 후보가 그러면 사유와 함께 `excluded`에 들어간다. 같은 이름은 같은 것으로 취급되지만, 두 전극이 실제로 같은 기능이라는 뜻은 아니다. 별칭을 맞추는 기능은 없다.
@@ -508,7 +491,7 @@ PY -m psdl1.search --ckpt D:\runs\dl1\dl1.pt --query-manifest D:\out\query1\mani
 Windows (명령 프롬프트):
 
 ```bat
-PY -m psdl1.evaluate --ckpt D:\runs\dl1\dl1.pt --manifest D:\out\bundle1\manifest.json --split D:\data\split.json --relations D:\data\relations.csv --topk 5 --out D:\out\evaluation1.json
+".venv-cmd\Scripts\python.exe" -I -m psdl1.evaluate --ckpt "D:\runs\dl1\dl1.pt" --manifest "D:\out\bundle1\manifest.json" --split "D:\data\split.json" --relations "D:\data\relations.csv" --topk 5 --out "D:\out\evaluation1.json"
 ```
 
 `--hard-negatives <파일>`로 형상은 같고 연결 위치만 다른 제품 쌍 목록(`[["MODEL-E", "MODEL-F"]]`)을 줄 수 있다.
@@ -755,9 +738,9 @@ POSIX에서는 아래 경로 변수를 사용자 값으로 설정한다. `STACK_
 Windows (명령 프롬프트; 경로에 공백/한글이 있어도 한 인수로 전달):
 
 ```bat
-PY -m psdl1.import_png --root "D:\png_root" --out "D:\out\relations-inspect1" --stack-order "D:\meta\stack-order.json"
-PY -m psdl1.import_png --root "D:\png_root" --out "D:\out\relations-bundle1" --stack-order "D:\meta\stack-order.json" --export --metadata "D:\meta\meta.json" --candidate-grid 512
-PY -m psdl1.import_png --verify-bundle "D:\out\relations-bundle1"
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\relations-inspect1" --stack-order "D:\meta\stack-order.json"
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --root "D:\png_root" --out "D:\out\relations-bundle1" --stack-order "D:\meta\stack-order.json" --export --metadata "D:\meta\meta.json" --candidate-grid 512
+".venv-cmd\Scripts\python.exe" -I -m psdl1.import_png --verify-bundle "D:\out\relations-bundle1"
 ```
 
 `--verify-bundle`은 단독 모드다. 다른 입력 flag나 `--stack-order`를 같이 주지 않는다.

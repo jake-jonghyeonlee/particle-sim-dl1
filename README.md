@@ -36,14 +36,18 @@ See [docs/training.md](docs/training.md) for the complete configuration and resu
 
 `configs/` contains illustrative filenames/IDs and unapproved example hyperparameters, except for the explicitly user-supplied `stack-order.json` reference of 2026-10-13. Both manifests, labels, and split must be supplied with actual provenance before running user training. A 2×2 simulation domain is not automatically converted to a unit.
 
-The checked runtime is Python 3.12. The T8 `requirements.lock` records exact installed versions for the macOS runtime, including optional timm/test dependencies; it is not a portable wheel/build lock. Use the closed-network package process to obtain approved distributions and the build backend; no dependency updates or downloads were performed here.
+The checked runtime is Python 3.12. Windows users must follow the
+[CMD offline installation guide](docs/WINDOWS_OFFLINE.md): unpack the prepared ZIP
+into a writable user folder, create `.venv-cmd` with preinstalled CPython, then
+install the bundled wheels with hash checks and `pip --no-index`. There is no
+PowerShell or online installer. The macOS `requirements.lock` snapshot is retained
+for provenance and is not a Windows installation lock. Building/downloading the
+distribution happens only on the connected preparation machine.
+
+Developer regression checks use the existing prepared development environment:
 
 ```bash
-uv pip install --no-index --find-links /approved/wheels -r requirements.lock
-uv pip install --no-index --find-links /approved/wheels -e .
-
 .venv/bin/python -m pytest -p no:warnings
-# Explicit opt-in to the existing synthetic training/search smoke:
 .venv/bin/python -m pytest -p no:warnings --run-training
 ```
 
@@ -57,12 +61,26 @@ Search and evaluation report the numeric checkpoint `grid` and `grid_selection` 
 
 Canonical single-product forwards preserve order/chunk-size reproducibility. `batch_size` controls candidate chunks rather than forward batch size; evaluation caches each product embedding once per command to avoid repeated forwards across queries, trading O(N × embedding dimension) memory for fewer forwards. Multi-product forward acceleration remains deferred because it changes arithmetic. The opt-in 40-epoch synthetic CNN smoke now uses an explicitly chosen synthetic grid 64, passes the strict grid gate with no bypass, and retains all loss/ranking/separation assertions; this fixture choice is not a real-data grid recommendation.
 
-## Windows 폐쇄망 설치
+## Windows 폐쇄망 설치와 실행 (CMD)
 
-Windows CPython 3.12 x64 CPU용 준비된 wheel 묶음과 uv 없는 설치는
+Windows CPython 3.12 x64 CPU용 준비된 wheel 묶음과 CMD 설치는
 [Windows 폐쇄망 가이드](docs/WINDOWS_OFFLINE.md)를 먼저 따르십시오.
 `bundles/windows_cp312_win_amd64.parts`는 Git 전달용 분할 ZIP이며,
 기존 macOS `requirements.lock`는 Windows용 lock가 아닙니다.
+
+ZIP을 사용자 폴더에 풀고 CMD에서 `install_windows_bundle.cmd`를 실행합니다.
+검사·학습·검색·평가도 같은 설치 Python을 사용합니다(실제 경로/ID로 변경).
+
+```bat
+set "DL1PY=%CD%\.venv-cmd\Scripts\python.exe"
+"%DL1PY%" -I -m psdl1.import_png --root "D:\PNG 입력" --out "D:\결과\새 검사" --no-preview
+"%DL1PY%" -I -m psdl1.data "D:\입력\manifest.json" --report "D:\결과\validation.json"
+"%DL1PY%" -I -m psdl1.train --config "D:\설정\train.json"
+"%DL1PY%" -I -m psdl1.search --ckpt "D:\학습\dl1.pt" --query-manifest "D:\입력\query.json" --query "실제-제품-ID" --candidates-manifest "D:\입력\candidates.json" --out "D:\결과\search.json"
+"%DL1PY%" -I -m psdl1.evaluate --ckpt "D:\학습\dl1.pt" --manifest "D:\입력\manifest.json" --split "D:\설정\split.json" --relations "D:\설정\relations.csv" --out "D:\결과\evaluation.json"
+```
+
+소스 checkout이나 활성화는 필요 없습니다. 아래 `.venv/bin/python` 예시는 POSIX 개발 환경용입니다.
 
 ## PNG workflow, offline
 

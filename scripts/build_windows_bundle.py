@@ -97,10 +97,13 @@ def main():
         wheel_sources = {n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist() if n.startswith('psdl1/') and not n.endswith('/')}
     if wheel_sources != source_hashes:
         raise ValueError('built application differs from complete src/psdl1 tree')
-    for name in ('verify_windows_bundle.py', 'install_and_smoke.ps1', 'smoke_windows_bundle.py',
+    for name in ('verify_windows_bundle.py', 'install_windows_bundle.cmd', 'install_windows_bundle.py', 'smoke_windows_bundle.py',
                  'windows-runtime.in', 'windows-build-constraints.txt'):
         shutil.copy2(ROOT / 'scripts' / name, output / name)
     shutil.copy2(ROOT / 'docs/WINDOWS_OFFLINE.md', output / 'README.md')
+    (output / 'docs').mkdir()
+    for name in ('USAGE.md', 'training.md', 'validation.md', 'data_contract.md', 'WINDOWS_OFFLINE.md'):
+        shutil.copy2(ROOT / 'docs' / name, output / 'docs' / name)
     wheels, lines = [], []
     for path in sorted(wheelhouse.glob('*.whl')):
         meta = read_wheel(path)
@@ -130,6 +133,7 @@ def main():
         if z.testzip() is not None:
             raise ValueError('archive CRC failed')
     result = {'archive': str(archive), 'size_bytes': archive.stat().st_size, 'sha256': sha256(archive),
+              'installer': 'CMD + installed CPython venv + local wheels',
               'wheels': len(wheels), 'expanded_bytes': sum(r['size_bytes'] for r in manifest['files'].values()),
               'installed_wheel_bytes': sum(i.file_size for p in wheelhouse.glob('*.whl') for i in zipfile.ZipFile(p).infolist())}
     archive.with_suffix('.zip.sha256').write_text(f"{result['sha256']}  {archive.name}\n", encoding='utf-8')

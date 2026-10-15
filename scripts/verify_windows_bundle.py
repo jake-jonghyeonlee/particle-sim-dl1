@@ -7,6 +7,7 @@ from email.parser import BytesParser
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -116,17 +117,35 @@ def verify(folder):
     for name in files:
         p = safe_relative(name)
         expected_dirs.update(str(parent) for parent in p.parents if str(parent) != '.')
+    # Match the field-tested CMD order: create .venv-cmd, then verify from
+    # that interpreter. Only that active, isolated venv may be excluded.
+    # An arbitrary pre-existing folder or a venv used from another interpreter
+    # remains unexpected inventory. Payload files stay strict.
+    active_venv = folder / '.venv-cmd'
+    ignore_venv = False
+    if active_venv.exists() and Path(sys.prefix).resolve() == active_venv.resolve() and sys.prefix != sys.base_prefix:
+        if active_venv.is_symlink():
+            raise ValueError('symlink venv forbidden inside bundle')
+        cfg = (active_venv / 'pyvenv.cfg').read_text(encoding='utf-8').lower()
+        if not re.search(r'include-system-site-packages\s*=\s*false', cfg):
+            raise ValueError('system-site-packages forbidden')
+        ignore_venv = True
     actual_files, actual_dirs = set(), set()
-    for path in folder.rglob('*'):
-        if path.is_symlink():
-            raise ValueError('symlinks forbidden in bundle')
-        rel = path.relative_to(folder).as_posix()
-        if path.is_file():
-            actual_files.add(rel)
-        elif path.is_dir():
-            actual_dirs.add(rel)
-        else:
-            raise ValueError(f'unsupported filesystem entry: {rel}')
+    for base, dirs, names in os.walk(folder, followlinks=False):
+        base = Path(base)
+        for name in list(dirs):
+            path = base / name
+            if path.is_symlink():
+                raise ValueError('symlinks forbidden in bundle')
+            if ignore_venv and path == active_venv:
+                dirs.remove(name)
+                continue
+            actual_dirs.add(path.relative_to(folder).as_posix())
+        for name in names:
+            path = base / name
+            if path.is_symlink() or not path.is_file():
+                raise ValueError('only regular payload files allowed in bundle')
+            actual_files.add(path.relative_to(folder).as_posix())
     expected_files = set(files) | {'manifest.json'}
     if actual_files != expected_files or actual_dirs != expected_dirs:
         raise ValueError(f'inventory differs; missing={sorted(expected_files-actual_files)} '

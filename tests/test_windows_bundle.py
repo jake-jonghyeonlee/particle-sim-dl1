@@ -18,6 +18,7 @@ def load(name):
     return module
 
 
+installer = load('install_windows_bundle')
 verify = load('verify_windows_bundle')
 transfer = load('transfer_windows_bundle')
 
@@ -46,7 +47,7 @@ def bundle(root, *, dependency='numpy>=1.26', numpy_tag='cp312-cp312-win_amd64',
     lines = [f"{e['metadata']['name']}{'[png]' if e['metadata']['name']=='psdl1' else ''}=={e['metadata']['version']} --hash=sha256:{verify.sha256(root/'wheelhouse'/e['file'])}"
              for e in records]
     (root / 'requirements-windows.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
-    (root / 'install_and_smoke.ps1').write_text('# installer fixture', encoding='utf-8')
+    (root / 'install_windows_bundle.cmd').write_text('# installer fixture', encoding='utf-8')
     manifest = {'schema_version': verify.SCHEMA, 'target': verify.TARGET, 'wheels': records,
                 'application_sources': {'psdl1/__init__.py': hashlib.sha256(b'# synthetic application\n').hexdigest()}}
     seal(root, manifest)
@@ -70,7 +71,7 @@ def test_strict_inventory_and_hashes(tmp_path, damage):
     elif damage == 'extra-wheel': shutil.copy2(wheel, wheel.with_name('extra.whl'))
     elif damage == 'extra-file': (tmp_path / 'unexpected.txt').touch()
     elif damage == 'extra-dir': (tmp_path / 'empty').mkdir()
-    elif damage == 'installer-tamper': (tmp_path / 'install_and_smoke.ps1').write_text('changed')
+    elif damage == 'installer-tamper': (tmp_path / 'install_windows_bundle.cmd').write_text('changed')
     elif damage == 'requirements-tamper': (tmp_path / 'requirements-windows.txt').write_text('numpy')
     elif damage == 'symlink': wheel.with_name('linked').symlink_to(wheel)
     with pytest.raises(ValueError): verify.verify(tmp_path)
@@ -193,16 +194,89 @@ def test_reuse_does_not_accept_the_active_source_environment(tmp_path):
     ('CPython', (3,12), 8, 'AMD64', 'darwin', False)])
 def test_installer_interpreter_acceptance_matrix(monkeypatch, implementation, version, bits, machine, system, accepted):
     import platform
-    import re
     import struct
     import sys
-    text = (ROOT / 'scripts/install_and_smoke.ps1').read_text(encoding='ascii')
-    predicate = re.search(r'^\$targetCheck = "(.*)"$', text, re.M).group(1)
     monkeypatch.setattr(platform, 'python_implementation', lambda: implementation)
     monkeypatch.setattr(platform, 'machine', lambda: machine)
     monkeypatch.setattr(sys, 'version_info', version)
     monkeypatch.setattr(sys, 'platform', system)
     monkeypatch.setattr(struct, 'calcsize', lambda _: bits)
-    if accepted: exec(predicate, {})
+    if accepted: installer.check_runtime()
     else:
-        with pytest.raises(AssertionError): exec(predicate, {})
+        with pytest.raises(ValueError): installer.check_runtime()
+
+
+def test_active_cmd_venv_is_allowed_but_payload_is_still_strict(tmp_path, monkeypatch):
+    import sys
+    bundle(tmp_path)
+    venv = tmp_path / '.venv-cmd'
+    venv.mkdir(); (venv / 'pyvenv.cfg').write_text('include-system-site-packages = false\n')
+    (venv / 'Scripts').mkdir(); (venv / 'Scripts/python.exe').write_bytes(b'fixture')
+    with pytest.raises(ValueError, match='inventory'): verify.verify(tmp_path)
+    monkeypatch.setattr(sys, 'prefix', str(venv))
+    monkeypatch.setattr(sys, 'base_prefix', str(tmp_path.parent / 'base'))
+    verify.verify(tmp_path)
+    (tmp_path / 'unexpected').mkdir()
+    with pytest.raises(ValueError, match='inventory'): verify.verify(tmp_path)
+
+
+def test_cmd_venv_with_system_packages_rejected(tmp_path, monkeypatch):
+    import sys
+    bundle(tmp_path)
+    venv = tmp_path / '.venv-cmd'; venv.mkdir()
+    (venv / 'pyvenv.cfg').write_text('include-system-site-packages = true\n')
+    monkeypatch.setattr(sys, 'prefix', str(venv))
+    monkeypatch.setattr(sys, 'base_prefix', str(tmp_path.parent / 'base'))
+    with pytest.raises(ValueError, match='system-site-packages'): verify.verify(tmp_path)
+
+
+def test_installer_existing_venv_is_preserved_without_running_commands(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer, 'check_runtime', lambda: None)
+    monkeypatch.setattr(installer, 'run', lambda *a, **kw: pytest.fail('must not run against existing venv'))
+    venv = tmp_path / '.venv-cmd'; venv.mkdir()
+    marker = venv / 'existing-file'; marker.write_bytes(b'preserve')
+    with pytest.raises(ValueError, match='preserved'): installer.install(tmp_path, venv)
+    assert marker.read_bytes() == b'preserve'
+
+
+@pytest.mark.parametrize('reuse,smoke', [(False, False), (True, False), (False, True)])
+def test_installer_cmd_order_offline_flags_and_optional_smoke(tmp_path, monkeypatch, reuse, smoke):
+    monkeypatch.setattr(installer, 'check_runtime', lambda: None)
+    root = tmp_path / '한글 bundle'; root.mkdir()
+    venv = root / '.venv-cmd'
+    if reuse:
+        venv.mkdir(); (venv / 'pyvenv.cfg').write_text('include-system-site-packages = false\n')
+    calls = []
+    monkeypatch.setattr(installer, 'run', lambda label, command, **kw: calls.append((label, list(map(str, command)), kw)))
+    installer.install(root, venv, reuse=reuse, smoke=smoke)
+    labels = [c[0] for c in calls]
+    assert ('create venv' in labels) == (not reuse)
+    assert ('local wheels only' in labels) == (not reuse)
+    assert ('optional synthetic DL1 smoke' in labels) == smoke
+    assert labels.index('bundle hashes/inventory/target/dependencies') < labels.index('pip check') < labels.index('DL1 help')
+    for _, command, options in calls:
+        assert options['cwd'] == root
+        assert options['env']['PIP_CONFIG_FILE'] == __import__('os').devnull
+        assert options['env']['PIP_NO_INDEX'] == '1'
+        assert options['env']['HF_HUB_OFFLINE'] == '1'
+        assert not any('powershell' in part.lower() or part == 'uv' or 'https:' in part for part in command)
+    if not reuse:
+        command = next(c[1] for c in calls if c[0] == 'local wheels only')
+        assert {'--no-index', '--only-binary=:all:', '--require-hashes', '--find-links=wheelhouse', '--isolated'} <= set(command)
+    if smoke:
+        assert labels[-1] == 'optional synthetic DL1 smoke'
+        path = Path(calls[-1][1][-1])
+        assert not path.is_relative_to(root)
+
+
+def test_failed_venv_creation_never_installs_and_preserves_partial_work(tmp_path, monkeypatch):
+    import subprocess
+    monkeypatch.setattr(installer, 'check_runtime', lambda: None)
+    venv = tmp_path / '.venv-cmd'
+    def fail(label, command, **kw):
+        assert label == 'create venv'
+        venv.mkdir(); (venv / 'partial').write_text('retain')
+        raise subprocess.CalledProcessError(1, command)
+    monkeypatch.setattr(installer, 'run', fail)
+    with pytest.raises(subprocess.CalledProcessError): installer.install(tmp_path, venv)
+    assert (venv / 'partial').read_text() == 'retain'

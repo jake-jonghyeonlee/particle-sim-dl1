@@ -1,71 +1,76 @@
-# Windows CPU offline bundle 검증 기록
+# DL1 Windows CMD offline bundle 검증 기록
 
-2026-10-15, 인터넷 가능한 macOS arm64에서 Codex가 직접 생성·검증했습니다.
-Windows 호스트 접근, 외부 업로드/배포, commit/push는 수행하지 않았습니다.
-설치·반입 명령과 버전 차이는 [Windows 폐쇄망 가이드](WINDOWS_OFFLINE.md)에 있습니다.
+현재 설치 및 설치 이후 실행 안내는 [CMD 가이드](WINDOWS_OFFLINE.md)를 따릅니다.
 
-## 기준과 산출물
+## 사용자 확인 범위와 DL1 범위
 
-- DL1: `feat/png-input`, baseline `11e3e4b2728e8754d2ab5b42d960ed5988678b1a`, 시작 상태 clean.
-  runtime source는 변경하지 않았습니다. 제공된 diagnostic 보완을 포함한 `src/psdl1` 전체와 자체 wheel 내용을 대조했습니다.
-- 참고 저장소(읽기만): particle-sim-compare `rewrite/line-pixel-rate`,
-  `d417ad847244ac0cd986f6195e23c4ba8d88d08c`. build/verify/install/runtime/build constraints/tests/usage와
-  실제 reference ZIP(60,631,353 bytes, 16 wheels)을 확인했습니다.
-- ZIP: `outputs/windows_cp312_win_amd64.zip`, **150,827,776 bytes** (약 143.84 MiB).
-- ZIP SHA256: `a1fe46839ef0cb8c234dd916a8b0a2e3affe6f706ded84d401d346a85f1c750e`.
-- 자체 wheel: `psdl1-0.1.0-py3-none-any.whl`, SHA256
-  `345a6dcb527c117e99a4ff9f4f25dd26d47c11428c5790c19d3b88f590b29ff5`.
-- 총 13 wheels: psdl1[png], numpy 2.5.3, Pillow 12.3.0, torch 2.14.1+cpu,
+사용자가 실제 확인한 것은 compare의 Windows CMD 설치 / pip check / help까지입니다.
+그 사실을 DL1 설치·수치 smoke·실자료 성공의 증거로 사용하지 않습니다.
+DL1은 자체 psdl1 wheel, NumPy/PyTorch/Pillow와 Windows 전이 의존성 13개 wheel을 사용합니다.
+compare용 pandas/pyarrow/zarr는 포함하지 않았고 compare 저장소도 수정하지 않았습니다.
+
+이번 시작점은 `feat/png-input`의 `78a2f91` (이전 offline bundle 작업을 포함한 clean 상태)입니다.
+원래 runtime baseline `11e3e4b2728e8754d2ab5b42d960ed5988678b1a`의 `src/psdl1`은
+이번 수정에서도 바꾸지 않았습니다. 기존 커밋·환경·자료는 보존했습니다.
+역사적 참고 snapshot은 compare `rewrite/line-pixel-rate`의
+`d417ad847244ac0cd986f6195e23c4ba8d88d08c`입니다. 최신 compare 수정 상태를 복제한 것은 아닙니다.
+
+## 최종 산출물
+
+- ZIP: `outputs/windows_cp312_win_amd64.zip`, **150,903,435 bytes**.
+- SHA256: `9d677ad8a5745422838f07fcd1045aa65dfc543d151020920f5c950546a7abdf`.
+- 자체 wheel SHA256: `baaacaaa633bec279bb21594aa705e4777b9ddb3e219175d07f68a266bd8a46f`.
+- Git 전달용: `bundles/windows_cp312_win_amd64.parts/`의 4개 part(각 최대 48,000,000 bytes),
+  `parts.json`, `reassemble.py`. 최종 ZIP을 실제 재결합하여 검증했습니다.
+- runtime 고정 버전은 이전 묶음과 같습니다: numpy 2.5.3, Pillow 12.3.0, torch 2.14.1+cpu,
   filelock 4.2.0, fsspec 2026.9.0, Jinja2 3.1.6, MarkupSafe 3.0.4, mpmath 1.3.0,
-  networkx 3.7, setuptools 84.0.0, sympy 1.14.0, typing_extensions 4.16.0.
-- wheelhouse 등 ZIP 내부 payload는 154,304,630 bytes; wheels 전체 비압축 파일 합계는
-  573,737,549 bytes입니다. venv/pip/bytecode/입출력 및 중복 전달 파일 공간은 추가로 필요합니다.
-- Git 반입용 `bundles/windows_cp312_win_amd64.parts/`: 48,000,000 bytes × 3개 +
-  6,827,776 bytes × 1개, `parts.json`, `reassemble.py`.
-  각 part hash와 최종 hash는 parts.json에 있습니다. ZIP/임시환경은 ignore 처리했고 분할본은 아직 untracked입니다.
+  networkx 3.7, setuptools 84.0.0, sympy 1.14.0, typing_extensions 4.16.0, psdl1[png] 0.1.0.
+  hatchling 1.27.0은 연결된 빌더에서만 사용합니다. macOS requirements.lock는 재사용하지 않았습니다.
+- 배포 ZIP에는 CMD/Python 설치기, verifier, 선택 smoke, local wheels, hash requirements,
+  README와 docs의 usage/training/validation/data contract/CMD 가이드를 동봉했습니다.
+  PowerShell/Bash 설치기는 포함하지 않습니다. 외부 다운로드는 연결된 배포 준비 빌더에만 있습니다.
 
-## 통과한 검증
+## 변경 및 검증 결과
 
-1. 연결 환경의 uv 0.11.23으로 Windows CPython 3.12 x64 전용 runtime을 해석했습니다.
-   PyPI JSON / 공식 PyTorch CPU index의 파일명·SHA256과 실제 다운로드를 비교했습니다.
-   Pillow 12.3.0의 cp312-win_amd64 wheel이 존재하여 계약 pin 변경은 없었습니다.
-   build backend hatchling은 1.27.0으로 고정했습니다.
-2. Windows wheel tag, Requires-Python, Windows 환경 marker 및 PNG extra를 포함한 전이 의존성
-   closure, requirements의 정확 pin/hash와 전체 파일·디렉터리 목록을 확인했습니다.
-3. Python socket connect/connect_ex/create_connection/getaddrinfo를 거절한 상태에서 Windows target
-   `pip install --dry-run --ignore-installed --no-index --no-cache-dir --only-binary=:all: --require-hashes`
-   를 실행했습니다. report의 설치 대상 13개 모두 `file:` URL이며 온라인 해석은 없었습니다.
-   이는 cross-target 설치 해석 검증이며 Windows 바이너리 실행은 아닙니다.
-4. 실제 bundle의 hardlink 복제본에서 wheel 누락, 설치기 변조, 예상 밖 파일·빈 디렉터리를
-   각각 거절했습니다. 원본 아티팩트는 수정하지 않았습니다.
-5. 4개 분할 파일로 실제 재결합한 ZIP의 최종 SHA256·CRC를 확인하고, 새 폴더에 압축 해제한 뒤
-   strict inventory/hash/closure를 다시 통과했습니다. 추출된 설치기·verify·smoke가 저장소 최종 파일과 같습니다.
-6. 별도 **새 macOS CPython 3.12.13 venv**에 전달본과 바이트가 동일한 자체 wheel을 설치했습니다.
-   이 호스트의 numpy 2.5.3 / Pillow 12.3.0 / torch 2.14.1(macOS wheel)로 `pip check` 및
-   `python -I` 설치 smoke를 통과했습니다. 기존 프로젝트 .venv 의존성은 변경하지 않았습니다.
-   smoke는 source checkout 경로 주입 없이 site-packages의 비편집 설치를 확인하며 socket을 차단합니다.
-   합성 PNG 2개 모델 × 2개 grid의 diagnostic PNG/JSONL 4세트 → verify-bundle →
-   metadata/candidate-grid export → verify-bundle 및 manifest validator →
-   tiny CPU 1-epoch/1-step 학습 → checkpoint 검색(eligible 1)을 검증했습니다.
-   실제 pretrained weights나 다운로드는 사용하지 않았습니다.
-7. `.venv/bin/python -m pytest`: **831 passed, 1 skipped**, 189.85초.
-   skip은 기존 명시적 opt-in 40-epoch training smoke입니다. 새 acceptance matrix 7개는 이후 별도 실행에 포함했습니다.
-   `.venv/bin/python -m pytest tests/test_windows_bundle.py`: **51 passed**.
-   `git diff --check` 통과. 테스트의 기존 grid-warning 41개는 실패가 아닙니다.
+1. Windows 설치 진입점은 `install_windows_bundle.cmd`와 `install_windows_bundle.py`입니다.
+   preinstalled CPython으로 venv 생성 → payload hash/inventory/target/closure 검증 → local wheels만
+   해시 고정 설치 → 설치 버전/격리/DL1 source 검사 → pip check → CPU imports/help 순서입니다.
+   기존 venv는 거절하고 `--reuse-venv`일 때 설치/업데이트 없이 정확 일치만 검사합니다.
+   `--smoke`는 선택이며 설치/help와 수치 smoke 결과를 구분합니다.
+2. 검증기는 현재 실행 중인 격리 `.venv-cmd`만 목록에서 제외하여 사용자 성공 순서인
+   venv 생성 후 verify를 지원합니다. 미사용/임의 venv, system-site-packages, payload의
+   누락/변조/추가 파일·디렉터리는 계속 거절합니다. 실제 최종 추출본에서 Mac CPython 3.12 venv를
+   `.venv-cmd`로 만든 뒤 그 Python으로 verifier 실행을 통과했습니다.
+3. README/usage/training/validation과 ZIP의 Windows 실행 예시는 모두 CMD입니다.
+   입력 검사, grids/export/verify, 학습·재개, 검색, 평가를 명시적 venv python.exe와
+   큰따옴표 경로로 안내합니다. `PY` 같은 launcher로 오인할 수 있는 placeholder도 제거했습니다.
+   기존 POSIX 개발 명령과 역사적 검증 기록은 Windows 설치 절차와 구분합니다.
+4. `.venv/bin/python -m pytest`: **845 passed, 1 skipped, 41 warnings**, 189.57초.
+   skip은 기존 opt-in 40-epoch training test입니다.
+   `tests/test_windows_bundle.py`: **58 passed**. 신규/재사용/실패 시 환경 보존,
+   CPython 버전·아키텍처 거절, offline flags/실행 순서, active venv 예외와 strict payload 검사 등을 포함합니다.
+5. Windows target wheel tag, Python 조건, 전이 closure와 공개 index의 원본 파일/hash,
+   자체 wheel의 전체 src 내용, requirements hash와 파일 inventory 검증을 통과했습니다.
+   네트워크 socket을 거절한 Windows target pip dry-run의 대상 13개는 모두 local `file:` URL입니다.
+   재결합 ZIP hash/CRC, 추출 inventory, 최종 installer 파일 일치 및 실제 Python 설치기 변조 거절도 확인했습니다.
+6. 별도 Mac CPython 3.12.13 venv에 **전달본과 같은 자체 wheel**을 설치했습니다.
+   pip check 및 import_png/data/train/search/evaluate 5개 module의 help가 통과했습니다.
+   source checkout/PYTHONPATH 없이 `python -I`와 network guard를 사용한 합성 smoke도 통과했습니다:
+   PNG 2개 모델 × 2개 grid의 diagnostic PNG/JSONL 4세트 → verify-bundle →
+   metadata/candidate-grid export → manifest validator → tiny CPU 1-step 학습 → checkpoint 검색.
+   Mac용 torch 2.14.1/numpy 2.5.3/Pillow 12.3.0을 사용했고 pretrained 다운로드는 없었습니다.
 
-빌드 및 상세 증거는 로컬 `outputs/windows-final-build.log`, `outputs/windows_cp312_win_amd64/manifest.json`,
-`outputs/windows-pip-dry-run.{log,json}`, `outputs/actual-artifact-negative-checks.json`,
-`outputs/full-suite.log`, `outputs/windows-bundle-tests.log`, `outputs/final-mac-smoke.log`,
-`outputs/final installed smoke 한글/smoke-result.json`에 보존했습니다. outputs는 Git으로 자동 전달되지 않습니다.
+증거는 `outputs/cmd-final-build.log`, `cmd-full-suite.log`, `cmd-regression.log`,
+`cmd-doc-audit.json`, `cmd-pip-dry-run.{json,log}`, `cmd-final-roundtrip.log`,
+`cmd-final-active-venv-check.log`, `cmd-help-checks.json`, `cmd-mac-smoke.log`,
+`cmd installed smoke 한글/smoke-result.json`에 보존했습니다. outputs는 Git ignore 대상입니다.
+이전 배포본은 outputs의 보관 폴더로 옮겼고, 전달용 ZIP과 Git 분할본은 CMD 버전으로 갱신했습니다.
+이번 수정은 commit/push하지 않았습니다.
 
-## 남은 실제 환경 검증
+## 실제 호스트에서 남은 검증
 
-Windows CPython의 wheel 설치, Microsoft VC++ DLL 로딩, 실제 PowerShell 5.1 및 Windows의
-경로/파일 게시 동작은 실행하지 못했습니다. 설치기에 PS7 전용 문법 없이 ASCII 스크립트와 인자 경로 전달을
-사용하고, 합성 smoke는 한글·공백 경로를 포함합니다. 이 사실은 Windows 성공의 증거가 아닙니다.
-Windows에서는 문서의 install_and_smoke.ps1을 실행하여 해당 호스트의 증거를 생성해야 합니다.
-
-CPU PNG 검사/진단/export 및 tiny core train/search 범위입니다. timm/torchvision/safetensors,
-사전학습 weights, GPU/CUDA는 제외했습니다. 16GB/18,000 PNG의 peak RAM·처리시간·검색 품질을
-검증하지 않았으며 전체 eager training/loader에는 별도 pilot과 자원 검토가 필요합니다.
-기존 venv는 자동 삭제/업데이트하지 않으며 재사용은 명시적 -ReuseVenv 일치 검사만 지원합니다.
+Windows DL1 설치, CMD wrapper의 실제 실행/quoting, Microsoft VC++ DLL 로딩,
+수치 smoke 및 실자료 처리는 이 Mac에서 실행할 수 없었습니다. Python 설치기의 orchestration은
+단위 테스트로 검증한 것이며 실제 Windows 성공을 뜻하지 않습니다.
+16GB/18,000 PNG 처리시간·peak RAM·검색 품질도 미검증입니다. timm/torchvision/safetensors,
+pretrained weights와 GPU/CUDA는 이 CPU/PNG 배포 범위에서 제외합니다.

@@ -2,6 +2,24 @@
 
 The user approved whole-unit isotropic resize + pad and electrode × actual-layer set aggregation on 2026-10-09, with shape/connectivity matching prioritized over absolute linewidth. Unit-size conditioning remains optional and off by default; compare both settings in the closed network. No second original-µm view is implemented. G5 real linewidth/grid and source endpoint metadata format, G6 labels/acceptance thresholds, and G3 naming remain open. The model/evaluation harness has no real-data performance PASS.
 
+## Windows offline execution (CMD)
+
+After [CMD installation](WINDOWS_OFFLINE.md), use the bundled environment from its
+extracted folder. Replace all example data paths/IDs with the actual inputs.
+
+```bat
+set "DL1PY=%CD%\.venv-cmd\Scripts\python.exe"
+"%DL1PY%" -I -m psdl1.data "D:\DL1 inputs\manifest.json" --report "D:\DL1 results\validation.json"
+"%DL1PY%" -I -m psdl1.search --ckpt "D:\DL1 runs\dl1.pt" --query-manifest "D:\DL1 inputs\query.json" --query "actual-product-id" --candidates-manifest "D:\DL1 inputs\candidates.json" --topk 5 --batch-size 32 --out "D:\DL1 results\search.json"
+"%DL1PY%" -I -m psdl1.evaluate --ckpt "D:\DL1 runs\dl1.pt" --manifest "D:\DL1 inputs\manifest.json" --split "D:\DL1 config\split.json" --relations "D:\DL1 config\relations.csv" --hard-negatives "D:\DL1 config\hard-negatives.json" --topk 5 --batch-size 32 --out "D:\DL1 results\evaluation.json"
+"%DL1PY%" -I smoke_windows_bundle.py --out "..\dl1-smoke-new"
+```
+
+Installation/pip check/help, synthetic smoke and real-data quality are distinct results.
+No Windows DL1 execution or real-data acceptance has been established. The runtime bundle
+has no pytest; the POSIX test commands and historical records below belong to the prepared
+development environment, not the offline installation procedure.
+
 ## Default contract checks
 
 ```bash
