@@ -106,3 +106,10 @@ root의 transfer 도구와 parts 폴더의 helper, parts.json의 helper hash를 
 회귀 테스트 **65 passed**, 0.31초. 증거: `outputs/crlf-v2-regression.log`,
 `outputs/crlf-v2-real-artifact.json`. 이 결과도 Windows CMD 실행 성공의 주장은 아닙니다.
 이전 수동 줄바꿈 복구 안내는 현재 가이드의 v2 버전 확인/자동 검증 절차로 대체했습니다.
+
+## 사용자 후속 확인
+
+v2 전달 후 사용자가 "잘 진행되었어"라고 보고했습니다. 직전 문제였던 재결합 단계의 진행 성공으로
+기록하며, Windows DL1 설치/import/help·수치 smoke·실자료 처리 성공까지 확장하지 않습니다.
+USAGE 2.1에는 이번에 안내한 root transfer 도구의 v2 확인 → 재결합 → 압축 해제 명령을 그대로
+정리했고, 2.2는 설치/help 및 별도 선택 smoke 절차를 유지합니다.

@@ -45,18 +45,19 @@ pip/venv와 VC++ x64 런타임은 사전 설치되어 있어야 합니다. 관�
 
 ```bat
 rem 버전이 psdl1-transfer 2인지 먼저 확인
-py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py --version
+py -3.12 scripts\transfer_windows_bundle.py --version
 rem 1. 분할본의 목록/개별 hash를 확인하고 ZIP 재결합
-py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py join bundles\windows_cp312_win_amd64.parts --output outputs\dl1-cmd.zip
+py -3.12 scripts\transfer_windows_bundle.py join bundles\windows_cp312_win_amd64.parts --output outputs\dl1-cmd-v2.zip
 rem 2. 쓰기 가능한 사용자 폴더에 압축 해제
-py -3.12 -m zipfile -e outputs\dl1-cmd.zip "%USERPROFILE%\dl1-cmd"
+py -3.12 -m zipfile -e outputs\dl1-cmd-v2.zip "%USERPROFILE%\dl1-cmd"
 rem 3. 압축 해제된 설치 폴더로 이동
 cd /d "%USERPROFILE%\dl1-cmd\windows_cp312_win_amd64"
 ```
 
-`outputs\dl1-cmd.zip`과 `%USERPROFILE%\dl1-cmd`는 **아직 없는 새 이름**을 사용합니다.
+`outputs\dl1-cmd-v2.zip`과 `%USERPROFILE%\dl1-cmd`는 **아직 없는 새 이름**을 사용합니다.
 이미 있으면 위 명령의 ZIP/폴더 이름을 함께 바꾸십시오. 재결합기는 기존 ZIP을 덮어쓰지 않고,
-성공 시 크기와 최종 SHA256을 출력합니다. 오류가 나면 다음 단계로 진행하지 마십시오.
+성공 시 크기와 최종 SHA256을 출력합니다. 버전 출력은
+`psdl1-transfer 2 (verified LF/CRLF/BOM)`이어야 합니다. 오류가 나면 다음 단계로 진행하지 마십시오.
 
 `reassembly script hash differs`는 Git의 줄바꿈 변환으로 생길 수 있습니다.
 [v2 재결합기 확인 및 오류 안내](WINDOWS_OFFLINE.md#git-반입-중-reassembly-script-hash-differs가-발생할-때)를
@@ -88,7 +89,9 @@ POSIX 예시는 미리 준비된 개발 환경의 `.venv/bin/python`을 뜻하�
 출력 경로는 매번 새 이름을 씁니다.
 
 compare에서 사용자 실제 성공은 CMD 설치/pip check/help 범위뿐입니다. 이는 DL1 설치·수치 smoke·
-실자료 성공의 근거가 아닙니다. DL1의 이 호스트 검증은 macOS 합성 자료이며 실제 Windows는 미검증입니다.
+실자료 성공의 근거가 아닙니다. DL1의 v2 재결합 단계는 사용자에게서 진행 성공을 확인했습니다.
+DL1 설치/import/help·수치 smoke·실자료 처리의 Windows 성공 여부는 아직 별도 확인이 필요합니다.
+이 호스트의 DL1 실행 검증은 macOS 합성 자료입니다.
 선택 smoke 결과와 상세 검증 범위는 [검증 기록](WINDOWS_OFFLINE_VALIDATION.md)에 있습니다.
 
 ## 3. PNG 폴더 준비
