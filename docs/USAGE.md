@@ -312,27 +312,32 @@ python -m psdl1.import_png --verify-bundle ./inspect-new
 `grid_evidence[].diagnostic.png`에서 찾습니다. PNG는 1100×1040 고정 크기입니다. `--no-preview`는 기존 전체
 미리보기/HTML만 생략하며 이 진단은 유지합니다. `--candidate-grid`만 지정하면 진단은 생성하지 않습니다.
 
-- 파랑은 실제 축소 후 전극, 초록은 global CNT, 보라는 겹침입니다. 회색 패딩은 물리적 재료가
-  아니며 관측하지 못한 valid 영역은 회색 해치로 표시합니다.
-- 노랑은 원본 가로/세로 최대 run 중 `길이 × grid/max(H,W) < 2`인 후보의 중점을 포함하는
-  target cell입니다. `runs`는 모든 방향별 후보 수, `cells`는 관측별 cell 수입니다. 같은 XY라도
-  다른 층/관측이면 별도로 셉니다. 노랑은 확정된 손상이나 실제 최소 선폭이 아닙니다.
-- 빨간 큰 링은 원본/축소 연결 성분 대응의 변화입니다. `D`는 전체 성분 소실, `S`는 분리,
-  `M?`는 합쳐짐 의심입니다. 링은 실제 성분 witness 위치이며 정확한 단선 픽셀의 주장이 아닙니다.
-  빨간 수는 관측별 합계입니다. 같은 CNT 점도 global union과 cnt_source에서 두 번 셀 수 있습니다.
-  가까운 링의 숫자는 모든 빨간 site 수입니다. 이벤트 하나에 여러 site가 있을 수 있습니다.
-- 오른쪽은 같은 grid 창을 사용한 원본/축소 확대 쌍을 최대 3개 보여 줍니다. 잘린 범위와
-  `detail views not shown` 수를 확인하십시오. 다른 층이 원래 형상을 가려도 마커/개수는 남습니다.
-- `no shape change detected by this check`는 안전/승인 판정이 아닙니다. 경계 이동, 연결을 유지한
-  침식, 구멍 생성/폐쇄, 모서리 변화 등을 놓칠 수 있습니다. 4-neighbour 정의에서 대각 접촉은
-  bridge가 아니며 area-bin support가 작은 기여 성분을 대응에 남길 수도 있습니다.
+상단 큰 문구로 `SHAPE CHANGE DETECTED`(형상변화 검출), `THIN AREAS: REFERENCE ONLY`
+(얇은 구간 참고만), `NO SHAPE CHANGE DETECTED`(검출 변화 없음), `INSPECTION INCOMPLETE`
+(검사 미완료)를 구분합니다. 미완료가 우선 표시됩니다.
 
-하단 `legacy grid status`와 기존 학습/검색/N7 차단 조건은 그대로입니다. 새 색/대응 결과로 기존
-경고를 무시하거나 전기적 연결성 보존을 승인하지 않습니다. 전체 관측 ID, 원본 경로, 중복 provenance,
-모든 노란 집계와 빨간 witness는 JSONL에서 확인할 수 있습니다. 진단의 원본 foreground 작업 배열은 일시적으로 픽셀당 약 100–170 B가 필요할 수 있습니다
-(수정 kernel의 합성 측정 151.2 B/foreground 픽셀; 상한 보장 아님). 큰 밀집 mask에서는 기존
-Product 메모리 위에 수 GB가 추가될 수 있습니다. 모델 수만큼 원본 label을 캐시하지
-않지만, 한 큰/복잡한 원본의 작업 배열과 grid별 고정 display 메모리 및 근거 파일 용량은 추가됩니다.
+- 파랑/초록/보라는 실제 축소 결과의 전극/CNT/겹침입니다. 회색은 패딩, 해치는 미관측 영역입니다.
+- 노랑은 원본 축방향 run의 `길이 × grid/max(H,W) < 2` 참고 영역입니다. 대각선의 1px run도
+  포함하므로 노랑만으로 형상 손상이나 실제 최소 선폭을 판단하지 않습니다.
+- 빨강은 성분 소실·분리·합쳐짐 의심의 실제 witness 위치입니다. 모든 층의 검출 마커를 유지합니다.
+  하단 `Observations`는 종류별 해당 **관측 수**이며 독립 물리결함 개수가 아닙니다. 같은 변화가
+  global CNT와 source CNT 등에 겹쳐 나타날 수 있습니다. 정확한 단선 픽셀을 뜻하지 않습니다.
+- 오른쪽 확대는 최대 3개이며 `more`는 생략된 이벤트 상세 수입니다. 모든 좌표, 원본 경로,
+  중복 provenance와 노랑/빨강 근거는 함께 생성되는 JSONL에 남습니다.
+
+기존 legacy status와 학습/검색 차단 조건은 그대로이며 `import-report.json`에서 확인합니다.
+축방향 run 경고와 새 형상 판단은 별개입니다. 변화 미검출도 안전/승인이 아니며 경계 이동,
+연결을 유지한 침식, 구멍 변화 등은 놓칠 수 있습니다.
+
+대응 계산의 source 좌표/정렬 임시배열은 최대 65,536 입력 픽셀의 row band로 처리합니다
+(한 행이 더 넓으면 한 행). source/target labels, 성분별 통계와 모든 고유 대응 edge는 여전히
+크기에 비례합니다. 모델별 streaming은 유지되지만 전체 import RAM 상한을 보장하지 않습니다.
+1500² 합성 단일 source→384 grid의 대응 계산 peak는 밀집 320.3→8.3 MiB,
+3% noise + 보존되는 두 영역을 넣은 sparse는 11.2→3.7 MiB였습니다. 3회 중앙 실행시간은
+각각 131→161 ms, 11.6→24.5 ms로
+시간 비용이 있습니다. 전체 모델 import 또는 실제 18,000 PNG 성공 측정은 아닙니다.
+`python scripts/benchmark_png_correspondence.py --case dense` (`sparse`도 가능)로 재현하며
+`--baseline-source <이전 png_diagnostic.py>`를 별도 프로세스에 주면 이전 구현과 비교합니다.
 
 재현 가능한 합성 예제(실제 데이터 성능/안전성 검증이 아님):
 

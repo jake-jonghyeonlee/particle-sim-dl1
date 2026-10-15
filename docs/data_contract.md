@@ -749,7 +749,9 @@ For `inspect_not_evaluated`/`inspect_failed_not_approved`, the exact nested obje
 Earlier complete grids survive a later failed grid; later grid rows are absent. A render/ledger error
 is a grid failure. Unfinished sinks remove only their own exclusively-created PNG/ledger files. The verified failure
 bundle publishes with exit 2, referencing earlier complete pairs and omitting later grids; export
-is blocked. Interruption, source mutation and progress-transport errors still abort without publication. No diagnostic changes approval or training/search gates.
+is blocked. Constructor mkdir/allocation failures follow the same path: close-safe fields are initialized
+before work begins, and only owned empty directories/files are removed; pre-existing content survives.
+Interruption, source mutation and progress-transport errors still abort without publication. No diagnostic changes approval or training/search gates.
 
 Each logical electrode, supplied connection mask, optional global CNT union and canonical source CNT
 asset is measured independently, with role/layer/asset/component identity and duplicate provenance.
@@ -767,6 +769,10 @@ target degree >=2 means merge_suspected. Both directions are evaluated even if t
 Split/merge sites use real support-edge witnesses nearest a representative of lost source material,
 when that component has foreground with no retained target support. The representative prefers lost
 material farthest from retained target foreground (city-block distance), with deterministic ties.
+Two source row-band passes bound coordinate/sort scratch to 65,536 input pixels (or one wider row),
+without changing adaptive support, lost counts, row-major representative ties, or nearest-witness
+(proximity,y,x,ty,tx) ordering. Labels remain O(HW + G²), component statistics O(C), and the global
+unique-edge output and merge scratch O(E + band supports); these are not fixed-memory bounds.
 Events record per-source lost counts; sites include optional lost_source_xy. Insets centre on that
 lost material. These are affected-region witnesses, not a claimed precise fracture position. Disappearance
 uses the projected first foreground source pixel. The full-frame centre mapping is
@@ -785,7 +791,9 @@ counts/minimum), event (kind/component IDs/bounds/site count/ambiguity flag), ad
 (real source/target/grid coordinates, local index and cluster ID), cluster (site count/display bounds),
 summary (exact scalar metadata/counts plus legacy status). Unknown/extra fields, versions, nonfinite or
 out-of-frame coordinates, duplicate references, bad canonical namespaces and count inconsistencies
-are rejected. Verification reads the PNG signature/IHDR (fixed RGB 1100x1040), hashes and ledger stream;
+are rejected. A site's lost_source_xy is null exactly when its corresponding source lost count is zero;
+disappearance requires a positive lost count and identical source/lost coordinates. Existing v1
+outputs satisfy these checks; no schema fields change. Verification reads the PNG signature/IHDR (fixed RGB 1100x1040), hashes and ledger stream;
 it retains one current observation/event and 144 cluster counters, not a global set of sites. Hashes
 provide integrity, not authenticity or electrical certification.
 
@@ -795,7 +803,10 @@ rounding can be missed. Support overlap can retain a tiny contributor that would
 per-source CNT views help expose union masking but cannot prove absence of damage. Four-neighbour
 diagonal contact is not a bridge. No skeleton, physical linewidth or electrical claim is introduced.
 The raster is a bounded view: reduced geometry is nearest-displayed, yellow uses OR/max for grids
-above 768, and at most three paired details are shown with exact unshown counts. All evidence remains
+above 768, and at most three paired details are shown with exact unshown counts. The large display
+judgment separates shape change, thin-area reference only, no detected shape change, and incomplete
+inspection (takes precedence). The footer reports observations per change kind, not physical defects;
+raw runs/cells/sites/clusters and legacy status remain in machine evidence rather than the PNG. All evidence remains
 in the stream; every layer's magnified view is not promised.
 
 Forward compatibility: existing v3 readers retain the unchanged legacy evidence but do not validate

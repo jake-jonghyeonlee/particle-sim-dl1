@@ -172,78 +172,142 @@ def yellow_cells(measured, transform):
                'horizontal_runs': int(counts[cell, 0]), 'vertical_runs': int(counts[cell, 1])}
 
 
-def correspondence(source_labels, target_labels, transform):
-    """Unique edges and real witnesses through exact integer adaptive bins.
+# Cap coordinate/sort temporaries by input pixels, independent of density.
+# A source row wider than this budget is the minimum indivisible band.
+_CORRESPONDENCE_BAND_PIXELS = 65536
 
-    Each source pixel visits <=2 bins per axis for downsampling; upsampling
-    enumerates all actual support bins, including overlapping adaptive bins.
+
+def _source_bands(source_labels, transform):
+    h, w = transform.shape_yx
+    nh, nw = transform.resized_shape_yx
+    rows = max(1, _CORRESPONDENCE_BAND_PIXELS // w)
+    for start in range(0, h, rows):
+        y, x = (coordinate.astype(np.int32) for coordinate in
+                np.nonzero(source_labels.image[start:start + rows]))
+        y += start
+        sl = source_labels.image[y, x]
+        x0 = (x.astype(np.int64) * nw // w).astype(np.int32)
+        x1 = (((x.astype(np.int64) + 1) * nw + w - 1) // w).astype(np.int32)
+        y0 = (y.astype(np.int64) * nh // h).astype(np.int32)
+        y1 = (((y.astype(np.int64) + 1) * nh + h - 1) // h).astype(np.int32)
+        yield y, x, sl, x0, x1, y0, y1
+
+
+def _band_supports(band, target_labels, transform):
+    _, _, _, x0, x1, y0, y1 = band
+    left, top, _, _ = transform.padding_ltrb
+    for dy in range(int((y1 - y0).max(initial=0))):
+        for dx in range(int((x1 - x0).max(initial=0))):
+            ii = np.flatnonzero((x0 + dx < x1) & (y0 + dy < y1))
+            tx, ty = x0[ii] + dx + left, y0[ii] + dy + top
+            yield ii, tx, ty, target_labels.image[ty, tx]
+
+
+def _unique_edges(edges):
+    """Minimum witness by (proximity, y, x, ty, tx), sorted by source/target."""
+    order = np.lexsort((edges[:, 4], edges[:, 5], edges[:, 2], edges[:, 3],
+                        edges[:, 6], edges[:, 1], edges[:, 0]))
+    edges = edges[order]
+    first = np.r_[True, np.any(edges[1:, :2] != edges[:-1, :2], axis=1)]
+    return edges[first]
+
+
+def correspondence(source_labels, target_labels, transform):
+    """Exact adaptive-bin edges with two bounded source-coordinate passes.
+
+    Pass 1 counts lost pixels and picks the global farthest-lost representative
+    (row-major ties). Pass 2 retains the nearest edge witness with the original
+    (y,x,ty,tx) ties. No whole-foreground coordinates or argsort arrays coexist.
+    Labels are still O(HW + G²), component totals O(C), and retained unique
+    edges O(E). Global edge merging/sorting is output-sensitive, NOT constant
+    memory; its temporary storage is O(E + band supports). Upsampling enumerates
+    every support bin without retaining all of them. A band is <=65536 input
+    pixels except when a single row is wider than that budget.
     """
     h, w = transform.shape_yx
     nh, nw = transform.resized_shape_yx
     left, top, _, _ = transform.padding_ltrb
-    y, x = (coordinate.astype(np.int32) for coordinate in np.nonzero(source_labels.image))
-    sl = source_labels.image[y, x]
-    x0=(x.astype(np.int64)*nw//w).astype(np.int32)
-    x1=(((x.astype(np.int64)+1)*nw+w-1)//w).astype(np.int32)
-    y0=(y.astype(np.int64)*nh//h).astype(np.int32)
-    y1=(((y.astype(np.int64)+1)*nh+h-1)//h).astype(np.int32)
+    count = source_labels.count + 1
+    lost_counts = np.zeros(count, dtype=np.int64)
+    if target_labels.count == 0:
+        # All material is lost and every distance score is the same. The
+        # labeler's first pixel is exactly the row-major representative. Avoid
+        # coordinate/support construction entirely, still counting in bands.
+        rows = max(1, _CORRESPONDENCE_BAND_PIXELS // w)
+        for start in range(0, h, rows):
+            lost_counts += np.bincount(source_labels.image[start:start + rows].ravel(), minlength=count)
+        lost_counts[0] = 0
+        lost_xy = source_labels.first_yx[:, ::-1].astype(np.int32)
+        lost_xy[0] = -1
+        return np.empty((0, 6), dtype=np.int32), lost_counts, lost_xy
+    maximum = np.full(count, -1, dtype=np.int32)
+    representative = np.full(count, h * w, dtype=np.int64)
+    distance = np.where(target_labels.image != 0, 0, 2 * transform.grid).astype(np.int32)
+    for axis in (1, 0):
+        index = np.arange(transform.grid, dtype=np.int32)
+        if axis == 0:
+            index = index[:, None]
+        distance = np.minimum.accumulate(distance - index, axis=axis) + index
+        distance = np.flip(np.minimum.accumulate(np.flip(distance + index, axis=axis),
+                           axis=axis), axis=axis) - index
+    for band in _source_bands(source_labels, transform):
+        y, x, sl, *_ = band
+        supported = np.zeros(len(x), dtype=bool)
+        for ii, tx, ty, tt in _band_supports(band, target_labels, transform):
+            supported[ii[tt != 0]] = True
+        lost = ~supported
+        lost_counts += np.bincount(sl[lost], minlength=count)
+        mx = (((2 * x.astype(np.int64) + 1) * nw // (2 * w) + left).clip(0, transform.grid - 1)).astype(np.int32)
+        my = (((2 * y.astype(np.int64) + 1) * nh // (2 * h) + top).clip(0, transform.grid - 1)).astype(np.int32)
+        score = distance[my, mx]
+        # Bands arrive in global row-major order. Only a strictly larger score
+        # can replace a prior band's representative; equal scores keep it.
+        better = lost & (score > maximum[sl])
+        np.maximum.at(maximum, sl[better], score[better])
+        eligible = better & (score == maximum[sl])
+        cc = np.unique(sl[eligible])
+        representative[cc] = h * w
+        np.minimum.at(representative, sl[eligible],
+                      y[eligible].astype(np.int64) * w + x[eligible])
+    lost_xy = np.full((count, 2), -1, dtype=np.int32)
+    cc = np.flatnonzero(lost_counts)
+    lost_xy[cc, 0] = representative[cc] % w
+    lost_xy[cc, 1] = representative[cc] // w
+    # Release pass-1 temporaries before allocating pass-2 coordinates.
+    del distance, maximum, representative, band, y, x, sl, supported, lost
+    del mx, my, score, better, eligible, cc, ii, tx, ty, tt
+    edges = np.empty((0, 7), dtype=np.int64)
     base = target_labels.count + 1
-    def supports():
-        for dy in range(int((y1-y0).max(initial=0))):
-            for dx in range(int((x1-x0).max(initial=0))):
-                ii=np.flatnonzero((x0+dx<x1)&(y0+dy<y1))
-                tx,ty=x0[ii]+dx+left,y0[ii]+dy+top
-                yield ii,tx,ty,target_labels.image[ty,tx]
-    supported=np.zeros(len(x),dtype=bool)
-    for ii,tx,ty,tt in supports():supported[ii[tt!=0]]=True
-    lost=~supported
-    lost_counts=np.bincount(sl[lost],minlength=source_labels.count+1)
-    # Prefer a genuinely lost region far from retained material, rather than
-    # ordinary edge erosion. Exact separable city-block distance on target cells.
-    distance=np.where(target_labels.image!=0,0,2*transform.grid).astype(np.int32)
-    for axis in (1,0):
-        index=np.arange(transform.grid,dtype=np.int32)
-        if axis==0:index=index[:,None]
-        distance=np.minimum.accumulate(distance-index,axis=axis)+index
-        distance=np.flip(np.minimum.accumulate(np.flip(distance+index,axis=axis),axis=axis),axis=axis)-index
-    mx=(((2*x.astype(np.int64)+1)*nw//(2*w)+left).clip(0,transform.grid-1)).astype(np.int32)
-    my=(((2*y.astype(np.int64)+1)*nh//(2*h)+top).clip(0,transform.grid-1)).astype(np.int32)
-    score=distance[my,mx]
-    maximum=np.full(source_labels.count+1,-1,dtype=np.int32)
-    np.maximum.at(maximum,sl[lost],score[lost])
-    representative=np.full(source_labels.count+1,len(x),dtype=np.int64)
-    eligible=lost&(score==maximum[sl])
-    np.minimum.at(representative,sl[eligible],np.flatnonzero(eligible))
-    lost_xy=np.full((source_labels.count+1,2),-1,dtype=np.int32)
-    cc=np.flatnonzero(lost_counts)
-    lost_xy[cc]=np.column_stack((x[representative[cc]],y[representative[cc]]))
-    chunks=[]
-    for ii,tx,ty,tt in supports():
-        keep=tt!=0;ii,tx,ty,tt=ii[keep],tx[keep],ty[keep],tt[keep]
-        ss=sl[ii];key=ss.astype(np.int64)*base+tt
-        delta_x=x[ii].astype(np.int64)-lost_xy[ss,0]
-        delta_y=y[ii].astype(np.int64)-lost_xy[ss,1]
-        proximity=np.where(lost_counts[ss]>0,delta_x*delta_x+delta_y*delta_y,0)
-        # ii is row-major, so stable key grouping already supplies the y/x
-        # tie-break; tx/ty are fixed for each pixel in this support pass.
-        order=np.argsort(key,kind='stable')
-        if len(order):
-            sorted_key=key[order]
-            starts=np.r_[0,np.flatnonzero(sorted_key[1:]!=sorted_key[:-1])+1]
-            minimum=np.minimum.reduceat(proximity[order],starts)
-            sizes=np.diff(np.r_[starts,len(order)])
-            candidates=np.where(proximity[order]==np.repeat(minimum,sizes),order,len(order))
-            chosen=np.minimum.reduceat(candidates,starts)
-        else:
-            chosen=order
-        chunks.append(np.column_stack((ss[chosen],tt[chosen],x[ii[chosen]],y[ii[chosen]],
-                                       tx[chosen],ty[chosen],proximity[chosen])))
-    if not chunks or not any(len(chunk) for chunk in chunks):
-        return np.empty((0,6),dtype=np.int32),lost_counts,lost_xy
-    edges=np.concatenate(chunks)
-    order=np.lexsort((edges[:,4],edges[:,5],edges[:,2],edges[:,3],edges[:,6],edges[:,1],edges[:,0]))
-    edges=edges[order];keys=edges[:,0]*base+edges[:,1]
-    return edges[np.r_[True,keys[1:]!=keys[:-1]],:6].astype(np.int32),lost_counts,lost_xy
+    for band in _source_bands(source_labels, transform):
+        y, x, sl, *_ = band
+        band_edges = np.empty((0, 7), dtype=np.int64)
+        for ii, tx, ty, tt in _band_supports(band, target_labels, transform):
+            keep = tt != 0
+            ii, tx, ty, tt = ii[keep], tx[keep], ty[keep], tt[keep]
+            ss = sl[ii]
+            key = ss.astype(np.int64) * base + tt
+            delta_x = x[ii].astype(np.int64) - lost_xy[ss, 0]
+            delta_y = y[ii].astype(np.int64) - lost_xy[ss, 1]
+            proximity = np.where(lost_counts[ss] > 0, delta_x * delta_x + delta_y * delta_y, 0)
+            order = np.argsort(key, kind='stable')
+            if len(order):
+                sorted_key = key[order]
+                starts = np.r_[0, np.flatnonzero(sorted_key[1:] != sorted_key[:-1]) + 1]
+                minimum = np.minimum.reduceat(proximity[order], starts)
+                sizes = np.diff(np.r_[starts, len(order)])
+                candidates = np.where(proximity[order] == np.repeat(minimum, sizes), order, len(order))
+                chosen = np.minimum.reduceat(candidates, starts)
+            else:
+                chosen = order
+            if len(chosen):
+                chunk = np.column_stack((ss[chosen], tt[chosen], x[ii[chosen]], y[ii[chosen]],
+                                         tx[chosen], ty[chosen], proximity[chosen]))
+                band_edges = _unique_edges(np.concatenate((band_edges, chunk)))
+        # Compact each band into the global unique edge set. Repeated edges
+        # across arbitrarily many bands never accumulate a foreground-sized list.
+        if len(band_edges):
+            edges = _unique_edges(np.concatenate((edges, band_edges)))
+    return edges[:, :6].astype(np.int32), lost_counts, lost_xy
 
 
 @dataclass
@@ -615,7 +679,8 @@ def verify_diagnostic_ledger(path, metadata, row, cnt_mode):
                              and all(_integer(n) and n<=observation['active_pixels'] for n in event['lost_source_counts']))
                     _bounds(event['source_bounds'],sources,w,h); _bounds(event['target_bounds'],targets,grid,grid)
                     if event['kind'] == 'disappearance':
-                        _require(len(sources)==1 and targets==[] and event['site_count']==1)
+                        _require(len(sources)==1 and targets==[] and event['site_count']==1
+                                 and event['lost_source_counts'][0]>0)
                         rank, component = 0,sources[0]
                     elif event['kind'] == 'split':
                         _require(len(sources)==1 and len(targets)>=2 and event['site_count']==len(targets))
@@ -633,12 +698,16 @@ def verify_diagnostic_ledger(path, metadata, row, cnt_mode):
                     sx,sy = record['source_xy']
                     source_box=event['source_bounds'][record['site_index'] if event['kind']=='merge_suspected' else 0]
                     _require(source_box[0]<=sx<source_box[2] and source_box[1]<=sy<source_box[3], 'diagnostic source witness outside component bounds')
+                    source_index = record['site_index'] if event['kind']=='merge_suspected' else 0
+                    _require((record['lost_source_xy'] is None) == (event['lost_source_counts'][source_index] == 0),
+                             'diagnostic lost material count/coordinate mismatch')
                     if record['lost_source_xy'] is not None:
                         _coordinate(record['lost_source_xy'],w,h,True)
                         lx,ly=record['lost_source_xy']
                         _require(source_box[0]<=lx<source_box[2] and source_box[1]<=ly<source_box[3])
                     if event['kind']=='disappearance':
-                        _require(record['target_xy'] is None)
+                        _require(record['target_xy'] is None and record['lost_source_xy']==record['source_xy'],
+                                 'diagnostic disappearance coordinate mismatch')
                         nh,nw = transform['resized_shape_yx']; left,top,_,_ = transform['padding_ltrb']
                         _require(np.allclose(record['grid_xy'],[(sx+.5)*nw/w+left,(sy+.5)*nh/h+top],rtol=0,atol=1e-10))
                     else:

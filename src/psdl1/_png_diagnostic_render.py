@@ -18,6 +18,18 @@ COLORS = {'electrode': (74, 120, 200), 'cnt': (46, 139, 87),
           'yellow': (242, 194, 0), 'red': (224, 32, 27)}
 
 
+def _judgment(metadata, has_thin):
+    """Display-only judgment; legacy status and diagnostic v1 stay unchanged."""
+    state = metadata['shape_state']
+    if state == 'observation_incomplete':
+        return 'INSPECTION INCOMPLETE', COLORS['red']
+    if state == 'change_detected':
+        return 'SHAPE CHANGE DETECTED', COLORS['red']
+    if has_thin:
+        return 'THIN AREAS: REFERENCE ONLY', (140, 113, 0)
+    return 'NO SHAPE CHANGE DETECTED', (35, 75, 70)
+
+
 def display_xy(grid_xy, grid):
     return [ORIGIN[i] + float(grid_xy[i]) * VIEW / grid for i in (0, 1)]
 
@@ -119,36 +131,41 @@ class DiagnosticSink:
         self.progress, self.observation_count = progress, observation_count
         self._ledger_owned = self._png_owned = False
         self._created_directories = set()
-        for directory in (self.png_path.parent, self.ledger_path.parent):
-            missing = []
-            while not directory.exists():
-                missing.append(directory)
-                directory = directory.parent
-            for directory in reversed(missing):
-                try:
-                    directory.mkdir()
-                except FileExistsError:
-                    pass
-                else:
-                    self._created_directories.add(directory)
-        self.electrode = np.zeros((VIEW, VIEW), dtype=bool)
-        self.cnt = np.zeros_like(self.electrode)
-        self.yellow = np.zeros_like(self.electrode)
-        self.holes = _holes(valid, transform) if not valid.all() else np.zeros_like(self.electrode)
-        self.incomplete = not bool(valid.all())
-        self.rings = Image.new('RGBA', (VIEW, VIEW), (0, 0, 0, 0))
-        self.cluster_counts = np.zeros((12, 12), dtype=np.int64)
-        self.cluster_bounds = np.zeros((12, 12, 4), dtype=float)
-        self.cluster_bounds[:, :, :2] = np.inf
-        self.cluster_bounds[:, :, 2:] = -np.inf
-        self.counts = {k: 0 for k in ('observations', 'thin_runs', 'thin_cells', 'disappearance',
-                                    'split', 'merge_suspected', 'sites', 'clusters')}
-        self.insets = []
-        self.eligible = 0
-        self._observation_index = 0
+        # close() must be safe from the first mkdir through every allocation.
         self._finished = False
         self._file = None
+        self.rings = None
+        self.electrode = self.cnt = self.yellow = self.holes = None
+        self.cluster_counts = self.cluster_bounds = None
+        self.insets = []
+        self.event_observations = {k: 0 for k in ('disappearance', 'split', 'merge_suspected')}
         try:
+            for directory in (self.png_path.parent, self.ledger_path.parent):
+                missing = []
+                while not directory.exists():
+                    missing.append(directory)
+                    directory = directory.parent
+                for directory in reversed(missing):
+                    try:
+                        directory.mkdir()
+                    except FileExistsError:
+                        pass
+                    else:
+                        self._created_directories.add(directory)
+            self.electrode = np.zeros((VIEW, VIEW), dtype=bool)
+            self.cnt = np.zeros_like(self.electrode)
+            self.yellow = np.zeros_like(self.electrode)
+            self.holes = _holes(valid, transform) if not valid.all() else np.zeros_like(self.electrode)
+            self.incomplete = not bool(valid.all())
+            self.rings = Image.new('RGBA', (VIEW, VIEW), (0, 0, 0, 0))
+            self.cluster_counts = np.zeros((12, 12), dtype=np.int64)
+            self.cluster_bounds = np.zeros((12, 12, 4), dtype=float)
+            self.cluster_bounds[:, :, :2] = np.inf
+            self.cluster_bounds[:, :, 2:] = -np.inf
+            self.counts = {k: 0 for k in ('observations', 'thin_runs', 'thin_cells', 'disappearance',
+                                        'split', 'merge_suspected', 'sites', 'clusters')}
+            self.eligible = 0
+            self._observation_index = 0
             self._file = self.ledger_path.open('x', encoding='utf-8')
             self._ledger_owned = True
             self._write('header', diagnostic_schema_version=VERSION, model_id=model_id,
@@ -195,7 +212,9 @@ class DiagnosticSink:
             x, y = record['cell_xy']; ym[y, x] = True
         self.yellow |= _project_mask(ym)
         draw = ImageDraw.Draw(self.rings)
+        observed_kinds = set()
         for event, sites in iter_events(observation, measured, result):
+            observed_kinds.add(event['kind'])
             self.counts[event['kind']] += 1
             self.eligible += 1
             self._write('event', observation_id=observation.observation_id, site_count=len(sites), **event)
@@ -236,6 +255,9 @@ class DiagnosticSink:
                 self.insets.append(candidate)
                 self.insets.sort(key=lambda item: item['key'])
                 del src, dst
+
+        for kind in observed_kinds:
+            self.event_observations[kind] += 1
 
     def finish(self, check):
         self.counts['clusters'] = int(np.count_nonzero(self.cluster_counts))
@@ -287,24 +309,13 @@ class DiagnosticSink:
             draw = ImageDraw.Draw(image)
             font = ImageFont.load_default(size=15)
             small = ImageFont.load_default(size=13)
-            full_title = f'{self.model_id} | grid {g} | CNT mode {self.cnt_mode}'
-            # Bounded title with full original identity preserved in header.
-            for row in range(2):
-                text = full_title[row * 118:(row + 1) * 118]
-                draw.text((20, 12 + row * 22), text, fill='black', font=font)
-            draw.text((20, 60), f'Threshold >= 0.5 | full-frame area + central pad | display {VIEW}/{g} (nearest)', fill='black', font=small)
+            full_title = f'{self.model_id} | grid {g}'
+            draw.text((20, 8), full_title[:130], fill='black', font=font)
+            verdict, color = _judgment(metadata, bool(self.yellow.any()))
+            draw.text((20, 30), verdict, fill=color, font=ImageFont.load_default(size=28))
+            draw.text((20, 64), f'Actual grid result | {g} -> {VIEW}px nearest display', fill='black', font=small)
             draw.rectangle((19, 83, 788, 852), outline=(90, 90, 90))
-            for by, bx in zip(*np.nonzero(self.cluster_counts > 1)):
-                count = str(int(self.cluster_counts[by, bx]))
-                # Reserve each bin's top strip for its count, never truncate.
-                x, y = ORIGIN[0] + bx * 64 + 3, ORIGIN[1] + by * 64 + 2
-                badge_font = small
-                while draw.textbbox((0, 0), count, font=badge_font)[2] > 58:
-                    badge_font = ImageFont.load_default(size=max(1, badge_font.size - 1))
-                box = draw.textbbox((x, y), count, font=badge_font)
-                draw.rectangle((box[0] - 1, box[1] - 1, box[2] + 1, box[3] + 1), fill='white', outline=COLORS['red'])
-                draw.text((x, y), count, fill=COLORS['red'], font=badge_font)
-            draw.text((810, 84), 'Affected-region detail (capped)', fill='black', font=small)
+            draw.text((810, 84), 'Red-region details (max 3)', fill='black', font=small)
             for row, inset in enumerate(self.insets):
                 y = 116 + row * 238
                 title = f"{inset['observation_id']} {inset['scope']} layer {inset['layer'] or '-'}"
@@ -329,22 +340,20 @@ class DiagnosticSink:
                         image.paste(crop_image, (810 + col * 140, y + 59))
                     draw.rectangle((810 + col * 140, y + 59, 942 + col * 140, y + 191), outline=(100, 100, 100))
             draw.rectangle((20, 872, 32, 884), fill=COLORS['yellow'], outline=(140, 113, 0))
-            draw.text((40, 869), 'thin-run candidates; gray = padding / hatch = unobserved', fill='black', font=small)
-            draw.ellipse((20, 895, 33, 908), outline=COLORS['red'], width=3)
-            draw.text((40, 891), 'shape-change evidence (D / S / M?) at real component witnesses', fill='black', font=small)
+            draw.text((40, 869), 'Thin-area reference only (axis runs)', fill='black', font=font)
+            draw.ellipse((20, 899, 33, 912), outline=COLORS['red'], width=3)
+            draw.text((40, 896), 'Check shape changes; all detected locations marked', fill='black', font=font)
             for i, name in enumerate(('electrode', 'cnt', 'overlap')):
                 x = 810 + i * 90
                 draw.rectangle((x, 872, x + 10, 882), fill=COLORS[name])
                 draw.text((x, 890), name, fill='black', font=small)
-            c = self.counts
-            lines = [f"Y thin-run candidates: {c['thin_runs']} runs in {c['thin_cells']} cells (observation totals)",
-                     f"R shape change: D {c['disappearance']} S {c['split']} M? {c['merge_suspected']} ({c['sites']} sites; observation totals)",
-                     {'change_detected': 'shape change detected', 'no_change_detected': 'no shape change detected by this check', 'observation_incomplete': 'observation incomplete'}[metadata['shape_state']],
-                     f"{c['sites']} sites / {c['clusters']} clusters; all sites included; insets {len(self.insets)} of {self.eligible} eligible; {self.eligible - len(self.insets)} detail views not shown",
-                     f"legacy grid status: {check['status']} (approval unchanged); layer overlap may hide shape; markers retained",
-                     'Component correspondence is not proof of geometry, linewidth, topology or electrical connectivity.']
+            c = self.event_observations
+            lines = [f"Observations: loss {c['disappearance']} | split {c['split']} | merge? {c['merge_suspected']}",
+                     'Overlapping observations may refer to the same change.',
+                     f"Red details: {len(self.insets)} shown | {self.eligible - len(self.insets)} more",
+                     'Gray: padding / hatch: unobserved | Full evidence: paired JSONL']
             for row, line in enumerate(lines):
-                draw.text((20, 920 + row * 19), line, fill='black', font=small)
+                draw.text((20, 938 + row * 23), line, fill='black', font=font if row == 0 else small)
             # Exclusive output avoids accidental replacement outside staging.
             with self.png_path.open('xb') as output:
                 self._png_owned = True
@@ -362,7 +371,8 @@ class DiagnosticSink:
                 if owned:
                     path.unlink(missing_ok=True)
             self.cleanup_directories()
-        self.rings.close()
+        if self.rings is not None:
+            self.rings.close()
         self.insets.clear()
         self.progress = None
         # Release numeric planes even if the caller retains a settled sink.

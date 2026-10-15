@@ -842,3 +842,156 @@ def test_verifier_checks_split_witness_source_box_and_target_centre(tmp_path,mut
         'grid_check':outcomes[0]['grid_check']}
     with pytest.raises(ValueError,match=message):
         diag.verify_diagnostic_ledger(path,outcomes[0]['diagnostic'],row,'image_only')
+
+
+@pytest.mark.parametrize('grid', [1, 4, 17, 53])
+@pytest.mark.parametrize('budget', [1, 173, 65536])
+def test_row_band_crossings_preserve_exact_correspondence(monkeypatch, grid, budget):
+    monkeypatch.setattr(diag, '_CORRESPONDENCE_BAND_PIXELS', budget)
+    rng = np.random.default_rng(712)
+    masks = [bridge(True), np.ones((29, 37), bool)]
+    masks.extend(rng.random((29, 37)) < density for density in (.05, .5, .95))
+    lattice = np.zeros((29, 37), bool)
+    lattice[::4] = True
+    lattice[:, ::5] = True
+    masks.extend((lattice, np.zeros_like(lattice)))
+    for mask in masks:
+        measured = diag.measure_source(mask, np.ones_like(mask))
+        result = diag.measure_grid(measured, grid)
+        expected = _lexsort_correspondence_oracle(measured.labels, result.target, result.transform)
+        for actual, want in zip((result.edges, result.lost_counts, result.lost_xy), expected):
+            np.testing.assert_array_equal(actual, want)
+
+
+@pytest.mark.parametrize('state,thin,text', [
+    ('observation_incomplete', True, 'INSPECTION INCOMPLETE'),
+    ('change_detected', True, 'SHAPE CHANGE DETECTED'),
+    ('no_change_detected', True, 'THIN AREAS: REFERENCE ONLY'),
+    ('no_change_detected', False, 'NO SHAPE CHANGE DETECTED'),
+])
+def test_prominent_display_judgments(state, thin, text):
+    from psdl1._png_diagnostic_render import _judgment
+    assert _judgment({'shape_state': state}, thin)[0] == text
+
+
+def test_display_observation_counts_and_markers_are_not_physical_defect_counts(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    captured = []
+    original = ImageDraw.ImageDraw.text
+    def record(self, xy, text, *args, **kwargs):
+        captured.append(text)
+        return original(self, xy, text, *args, **kwargs)
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text', record)
+    render(tmp_path, product(bridge(True), cnt=bridge(True)))
+    assert 'Observations: loss 0 | split 2 | merge? 2' in captured
+    assert 'Overlapping observations may refer to the same change.' in captured
+    assert 'Red details: 3 shown | 1 more' in captured
+    assert not any('legacy' in text or 'clusters' in text or 'sites' in text for text in captured)
+
+
+@pytest.mark.parametrize('stage', ['zeros', 'holes', 'image', 'mkdir'])
+def test_sink_early_init_failure_removes_only_owned_directories(tmp_path, monkeypatch, stage):
+    from pathlib import Path
+    from psdl1 import _png_diagnostic_render as renderer
+    sentinel = tmp_path / 'existing' / 'sentinel'
+    sentinel.parent.mkdir()
+    sentinel.write_bytes(b'unowned')
+    png = sentinel.parent / 'owned' / 'nested' / 'g.png'
+    ledger = sentinel.parent / 'other' / 'g.jsonl'
+    valid = np.ones((16, 16), bool)
+    valid[0, 0] = False
+    if stage == 'zeros':
+        original = np.zeros
+        def fail(shape, *args, **kwargs):
+            if shape == (VIEW, VIEW):
+                raise MemoryError('allocation')
+            return original(shape, *args, **kwargs)
+        monkeypatch.setattr(np, 'zeros', fail)
+    elif stage == 'holes':
+        def fail(*args):
+            raise MemoryError('holes')
+        monkeypatch.setattr(renderer, '_holes', fail)
+    elif stage == 'image':
+        def fail(*args, **kwargs):
+            raise MemoryError('image')
+        monkeypatch.setattr(Image, 'new', fail)
+    else:
+        original = Path.mkdir
+        def fail(self, *args, **kwargs):
+            if self == ledger.parent:
+                raise PermissionError('mkdir')
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(Path, 'mkdir', fail)
+    with pytest.raises((MemoryError, PermissionError)):
+        DiagnosticSink(png, ledger, model_id='synthetic',
+                       transform=data.frame_transform(valid.shape, 4), valid=valid)
+    assert sentinel.read_bytes() == b'unowned'
+    assert sorted(sentinel.parent.iterdir()) == [sentinel]
+
+
+@pytest.mark.parametrize('grids', [(16,), (16, 32, 64)])
+@pytest.mark.parametrize('stage', ['allocation', 'mkdir'])
+@pytest.mark.parametrize('export', [False, True])
+def test_first_sink_init_failure_publishes_exact_verified_failure_bundle(tmp_path, monkeypatch, grids, stage, export):
+    from pathlib import Path
+    from psdl1 import import_png as importer
+    from test_png_streaming import import_options
+    options = replace(import_options(tmp_path, no_preview=True, export=export), inspect_grids=grids)
+    injected = []
+    if stage == 'allocation':
+        original = np.zeros
+        def fail(shape, *args, **kwargs):
+            if shape == (VIEW, VIEW) and not injected:
+                injected.append(True)
+                raise MemoryError('first sink allocation')
+            return original(shape, *args, **kwargs)
+        monkeypatch.setattr(np, 'zeros', fail)
+    else:
+        original = Path.mkdir
+        def fail(self, *args, **kwargs):
+            if self.parent.name == 'diagnostics' and not injected:
+                injected.append(True)
+                raise PermissionError('first sink mkdir')
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(Path, 'mkdir', fail)
+    _, code = importer.run_import(options)
+    assert injected and code == 2
+    assert importer.verify_bundle(options.out)['status'] == 'verified'
+    report = json.loads((options.out / 'import-report.json').read_text())
+    assert len(report['grid_evidence']) == 1
+    row = report['grid_evidence'][0]
+    assert row['purpose'] == 'inspect_failed_not_approved' and row['diagnostic']['requested_grids'] == [16]
+    assert row['diagnostic']['state'] == 'not_evaluated'
+    assert not (options.out / 'diagnostics').exists()
+    assert not (options.out / 'manifest.json').exists()
+
+
+@pytest.mark.parametrize('mutation', ['missing_lost', 'zero_lost', 'different_disappearance', 'unexpected_lost'])
+def test_lost_material_self_consistency(tmp_path, mutation):
+    m = np.zeros((16, 16), bool)
+    if mutation == 'unexpected_lost':
+        m = np.zeros((2, 2), bool)
+        m[0, 0] = m[1, 1] = True  # both contribute to the retained mean=.5 cell
+        grids = (1,)
+    else:
+        m[1, 1:3] = True
+        grids = (4,)
+    outcomes, records = render(tmp_path, product(m), grids)
+    row = {'model_id': 'synthetic', 'transform': outcomes[0]['grid_check']['transform'],
+           'grid_check': outcomes[0]['grid_check']}
+    diag.verify_diagnostic_ledger(tmp_path / f'g{grids[0]}.jsonl', outcomes[0]['diagnostic'], row, 'image_only')
+    event = next(r for r in records if r['type'] == 'event')
+    site = next(r for r in records if r['type'] == 'site')
+    if mutation == 'missing_lost':
+        site['lost_source_xy'] = None
+    elif mutation == 'zero_lost':
+        event['lost_source_counts'][0] = 0
+    elif mutation == 'different_disappearance':
+        site['lost_source_xy'] = [2, 1]
+    else:
+        assert event['lost_source_counts'][0] == 0
+        site['lost_source_xy'] = site['source_xy']
+    path = tmp_path / 'mutant.jsonl'
+    path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+    with pytest.raises(ValueError):
+        diag.verify_diagnostic_ledger(path, outcomes[0]['diagnostic'], row, 'image_only')
