@@ -74,3 +74,17 @@ Windows DL1 설치, CMD wrapper의 실제 실행/quoting, Microsoft VC++ DLL 로
 단위 테스트로 검증한 것이며 실제 Windows 성공을 뜻하지 않습니다.
 16GB/18,000 PNG 처리시간·peak RAM·검색 품질도 미검증입니다. timm/torchvision/safetensors,
 pretrained weights와 GPU/CUDA는 이 CPU/PNG 배포 범위에서 제외합니다.
+
+## Git CRLF 전달 오류 후속 수정
+
+`reassembly script hash differs`의 한 원인으로 Windows Git `core.autocrlf=true`의
+LF→CRLF 변환을 실제 Git checkout으로 재현했습니다. LF 복구 후 원래 manifest hash와
+정확히 일치했습니다. `.gitattributes`로 분할 폴더의 모든 파일에 `-text`를 적용하고,
+helper 원본에는 `text eol=lf`를 적용했습니다. 무결성 검사는 그대로 유지합니다.
+
+회귀 테스트는 보호 설정이 없을 때 같은 오류를 재현하고, 보호 설정이 있을 때 동일 Git 설정으로
+checkout한 전달 파일이 원본과 바이트 단위로 같고 재결합까지 통과함을 검증합니다.
+`tests/test_windows_bundle.py`: **60 passed** (0.93초).
+기존 분할본·최종 ZIP hash는 변경하지 않았습니다. 이미 변환된 파일의 해시 확인 후 LF 복구 명령은
+[CMD 가이드](WINDOWS_OFFLINE.md#git-반입-중-reassembly-script-hash-differs가-발생할-때)에 있습니다.
+이 재현은 Git의 파일 변환 동작 검증이며 실제 Windows DL1 실행 검증은 아닙니다.

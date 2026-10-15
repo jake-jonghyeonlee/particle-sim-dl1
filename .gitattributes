@@ -1,0 +1,5 @@
+# These delivery files are SHA256-sealed bytes, including the Python helper.
+# Do not let Windows core.autocrlf rewrite any file in the transfer inventory.
+/bundles/windows_cp312_win_amd64.parts/* -text
+# Future split builds must copy the same LF helper on every Git platform.
+/scripts/transfer_windows_bundle.py text eol=lf

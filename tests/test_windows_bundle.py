@@ -280,3 +280,31 @@ def test_failed_venv_creation_never_installs_and_preserves_partial_work(tmp_path
     monkeypatch.setattr(installer, 'run', fail)
     with pytest.raises(subprocess.CalledProcessError): installer.install(tmp_path, venv)
     assert (venv / 'partial').read_text() == 'retain'
+
+
+@pytest.mark.parametrize('protect_bytes', [False, True])
+def test_git_windows_autocrlf_preserves_sealed_transfer_only_with_attributes(tmp_path, protect_bytes):
+    """Reproduce the field failure via real Git checkout, without a Windows shell."""
+    import subprocess
+    repo = tmp_path / 'repo'; repo.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    archive = repo / 'input.zip'; archive.write_bytes(bytes(range(256)) * 100)
+    folder = repo / 'bundles/windows_cp312_win_amd64.parts'
+    transfer.split(archive, folder, 5000)
+    if protect_bytes:
+        shutil.copy2(ROOT / '.gitattributes', repo / '.gitattributes')
+    git = ['git', '-C', str(repo), '-c', 'core.autocrlf=true']
+    subprocess.run([*git, 'add', '.'], check=True, capture_output=True)
+    exported = tmp_path / 'Windows checkout'; exported.mkdir()
+    subprocess.run([*git, 'checkout-index', '--all', '--prefix', str(exported) + '/'], check=True)
+    checkout_parts = exported / folder.relative_to(repo)
+    output = tmp_path / 'rejoined.zip'
+    if protect_bytes:
+        transfer.join(checkout_parts, output)
+        assert output.read_bytes() == archive.read_bytes()
+        assert (checkout_parts / 'reassemble.py').read_bytes() == (folder / 'reassemble.py').read_bytes()
+    else:
+        assert b'\r\n' in (checkout_parts / 'reassemble.py').read_bytes()
+        with pytest.raises(ValueError, match='reassembly script hash differs'):
+            transfer.join(checkout_parts, output)
+        assert not output.exists()

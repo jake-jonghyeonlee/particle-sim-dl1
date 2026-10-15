@@ -180,7 +180,28 @@ python3 scripts/transfer_windows_bundle.py join bundles/windows_cp312_win_amd64.
 
 GitHub 단일 파일 100MB 제한 때문에 ZIP을 직접 add/commit하지 않습니다. outputs와 *.zip은
 ignore 대상입니다. Git 전달이 필요하면 준비한 `bundles/windows_cp312_win_amd64.parts/`와
-스크립트/문서를 검토해 함께 add/commit하십시오(이번 수정에서는 commit/push하지 않음).
+스크립트/문서와 루트 `.gitattributes`를 함께 전달하십시오.
 각 part는 최대 **48,000,000 bytes**, parts.json에는 순서/개별 hash/최종 ZIP hash가 있습니다.
 재결합기는 누락·추가·변조 파일, 순서/이름 오류를 거절하고 기존 ZIP을 덮어쓰지 않습니다.
 분할로 전송 총량이 줄지는 않습니다. 저장소 clone 크기가 우려되면 ZIP을 별도 로컬 매체로 반입하십시오.
+
+## Git 반입 중 `reassembly script hash differs`가 발생할 때
+
+이 오류는 경로가 아니라 `reassemble.py`의 바이트가 `parts.json`에 기록된 값과 다르다는 뜻입니다.
+Windows Git의 `core.autocrlf=true`가 LF 줄바꿈을 CRLF로 바꾸는 경우를 실제 Git checkout으로
+재현했습니다. 저장소의 `.gitattributes`는 분할 폴더 전체를 `-text`로 지정하여 새 checkout의
+바이트 변환을 막습니다. 미래 빌더가 복사하는 helper 원본도 LF로 고정합니다.
+
+이미 반입한 파일은 최신 설정을 받더라도 자동으로 다시 기록되지 않을 수 있습니다. 저장소 루트의
+CMD에서 아래 명령을 실행하십시오. **CRLF→LF 변환 결과가 기록된 SHA256과 정확히 일치할 때만**
+스크립트를 다시 저장합니다. 실제 내용이 바뀌었으면 저장하지 않고 중단합니다. 해시 검사를 지우거나
+parts.json의 기대 해시를 새 값으로 바꾸지 마십시오.
+
+```bat
+py -3.12 -c "from pathlib import Path; import hashlib,json; d=Path('bundles/windows_cp312_win_amd64.parts'); p=d/'reassemble.py'; b=p.read_bytes().replace(b'\r\n',b'\n'); m=json.loads((d/'parts.json').read_text(encoding='utf-8')); assert hashlib.sha256(b).hexdigest()==m['reassemble_sha256'], 'Not only CRLF: stop and obtain matching files'; p.write_bytes(b); print('hash OK: LF restored')"
+py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py join bundles\windows_cp312_win_amd64.parts --output outputs\windows_cp312_win_amd64.zip
+```
+
+기존 출력 ZIP은 덮어쓰지 않으므로 이미 존재하면 `--output`에 새 파일 이름을 지정합니다.
+이 수정은 Python helper의 줄바꿈과 Git 전달 설정만 다룹니다. 네 개 part의 바이트,
+최종 ZIP SHA256과 설치된 DL1 wheel은 바꾸지 않습니다. 실제 Windows DL1 실행 성공은 여전히 별도 검증입니다.
