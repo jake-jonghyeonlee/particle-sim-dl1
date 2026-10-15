@@ -6,3 +6,6 @@ runs/
 data/
 weights/
 *.egg-info/
+outputs/
+.venv-*/
+bundles/*.zip

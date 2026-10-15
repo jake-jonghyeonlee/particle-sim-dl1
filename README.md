@@ -57,6 +57,13 @@ Search and evaluation report the numeric checkpoint `grid` and `grid_selection` 
 
 Canonical single-product forwards preserve order/chunk-size reproducibility. `batch_size` controls candidate chunks rather than forward batch size; evaluation caches each product embedding once per command to avoid repeated forwards across queries, trading O(N × embedding dimension) memory for fewer forwards. Multi-product forward acceleration remains deferred because it changes arithmetic. The opt-in 40-epoch synthetic CNN smoke now uses an explicitly chosen synthetic grid 64, passes the strict grid gate with no bypass, and retains all loss/ranking/separation assertions; this fixture choice is not a real-data grid recommendation.
 
+## Windows 폐쇄망 설치
+
+Windows CPython 3.12 x64 CPU용 준비된 wheel 묶음과 uv 없는 설치는
+[Windows 폐쇄망 가이드](docs/WINDOWS_OFFLINE.md)를 먼저 따르십시오.
+`bundles/windows_cp312_win_amd64.parts`는 Git 전달용 분할 ZIP이며,
+기존 macOS `requirements.lock`는 Windows용 lock가 아닙니다.
+
 ## PNG workflow, offline
 
 Use `psdl1[png]` with approved local **Pillow 12.3.0** wheels (and hatchling/build
