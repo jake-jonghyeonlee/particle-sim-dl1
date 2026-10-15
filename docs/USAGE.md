@@ -33,9 +33,37 @@ DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품
 
 ## 2. 설치와 확인
 
-Windows 설치는 [CMD 폐쇄망 가이드](WINDOWS_OFFLINE.md)를 따릅니다. ZIP을 쓰기 가능한 사용자
-폴더에 풀고 그 안의 `windows_cp312_win_amd64`에서 **CMD**로 실행합니다. Python 3.12 x64,
+Windows 설치는 **CMD(명령 프롬프트)**에서 진행합니다. Python 3.12 x64,
 pip/venv와 VC++ x64 런타임은 사전 설치되어 있어야 합니다. 관리자 권한은 필요하지 않습니다.
+자세한 사전 조건과 수동 설치는 [CMD 폐쇄망 가이드](WINDOWS_OFFLINE.md)를 따릅니다.
+
+### 2.1 Git 분할본 재결합 → 압축 해제
+
+받은 저장소의 **루트 폴더**(README.md와 bundles 폴더가 있는 곳)에서 CMD를 엽니다.
+`bundles\windows_cp312_win_amd64.parts`는 ZIP 분할본이며, part001~part004와
+`parts.json`, `reassemble.py` **총 6개 파일 모두** 필요합니다.
+
+```bat
+rem 1. 분할본의 목록/개별 hash를 확인하고 ZIP 재결합
+py -3.12 bundles\windows_cp312_win_amd64.parts\reassemble.py join bundles\windows_cp312_win_amd64.parts --output outputs\dl1-cmd.zip
+rem 2. 쓰기 가능한 사용자 폴더에 압축 해제
+py -3.12 -m zipfile -e outputs\dl1-cmd.zip "%USERPROFILE%\dl1-cmd"
+rem 3. 압축 해제된 설치 폴더로 이동
+cd /d "%USERPROFILE%\dl1-cmd\windows_cp312_win_amd64"
+```
+
+`outputs\dl1-cmd.zip`과 `%USERPROFILE%\dl1-cmd`는 **아직 없는 새 이름**을 사용합니다.
+이미 있으면 위 명령의 ZIP/폴더 이름을 함께 바꾸십시오. 재결합기는 기존 ZIP을 덮어쓰지 않고,
+성공 시 크기와 최종 SHA256을 출력합니다. 오류가 나면 다음 단계로 진행하지 마십시오.
+
+`reassembly script hash differs`는 Git의 줄바꿈 변환으로 생길 수 있습니다.
+[해시 확인 후 줄바꿈 복구 안내](WINDOWS_OFFLINE.md#git-반입-중-reassembly-script-hash-differs가-발생할-때)를
+따르십시오. 해시 검사를 지우거나 parts.json의 기대 해시를 바꾸지 마십시오.
+완성된 ZIP을 별도로 받은 경우에는 재결합을 생략하고 그 ZIP 경로로 압축 해제합니다.
+
+### 2.2 설치 → help 확인 → 선택 smoke
+
+위 `cd /d`로 이동한 `windows_cp312_win_amd64` 폴더에서 이어서 실행합니다.
 
 ```bat
 install_windows_bundle.cmd
