@@ -26,14 +26,26 @@ def main():
     shape=(1001,1203)
     a=np.zeros(shape,bool)
     a[200:500,120:420]=a[200:500,780:1080]=True
-    a[350,420:780]=True;a[90,80]=True
+    a[350,420:780]=True;a[90,80]=True                      # split bridge + loss
     b=np.zeros(shape,bool);b[650:900,300:900]=True
     hidden=np.zeros(shape,bool);hidden[760,600]=True
+    merge=np.zeros(shape,bool)                             # 2px gap -> merge?
+    merge[560:620,100:300]=merge[560:620,302:500]=True
+    gate=np.zeros(shape,bool);gate[150:950,560:700]=True    # overlaps several layers
+    via=np.zeros(shape,bool);via[100:600,900:1000]=True
     cnt=np.zeros(shape,bool);cnt[700:820,550:650]=True;cnt[850,1050]=True
+    thin=np.zeros(shape,bool)                              # thin-only product
+    thin[100:900,300:324]=thin[100:900,700:730]=True;thin[400:600,900:1100]=True
     source=out/'source'
-    for role,name,mask in [('bridge','1-top.png',a),('broad','3-bottom.png',b),
-                           ('hidden','4-buried.png',hidden),('cno','2-CNT.png',cnt)]:
-        path=source/'SYNTHETIC-DIAGNOSTIC'/role/name;path.parent.mkdir(parents=True,exist_ok=True)
+    for model,role,name,mask in [('SYNTHETIC-DIAGNOSTIC','bridge','1-top.png',a),
+                                 ('SYNTHETIC-DIAGNOSTIC','broad','3-bottom.png',b),
+                                 ('SYNTHETIC-DIAGNOSTIC','hidden','4-buried.png',hidden),
+                                 ('SYNTHETIC-DIAGNOSTIC','merge','5-metal2.png',merge),
+                                 ('SYNTHETIC-DIAGNOSTIC','gate','6-gate.png',gate),
+                                 ('SYNTHETIC-DIAGNOSTIC','via','7-via.png',via),
+                                 ('SYNTHETIC-DIAGNOSTIC','cno','2-CNT.png',cnt),
+                                 ('SYNTHETIC-THIN-ONLY','line','1-top.png',thin)]:
+        path=source/model/role/name;path.parent.mkdir(parents=True,exist_ok=True)
         with Image.fromarray(np.where(mask,0,255).astype(np.uint8)) as image:
             image.save(path)
     bundle=out/'bundle'
@@ -42,7 +54,8 @@ def main():
     assert verify_bundle(bundle)['status']=='verified'
     report=json.loads((bundle/'import-report.json').read_text())
     for row in report['grid_evidence']:
-        print(bundle/row['diagnostic']['png'])
+        if 'diagnostic' in row and 'png' in row['diagnostic']:
+            print(row['model_id'],row['diagnostic']['shape_state'],bundle/row['diagnostic']['png'])
     return 0
 
 

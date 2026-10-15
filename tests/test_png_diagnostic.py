@@ -5,11 +5,19 @@ import json
 import weakref
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytest
 
 from psdl1 import data, png_diagnostic as diag
-from psdl1._png_diagnostic_render import DiagnosticSink, COLORS, ORIGIN, VIEW, display_xy, _project_mask
+from psdl1._png_diagnostic_render import (DiagnosticSink, COLORS, ORIGIN, VIEW, display_xy, _project_mask,
+                                         CNT_ALPHA, DIFF, layer_color, tint)
+
+LAYER0 = tint(layer_color(0))
+HATCH = (40, 20, 70)
+
+
+def over_cnt(rgb):
+    return tuple(int(c * (1 - CNT_ALPHA) + k * CNT_ALPHA) for c, k in zip(rgb, COLORS['cnt']))
 from psdl1.schema import Connection, Element, Endpoint, Frame, Product
 
 
@@ -208,7 +216,11 @@ def test_renderer_ledger_conservation_and_colors(tmp_path):
         assert image.size == (1100, 1040) and image.mode == 'RGB'
         colors = np.asarray(image)
         assert (colors == COLORS['red']).all(axis=2).any()
-        assert (colors == COLORS['overlap']).all(axis=2).any()
+        # Every cell is thin here, so yellow is blended over CNT-over-layer
+        # and over the sparse overlap hatch; neither is erased.
+        half = lambda rgb: tuple((c + y) // 2 for c, y in zip(rgb, COLORS['yellow']))
+        assert (colors == half(over_cnt(LAYER0))).all(axis=2).any()
+        assert (colors == half(HATCH)).all(axis=2).any()
         # First target row is empty; no source thumbnail was painted there.
         assert image.getpixel((110, 110)) == (255, 255, 255)
 
@@ -237,7 +249,9 @@ def test_hidden_layer_and_cnt_source_evidence_survives(tmp_path):
     assert [r['observation_id'] for r in records if r['type'] == 'event'] == ['o1', 'o4']
     assert all(r['composite_ambiguity_possible'] for r in records if r['type'] == 'event')
     with Image.open(tmp_path / 'g4.png') as image:
-        assert image.getpixel((500, 500)) == COLORS['overlap']
+        # Tiny layer L vanishes at grid 4; broad layer B keeps its own colour
+        # (second layer), and CNT is composited over it, not replacing it.
+        assert image.getpixel((500, 500)) == over_cnt(tint(layer_color(1)))
     assert next(r for r in records if r['type'] == 'observation' and r['scope'] == 'cnt_source')['source_paths'] == ['a.png', 'duplicate.png']
 
 
@@ -603,7 +617,7 @@ def test_asymmetric_render_registration_and_exact_two_pixel_boundary(tmp_path):
     assert not outcomes[0]['grid_check']['elements'][0]['thin_line_warning']
     assert not any(r['type']=='yellow_cell' for r in records)
     with Image.open(tmp_path/'g4.png') as image:
-        assert image.getpixel((20+672,84+96))==COLORS['electrode']
+        assert image.getpixel((20+672,84+96))==LAYER0
         assert image.getpixel((20+96,84+672))==(255,255,255)
 
 
@@ -995,3 +1009,179 @@ def test_lost_material_self_consistency(tmp_path, mutation):
     path.write_text(''.join(json.dumps(r) + '\n' for r in records))
     with pytest.raises(ValueError):
         diag.verify_diagnostic_ledger(path, outcomes[0]['diagnostic'], row, 'image_only')
+
+
+def _capture_render(monkeypatch):
+    """Copy display state just before rendering (close() releases it)."""
+    captured = {}
+    original = DiagnosticSink._render
+    def spy(self, check, metadata):
+        captured[self.transform.grid] = {
+            'insets': [dict(i) for i in self.insets], 'yellow': [dict(y) for y in self.yellow_examples],
+            'layers': dict(self.layers)}
+        return original(self, check, metadata)
+    monkeypatch.setattr(DiagnosticSink, '_render', spy)
+    return captured
+
+
+def test_layers_get_distinct_colors_stable_across_grids(tmp_path, monkeypatch):
+    a = np.zeros((32, 32), bool); a[0:16, 0:32] = True
+    b = np.zeros_like(a); b[16:32, 0:32] = True
+    captured = _capture_render(monkeypatch)
+    render(tmp_path, product(a, other=(Element('F', 'M', b),)), (8, 16))
+    colors = {}
+    for g in (8, 16):
+        assert captured[g]['layers'] == {'L': 0, 'M': 1}
+        with Image.open(tmp_path / f'g{g}.png') as image:
+            colors[g] = image.getpixel((400, 200)), image.getpixel((400, 700))
+    assert colors[8] == colors[16] == (tint(layer_color(0)), tint(layer_color(1)))
+    assert layer_color(0) != layer_color(1)
+    assert len({layer_color(i) for i in range(40)}) == 40
+
+
+def test_cnt_drawn_after_layers_with_hatch_overlap(tmp_path):
+    e = np.zeros((32, 32), bool); e[:, :16] = True
+    cnt = np.zeros_like(e); cnt[:16, :] = True
+    render(tmp_path, product(e, cnt=cnt), (8,))
+    with Image.open(tmp_path / 'g8.png') as image:
+        overlap = np.asarray(image)[84:84 + 384, 20:20 + 384].reshape(-1, 3)
+        found = {tuple(map(int, c)) for c in np.unique(overlap, axis=0)}
+        assert found == {over_cnt(LAYER0), HATCH}
+        assert image.getpixel((600, 200)) == over_cnt((255, 255, 255))
+        assert image.getpixel((200, 600)) == LAYER0
+
+
+def test_yellow_only_explains_projected_run(tmp_path, monkeypatch):
+    m = np.zeros((40, 40), bool); m[10:30, 20:23] = True; m[10:30, 5:9] = True
+    texts = []
+    original = ImageDraw.ImageDraw.text
+    monkeypatch.setattr(ImageDraw.ImageDraw, 'text',
+                        lambda self, xy, text, *a, **k: (texts.append(text), original(self, xy, text, *a, **k))[1])
+    captured = _capture_render(monkeypatch)
+    outcomes, records = render(tmp_path, product(m), (16,))
+    assert outcomes[0]['diagnostic']['shape_state'] == 'no_change_detected'
+    assert outcomes[0]['diagnostic']['eligible_insets'] == 0
+    yellow = captured[16]['yellow']
+    assert len(yellow) == 1 and not captured[16]['insets']
+    assert yellow[0]['run'] == (0, 10, 20, 3)
+    assert yellow[0]['projected'] == 3 * 16 / 40
+    assert 'horizontal run 3px' in texts and 'x 16/40' in texts and '-> 1.20 cells' in texts
+    assert 'Red details: 0 shown | 0 more' in texts
+    assert any('diagonals not measured' in t for t in texts)
+    assert any(t.startswith('Yellow thin references: 1 examples') for t in texts)
+
+
+def test_red_detail_is_registered_and_never_dilated(tmp_path, monkeypatch):
+    from psdl1._png_diagnostic_render import CROP
+    m = np.zeros((16, 16), bool); m[1, 1] = True
+    before = m.copy()
+    captured = _capture_render(monkeypatch)
+    render(tmp_path, product(m), (4,))
+    assert np.array_equal(m, before)
+    inset = captured[4]['insets'][0]
+    assert inset['kind'] == 'disappearance' and inset['layer'] == 'L' and inset['window'] == [0, 0, 4, 4]
+    # Independent oracle: nearest sampling of the true one-pixel source.
+    hit = np.floor((np.arange(CROP) + .5) * 16 / CROP).astype(int) == 1
+    np.testing.assert_array_equal(inset['source'], hit[:, None] & hit)
+    assert not inset['target'].any()
+    sink_crops = DiagnosticSink._crop_image(None, inset, (1, 2, 3), 4)
+    diff = np.asarray(sink_crops[2])
+    assert ((diff == DIFF['source_only']).all(axis=2) == inset['source']).all()
+    for crop in sink_crops:
+        crop.close()
+
+
+def test_red_and_yellow_detail_counts_are_bounded(tmp_path, monkeypatch):
+    from psdl1._png_diagnostic_render import YELLOW_DETAILS
+    m = np.zeros((16, 16), bool); m[1, 1] = True
+    captured = _capture_render(monkeypatch)
+    p = product(m, other=tuple(Element(f'E{i}', f'L{i}', m) for i in range(5)))
+    outcomes, _ = render(tmp_path, p)
+    assert len(captured[4]['insets']) == outcomes[0]['diagnostic']['insets_shown'] == 3
+    assert len(captured[4]['yellow']) == YELLOW_DETAILS
+
+
+def test_merge_detail_uses_local_join_window_showing_source_gap(tmp_path, monkeypatch):
+    # Same geometry as the demo merge layer: two 60px-tall bars, 2px apart.
+    m = np.zeros((1001, 1203), bool); m[560:620, 100:300] = True; m[560:620, 302:500] = True
+    before = m.copy()
+    captured = _capture_render(monkeypatch)
+    _, records = render(tmp_path, product(m), (64,))
+    assert np.array_equal(m, before)
+    event = next(r for r in records if r['type'] == 'event' and r['kind'] == 'merge_suspected')
+    assert sorted(event['source_bounds']) == [[100, 560, 300, 620], [302, 560, 500, 620]]
+    inset = next(i for i in captured[64]['insets'] if i['kind'] == 'merge_suspected')
+    assert inset['context'] == 'join' and inset['scale'] <= 1  # enlargement, not OR-reduced
+    x0, y0, x1, y1 = inset['window']
+    assert x1 - x0 == y1 - y0 < 64
+    # Same ROI for both: seam row crosses both bars; source has a gap, grid is joined.
+    rows = inset['source'].any(axis=1)
+    row = inset['source'][np.flatnonzero(rows)[len(np.flatnonzero(rows)) // 2]]
+    on = np.flatnonzero(row)
+    assert on.size and (np.diff(on) > 1).sum() == 1  # exactly two separated pieces
+    gap = np.flatnonzero(~row[on[0]:on[-1]]) + on[0]
+    assert gap.size >= 2
+    assert inset['target'][:, gap].any(axis=0).all()  # gap columns joined in grid
+    assert inset['color'] == layer_color(0)
+
+
+def test_merge_join_seam_falls_back_and_is_bounded():
+    from psdl1._png_diagnostic_render import _join_seam
+    assert _join_seam({'source_bounds': [[0, 0, 10, 10], [5, 5, 15, 15]]}) is None  # overlapping
+    assert _join_seam({'source_bounds': [[0, 0, 10, 10], [20, 20, 30, 30]]}) is None  # diagonal
+    assert _join_seam({'source_bounds': [[0, 0, 10, 4], [0, 7, 10, 9]]}) == (5, 5.5)
+    huge = {'source_bounds': [[i * 10, 0, i * 10 + 9, 5] for i in range(100000)]}
+    assert _join_seam(huge) == (9.5, 2.5)  # only first few boxes considered
+
+
+def test_split_detail_keeps_event_context_window(tmp_path, monkeypatch):
+    captured = _capture_render(monkeypatch)
+    _, records = render(tmp_path, product(bridge()), (4,))
+    split = [i for i in captured[4]['insets'] if i['kind'] == 'split']
+    assert split and all(i['context'] is True for i in split)
+    event = next(r for r in records if r['type'] == 'event' and r['kind'] == 'split')
+    x0, y0, x1, y1 = split[0]['window']
+    for bx0, by0, bx1, by1 in event['target_bounds']:
+        assert x0 <= bx0 and y0 <= by0 and bx1 <= x1 and by1 <= y1
+
+
+def test_detail_source_scan_uses_bounded_row_bands():
+    from psdl1._png_diagnostic_render import BAND_PIXELS, _crop_pair
+    source = np.zeros((1200, 1000), bool); source[::7, ::5] = True; source[600, 3] = True
+    before = source.copy()
+    sizes = []
+
+    class Spy(np.ndarray):
+        def __getitem__(self, key):
+            out = super().__getitem__(key)
+            if isinstance(key, tuple) and all(isinstance(k, slice) for k in key):
+                sizes.append(np.asarray(out).size)
+            return out
+    transform = analyze(np.zeros((1200, 1000), bool), 16)[1].transform
+    target = np.ones((16, 16), bool)
+    src, dst, window = _crop_pair(source.view(Spy), target, transform, (8, 8), 16, 90, (0, 0))
+    assert window == [0, 0, 16, 16] and sizes and max(sizes) <= BAND_PIXELS
+    assert sum(sizes) == source.size  # each original pixel scanned once, in bands
+    assert np.array_equal(source, before) and dst.all()
+    # Banding is exact: equals an unbanded OR oracle.
+    import psdl1._png_diagnostic_render as r
+    old = r.BAND_PIXELS
+    try:
+        r.BAND_PIXELS = 1 << 40
+        oracle, _, _ = _crop_pair(source, target, transform, (8, 8), 16, 90, (0, 0))
+    finally:
+        r.BAND_PIXELS = old
+    np.testing.assert_array_equal(src, oracle)
+
+
+def test_detail_tiles_bound_wide_rows_and_reduced_target(monkeypatch):
+    import psdl1._png_diagnostic_render as r
+    monkeypatch.setattr(r, 'BAND_PIXELS', 100)
+    tiles = list(r._tiles(0, 7, 0, 450))
+    assert all((b1 - b0) * (c1 - c0) <= 100 for b0, b1, c0, c1 in tiles)
+    assert sum((b1 - b0) * (c1 - c0) for b0, b1, c0, c1 in tiles) == 7 * 450
+    transform = analyze(np.zeros((300, 300), bool), 200)[1].transform
+    target = np.zeros((200, 200), bool); target[3, 197] = target[150, 1] = True
+    _, dst, window = r._crop_pair(np.zeros((300, 300), bool), target, transform, (0, 0), 200, 90, (0, 0))
+    assert window == [0, 0, 200, 200]
+    assert dst[3 * 90 // 200, 197 * 90 // 200] and dst[150 * 90 // 200, 1 * 90 // 200] and dst.sum() == 2
