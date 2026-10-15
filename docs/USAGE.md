@@ -17,7 +17,7 @@ DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품
 
 | 순서 | 하는 일 | 명령 | 필요한 것 | 만들어지는 것 |
 |---|---|---|---|---|
-| 0 | 설치와 확인 | `install_windows_bundle.cmd` | Python 3.12 x64, 동봉 wheel | `.venv-cmd` |
+| 0 | 설치와 확인 | `py -3.12 -I install_windows_bundle.py` | Python 3.12 x64, 동봉 wheel | `.venv-cmd` |
 | 1 | PNG 폴더 준비 | (사용자) | 모델별 전극·CNT PNG | 입력 폴더 |
 | 2 | 검사 | `psdl1.import_png` | 입력 폴더 | 보고서, preview |
 | 3 | 형상 확인(image_only) | (사용자) `preview.html` | 2의 결과 | CNT 형상·여백 확인 |
@@ -33,15 +33,27 @@ DL1은 새 제품과 **원본 형상·전극 연결**이 비슷한 기존 제품
 
 ## 2. 설치와 확인
 
-Windows 설치는 **CMD(명령 프롬프트)**에서 진행합니다. Python 3.12 x64,
+Windows 설치는 **Git Bash 또는 CMD(명령 프롬프트)**에서 설치된 Python을 직접 실행합니다.
+`.cmd` 파일 실행이나 가상환경 활성화는 필요하지 않습니다. Python 3.12 x64,
 pip/venv와 VC++ x64 런타임은 사전 설치되어 있어야 합니다. 관리자 권한은 필요하지 않습니다.
 자세한 사전 조건과 수동 설치는 [CMD 폐쇄망 가이드](WINDOWS_OFFLINE.md)를 따릅니다.
 
 ### 2.1 Git 분할본 재결합 → 압축 해제
 
-받은 저장소의 **루트 폴더**(README.md와 bundles 폴더가 있는 곳)에서 CMD를 엽니다.
+받은 저장소의 **루트 폴더**(README.md와 bundles 폴더가 있는 곳)에서 실행합니다.
 `bundles\windows_cp312_win_amd64.parts`는 ZIP 분할본이며, part001~part004와
 `parts.json`, `reassemble.py` **총 6개 파일 모두** 필요합니다.
+
+**Git Bash:**
+
+```bash
+py -3.12 scripts/transfer_windows_bundle.py --version
+py -3.12 scripts/transfer_windows_bundle.py join bundles/windows_cp312_win_amd64.parts --output outputs/dl1-cmd-v2.zip
+py -3.12 -m zipfile -e outputs/dl1-cmd-v2.zip "$HOME/dl1-cmd"
+cd "$HOME/dl1-cmd/windows_cp312_win_amd64"
+```
+
+**CMD:**
 
 ```bat
 rem 버전이 psdl1-transfer 2인지 먼저 확인
@@ -67,10 +79,27 @@ cd /d "%USERPROFILE%\dl1-cmd\windows_cp312_win_amd64"
 
 ### 2.2 설치 → help 확인 → 선택 smoke
 
-위 `cd /d`로 이동한 `windows_cp312_win_amd64` 폴더에서 이어서 실행합니다.
+위에서 압축 해제된 `windows_cp312_win_amd64` 폴더로 이동한 뒤 실행합니다.
+설치 명령은 **Git Bash와 CMD에서 동일**합니다.
 
 ```bat
-install_windows_bundle.cmd
+py -3.12 -I install_windows_bundle.py
+```
+
+설치 성공 후에는 **설치된 venv의 Python**으로 실행합니다. `py -3.12 -m psdl1...`로 바꾸면
+base Python을 선택할 수 있으므로 아래의 명시적 venv 실행 파일을 사용하십시오.
+
+**Git Bash — help 확인 및 선택 smoke:**
+
+```bash
+./.venv-cmd/Scripts/python.exe -I -m psdl1.import_png --help
+# 선택: 새 출력 폴더에서 DL1 수치 smoke (설치/help와 별도)
+./.venv-cmd/Scripts/python.exe -I smoke_windows_bundle.py --out "../dl1-smoke-new"
+```
+
+**CMD — help 확인 및 선택 smoke:**
+
+```bat
 .venv-cmd\Scripts\python.exe -I -m psdl1.import_png --help
 rem 선택: 새 출력 폴더에서 DL1 수치 smoke (설치/help와 별도)
 .venv-cmd\Scripts\python.exe -I smoke_windows_bundle.py --out "..\dl1-smoke-new"
@@ -78,12 +107,14 @@ rem 선택: 새 출력 폴더에서 DL1 수치 smoke (설치/help와 별도)
 
 설치기는 `.venv-cmd` 생성 → hash/inventory 검증 → 동봉 DL1 전용 wheel만 해시 고정 설치 →
 pip check → CPU import/help를 확인합니다. 기존 venv는 자동 삭제·업데이트하지 않습니다.
-재사용은 `install_windows_bundle.cmd --reuse-venv`로 정확 일치를 검사합니다.
+재사용은 `py -3.12 -I install_windows_bundle.py --reuse-venv`로 정확 일치를 검사합니다.
 수동 venv/verify/pip 설치 순서도 [CMD 가이드](WINDOWS_OFFLINE.md)에 있습니다.
 Bash/PowerShell 설치기, uv, 온라인 설치, source checkout/PYTHONPATH, editable install은 쓰지 않습니다.
 pytest와 hatchling은 반입 PC 설치에 필요하지 않습니다. macOS `requirements.lock`를 Windows에 적용하지 않습니다.
 
-이후 Windows 명령은 이 설치 폴더에서 `.venv-cmd\Scripts\python.exe -I`로 실행합니다.
+이후 Windows CMD 예시는 이 설치 폴더에서 `.venv-cmd\Scripts\python.exe -I`로 실행합니다.
+Git Bash에서는 실행 파일을 `./.venv-cmd/Scripts/python.exe -I`로 쓰고, 데이터 경로는
+`"D:/입력 폴더/manifest.json"`처럼 큰따옴표와 `/`를 사용하십시오.
 다른 경로에서 실행할 때는 Python 실행 파일의 절대 경로를 큰따옴표로 감싸십시오.
 POSIX 예시는 미리 준비된 개발 환경의 `.venv/bin/python`을 뜻하며 Windows 설치 절차가 아닙니다.
 출력 경로는 매번 새 이름을 씁니다.
