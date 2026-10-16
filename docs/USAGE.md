@@ -351,6 +351,14 @@ Windows (명령 프롬프트):
 
 #### 모델 × grid 진단 PNG
 
+**기존 Windows ZIP 설치 후 새 그림이 안 보일 때:** `git pull`만으로 `.venv-cmd`에 설치된
+wheel은 바뀌지 않습니다. [grid 진단 업데이트](../bundles/updates/grid-diagnostics-f74a718/README.md)의
+폴더 전체를 기존 `.venv-cmd` 옆으로 옮긴 뒤, 안내된 오프라인 `pip --force-reinstall` 명령으로
+psdl1만 교체합니다(기존 numpy/torch/Pillow 재설치 없음). 설치 버전은 같은 `0.1.0`이므로
+버전 번호만으로 적용 여부를 구분하지 말고 안내된 import 확인 명령을 실행하세요.
+기존 PNG는 바뀌지 않으므로 **새 출력 폴더**로 `--inspect-grids`를 다시 실행해야 합니다.
+기존 전체 ZIP의 wheelhouse 파일을 직접 교체하면 기존 manifest 검증이 실패하므로 별도 업데이트 폴더를 사용합니다.
+
 ```sh
 python -m psdl1.import_png --root ./png-source --out ./inspect-new \
   --inspect-grids 32 64 --no-preview

@@ -1,0 +1,29 @@
+{
+  "source_commit": "f74a718fe3326dee3788c6e790e6aab7624e6363",
+  "wheel": "psdl1-0.1.0-py3-none-any.whl",
+  "wheel_sha256": "29ea6329cf61aef715564707a37c6514563c8a70dbccbfc2f92ceafd0a159ce0",
+  "wheel_size_bytes": 106849,
+  "hatchling": "1.27.0",
+  "build_command": "uv build --wheel --offline --no-config --no-python-downloads --out-dir outputs/grid-diagnostics-f74a718-build --build-constraints scripts/windows-build-constraints.txt .",
+  "target": "Existing DL1 Windows CPython3.12 x64 offline venv; application-only update; runtime dependencies unchanged",
+  "application_sources": {
+    "psdl1/checkpoint.py": "664165920b12baa5a1454dc25dd8902eb40ad76facc9aa4b455680ffa04dfeb5",
+    "psdl1/png_source.py": "e3582a3b38bd1cf158d4d0a2509118ce4ffb080d81796d3eaf7075d0cf8b83e8",
+    "psdl1/__init__.py": "c31623de81fac07c81fae0c3919f614f6c763e547341fdb55442795eecb656ff",
+    "psdl1/import_png.py": "d0ecdcae59ab48d3788f4bf4b4f2aa14fbd56d90b1c0cf8a186cd94acfaf9acf",
+    "psdl1/model.py": "a8e8dfa26292be4f2947a1f2aa6bd2daedf1a3e40e174e0e2a2361bc8947f005",
+    "psdl1/_png_diagnostic_render.py": "156dd19c0fada013c8360d365a7be0a8dc642f85ad60f6c39c9368667b00c521",
+    "psdl1/split.py": "4f9f359a9d82bcec6a188cd776ff35f2ff48aff41aed36bc55f24c53fa00bc50",
+    "psdl1/train.py": "486b26ac5ce3e419bdb17ca428b2fa7469f089fe168d8ee744d3a6f43ad27bf4",
+    "psdl1/search.py": "c939c156779c9075bd01bc91a47118b86f6566c91d23ebaef45d96be827bb2e9",
+    "psdl1/png_diagnostic.py": "1b2ff947ec26d897403d251d72192a6664fb7532f3306e8559eb001f8b9f62d3",
+    "psdl1/evaluate.py": "00f14fd7043df904064a382088315489835ecbd1477036137d6fe748059a8eb2",
+    "psdl1/losses.py": "e67cb27cbb51f00a1ae5bdf9de77b6aa20b0cfdb7b5054cdf6eb881a3ff61985",
+    "psdl1/png_connections.py": "014484aa4dfbf1aadc461278b18621f0c11a563720a5213310edc0d1e0dbdc05",
+    "psdl1/png_preview.py": "4ddb42d3585f5739da73b7090e4efe27ee4a6413bd4ca2fa556e74941dff0cc9",
+    "psdl1/data.py": "e83d089c9e883eaf3b3a5d43d174feb2980a3ee8f05bf2fe5733ec3344ac21a8",
+    "psdl1/schema.py": "3eb519a9584dfbf3a9eca165da6158813c9e3f8735b58f96c96d5f8e616d00ba",
+    "psdl1/png_contract.py": "591b2b1bc2c1380f87c23eee959471ea25cb68fc200c762094dc5633a25b863d"
+  },
+  "windows_execution_tested": false
+}

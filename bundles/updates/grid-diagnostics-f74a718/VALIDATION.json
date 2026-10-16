@@ -1,0 +1,19 @@
+{
+  "source_validation": "862 passed, 1 skipped on f74a718; source unchanged",
+  "offline_build": true,
+  "build_backend": "hatchling==1.27.0",
+  "wheel_complete_source_content_match": true,
+  "wheel_isolated_target_install": true,
+  "wheel_only_smoke": {
+    "network": "blocked",
+    "source_checkout_used": false,
+    "verified": true,
+    "pngs_equal_to_tested_source": 4,
+    "grids": [
+      64,
+      128
+    ]
+  },
+  "tampered_wheel_rejected_by_pip_require_hashes": true,
+  "windows_execution_tested": false
+}
