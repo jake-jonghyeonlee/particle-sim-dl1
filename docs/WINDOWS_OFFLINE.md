@@ -76,6 +76,14 @@ install_windows_bundle.cmd --reuse-venv
 실패한 환경과 로그는 보존됩니다. 검증 실패를 우회하지 말고 원인을 고친 뒤 새 압축 해제 경로에서
 다시 설치하십시오. 수동으로 venv를 만들었다면 자동 설치에는 `--reuse-venv`를 지정합니다.
 
+**grid 진단 업데이트를 적용한 환경:** 업데이트 wheel은 전체 ZIP manifest와 다른 psdl1 코드를 설치하므로
+`verify_windows_bundle.py . --installed-prefix .venv-cmd`와 `install_windows_bundle.cmd --reuse-venv`는
+`installed psdl1 source differs: psdl1/_png_diagnostic_render.py`로 실패합니다. 업데이트가 적용됐다는
+예상된 결과이며 환경 손상이 아닙니다. 적용 여부는 업데이트 안내의 `_join_seam` import 확인으로 판단합니다.
+업데이트 폴더를 bundle 폴더 안에 둔 채 `verify_windows_bundle.py .`를 실행하면 `inventory differs`로도
+실패합니다. 전체 bundle 검증이 필요하면 업데이트 폴더를 bundle 밖으로 옮긴 뒤 실행하십시오.
+검증을 통과시키려고 manifest나 wheelhouse를 바꾸지 마십시오.
+
 ## 선택: DL1 수치 smoke와 실제 PNG 실행
 
 설치/import/help 성공과 수치 smoke 성공은 별도입니다. 설치 후 다음 명령으로 합성 PNG 2개 모델의

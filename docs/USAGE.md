@@ -358,6 +358,8 @@ psdl1만 교체합니다(기존 numpy/torch/Pillow 재설치 없음). 설치 버
 버전 번호만으로 적용 여부를 구분하지 말고 안내된 import 확인 명령을 실행하세요.
 기존 PNG는 바뀌지 않으므로 **새 출력 폴더**로 `--inspect-grids`를 다시 실행해야 합니다.
 기존 전체 ZIP의 wheelhouse 파일을 직접 교체하면 기존 manifest 검증이 실패하므로 별도 업데이트 폴더를 사용합니다.
+업데이트 후 전체 ZIP 기준 설치 검증(`--installed-prefix`, `--reuse-venv`)은 `installed psdl1 source differs`로
+실패하는 것이 예상 동작입니다([Windows 설치 안내](WINDOWS_OFFLINE.md)의 grid 진단 업데이트 항목).
 
 ```sh
 python -m psdl1.import_png --root ./png-source --out ./inspect-new \
