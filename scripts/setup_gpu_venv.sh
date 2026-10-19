@@ -39,7 +39,7 @@ pip() { "$VPY" -I -m pip --disable-pip-version-check "$@"; }
 index_args=()
 if [ -n "${TORCH_INDEX_URL:-}" ]; then index_args=(--extra-index-url "$TORCH_INDEX_URL"); fi
 
-pip install "numpy==2.5.3" "Pillow==12.3.0" "safetensors==0.8.0" "hatchling==1.27.0"
+pip install "numpy==2.5.3" "Pillow==12.3.0" "safetensors==0.8.0" "hatchling==1.27.0" "editables"
 pip install "${index_args[@]}" "torch==$TORCH_SPEC" "torchvision==$TV_SPEC"
 pip install "timm==1.0.30"
 # Application from this checkout, editable: a later git pull updates the installed code. Deps are pinned above.
