@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import math
 import tempfile
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +23,7 @@ import torch.nn.functional as F
 from .checkpoint import capture_rng, code_hash, json_hash, restore_rng, state_hash
 from .data import CHANNELS, _iter_manifest_products, binary_mask, input_identity, normalize_unit
 from .model import build_backbone
+from .progress import Progress, stderr_sink
 from .schema import approval_status, validate_product
 from .split import validate_split
 
@@ -141,7 +144,7 @@ def _save_npy(path, array):
     _atomic_save(path, write)
 
 
-def scan_and_cache(manifest, split, cache_dir, grid):
+def scan_and_cache(manifest, split, cache_dir, grid, progress=None, total=None):
     """manifest를 한 번 훑어 계보를 검증하고 train/validation 요소 이미지를 캐시한다.
 
     test 제품은 manifest 검증을 위해 읽히지만 캐시·해시·학습에는 들어가지 않는다."""
@@ -151,10 +154,15 @@ def scan_and_cache(manifest, split, cache_dir, grid):
     index_path = cache_dir / "index.json"
     old = json.loads(index_path.read_text()) if index_path.is_file() else {}
     old = old.get("products", {}) if old.get("grid") == grid else {}
+    progress = progress or Progress()
     stubs, entries = [], {}
+    started = time.monotonic()
+    progress.emit("scan", state="started", products=total, to_cache=len(wanted))
     for product in _iter_manifest_products(manifest, grid=grid):
         stubs.append(SimpleNamespace(product_id=product.product_id, lineage_id=product.lineage_id))
+        record = {"index": len(stubs), "products": total, "product_id": product.product_id, "elapsed_s": round(time.monotonic() - started, 1)}
         if product.product_id not in wanted:
+            progress.emit("scan", state="read_only_not_used", **record)
             continue
         identity = input_identity(product)
         name = hashlib.sha256(product.product_id.encode()).hexdigest()[:20]
@@ -165,8 +173,10 @@ def scan_and_cache(manifest, split, cache_dir, grid):
             _save_npy(cache_dir / entry["file"], images.astype(np.float16))
             _save_npy(cache_dir / entry["valid_file"], valid.astype(np.float16))
         entries[product.product_id] = entry
+        progress.emit("scan", state="reused" if reusable else "cached", **record)
     partitions = validate_split(stubs, split)
     _atomic_save(index_path, lambda t: Path(t).write_text(json.dumps({"grid": grid, "products": entries}, indent=1)))
+    progress.emit("scan", state="completed", products=len(stubs), cached=len(entries), elapsed_s=round(time.monotonic() - started, 1))
     return {key: [entries[p.product_id] for p in partitions[key]] for key in ("train", "validation")}, entries
 
 
@@ -184,20 +194,22 @@ def evaluate_reconstruction(model, reader, config, device, seed):
     return {"loss": total / count, "baseline_loss": baseline / count, "masked_foreground_iou": inter / union if union else None, "elements": count}
 
 
-def pretrain(manifest, split, out_dir, *, epochs=100, batch_size=4, lr=3e-4, backbone="tiny", mask_ratio=0.6, patch=None,
+def pretrain(manifest, split, out_dir, *, progress_sink=None, progress_interval=10.0, epochs=100, batch_size=4, lr=3e-4, backbone="tiny", mask_ratio=0.6, patch=None,
              fg_weight=5.0, decoder_dim=128, seed=0, device="cpu", grid=None, allow_grid_override=False, resume=None):
     if any(type(v) is not int or v <= 0 for v in (epochs, batch_size, decoder_dim)) or type(seed) is not int or not 0 <= seed < 2**32 or lr <= 0 or fg_weight < 1:
         raise ValueError("positive epochs/batch_size/decoder_dim/lr, fg_weight >= 1 and integer seed required")
     if torch.device(device).type not in {"cpu", "cuda"}:
         raise ValueError("pretraining supports CPU/CUDA only")
     manifest = Path(manifest)
-    candidate = json.loads(manifest.read_text(encoding="utf-8"))["candidate_grid"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    candidate = document["candidate_grid"]
+    progress = Progress(progress_sink, progress_interval)
     grid = candidate if grid is None else grid
     if type(grid) is not int or grid <= 0 or (grid != candidate and not allow_grid_override):
         raise ValueError(f"grid {grid} conflicts with manifest candidate_grid {candidate}; explicit --allow-grid-override is required")
     out = Path(out_dir)
     cache_dir = out / "cache"
-    partitions, entries = scan_and_cache(manifest, split, cache_dir, grid)
+    partitions, entries = scan_and_cache(manifest, split, cache_dir, grid, progress, len(document.get("products", [])))
     if not partitions["train"]:
         raise ValueError("training split is empty")
     torch.manual_seed(seed)
@@ -229,9 +241,14 @@ def pretrain(manifest, split, out_dir, *, epochs=100, batch_size=4, lr=3e-4, bac
     train_reader = CacheReader(cache_dir, partitions["train"])
     valid_reader = CacheReader(cache_dir, partitions["validation"]) if partitions["validation"] else None
     out.mkdir(parents=True, exist_ok=True)
+    steps_per_epoch = math.ceil(len(train_reader) / batch_size)
+    progress.emit("train", state="started", device=str(device), cuda_device=torch.cuda.get_device_name(0) if torch.device(device).type == "cuda" else None,
+                  train_elements=len(train_reader), validation_elements=0 if valid_reader is None else len(valid_reader),
+                  steps_per_epoch=steps_per_epoch, epochs=epochs, start_epoch=start, **{k: config[k] for k in ("backbone", "grid", "patch", "batch_size")})
     for epoch in range(start, epochs):
         net.train()
         total, steps = 0.0, 0
+        epoch_started = time.monotonic()
         for images, valid in train_reader.batches(batch_size, gen):
             mask = patch_mask(len(images), grid, patch, mask_ratio, gen).to(device)
             images, valid = images.to(device), valid.to(device)
@@ -240,10 +257,16 @@ def pretrain(manifest, split, out_dir, *, epochs=100, batch_size=4, lr=3e-4, bac
             loss.backward()
             optimizer.step()
             total, steps = total + float(loss.detach()), steps + 1
+            if steps == steps_per_epoch or progress.due():
+                elapsed = time.monotonic() - epoch_started
+                progress.emit("train", state="running", epoch=epoch + 1, epochs=epochs, step=steps, steps=steps_per_epoch, loss=round(total / steps, 6),
+                              elapsed_s=round(elapsed, 1), epoch_eta_s=round(elapsed / steps * (steps_per_epoch - steps), 1))
         history.append(total / steps)
         record = {"epoch": epoch + 1, "steps": steps, "train_loss": history[-1],
                   "validation": None if valid_reader is None else evaluate_reconstruction(net, valid_reader, config, device, seed + epoch + 1)}
         metadata["epochs"].append(record)
+        progress.emit("train", state="epoch_completed", epoch=epoch + 1, epochs=epochs, train_loss=round(history[-1], 6), validation=record["validation"],
+                      elapsed_s=round(time.monotonic() - epoch_started, 1))
         state = {key: value.detach().cpu() for key, value in net.backbone.state_dict().items()}
         metadata["backbone_weights_hash"] = state_hash(state)
         saved = {"format_version": PRETRAIN_VERSION, "backbone": state, "decoder": {k: v.detach().cpu() for k, v in net.decoder.state_dict().items()},
@@ -257,6 +280,7 @@ def pretrain(manifest, split, out_dir, *, epochs=100, batch_size=4, lr=3e-4, bac
     except ImportError:
         pass
     (out / "pretrain.json").write_text(json.dumps({k: metadata[k] for k in ("input_hash", "code_hash", "config", "config_hash", "split", "backbone_weights_hash", "approval")}, indent=1) + "\n")
+    progress.emit("train", state="completed", epochs=epochs, last_loss=history[-1], output=str(out))
     return history
 
 
@@ -278,10 +302,13 @@ def main(argv=None):
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume")
+    ap.add_argument("--no-progress", action="store_true", help="suppress JSON progress lines on stderr")
+    ap.add_argument("--progress-interval", type=float, default=10.0, help="seconds between in-epoch progress lines")
     a = ap.parse_args(argv)
     history = pretrain(a.manifest, json.loads(Path(a.split).read_text()), a.out, epochs=a.epochs, batch_size=a.batch_size, lr=a.lr,
                        backbone=a.backbone, mask_ratio=a.mask_ratio, patch=a.patch, fg_weight=a.fg_weight, decoder_dim=a.decoder_dim,
-                       seed=a.seed, device=a.device, grid=a.grid, allow_grid_override=a.allow_grid_override, resume=a.resume)
+                       seed=a.seed, device=a.device, grid=a.grid, allow_grid_override=a.allow_grid_override, resume=a.resume,
+                       progress_sink=None if a.no_progress else stderr_sink, progress_interval=a.progress_interval)
     print(json.dumps({"last_loss": history[-1], "backbone": str(Path(a.out) / "backbone.pt"), "approval": approval_status()}))
 
 

@@ -179,3 +179,16 @@ def test_json_config_and_cli_override_without_training(manifest_case, tmp_path, 
 def test_explicit_empty_split_cannot_fall_back_to_training_all_products(products, tmp_path):
     with pytest.raises(ValueError, match="split schema"):
         train(products, tmp_path, grid=32, split_manifest={}, relations=(set(), {frozenset(("bus-40", "comb-40"))}))
+
+
+def test_train_reports_prepare_and_epoch_progress(products, tmp_path):
+    events = []
+    similar = {frozenset(("bus-40", "bus-64"))}
+    different = {frozenset(("bus-40", "comb-40")), frozenset(("bus-64", "ring-64")), frozenset(("comb-64", "ring-40"))}
+    train(products, tmp_path, epochs=2, grid=64, batch_size=3, relations=(similar, different), progress_sink=events.append, progress_interval=0)
+    phases = [(e["phase"], e["state"]) for e in events]
+    assert phases[0] == ("prepare", "started") and phases.count(("prepare", "product_prepared")) == len(products)
+    assert ("train", "started") in phases and phases.count(("train", "epoch_completed")) == 2
+    running = [e for e in events if e["state"] == "running"]
+    assert running and running[0]["epoch"] == 1 and running[-1]["epoch"] == 2 and running[-1]["step"] == running[-1]["steps"]
+    train(products, tmp_path / "silent", epochs=1, grid=64, batch_size=3, relations=(similar, different))  # sink is optional

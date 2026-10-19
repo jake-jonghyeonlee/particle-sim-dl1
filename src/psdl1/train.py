@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import time
 import json
 import math
 from pathlib import Path
@@ -16,6 +17,7 @@ from .data import Product, build_vocab, collate, frame_transform, grid_check, in
 from .losses import NEGATIVE, masked_contrastive_loss, relation_coverage, relation_matrix, validate_relations
 from .model import ProductEncoder
 from .split import training_only_split, validate_split
+from .progress import Progress, stderr_sink
 from .schema import approval_status
 
 
@@ -143,7 +145,8 @@ def resolve_training_grid(products, grid=None, *, allow_grid_override=False):
 def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backbone="tiny", weights_file=None,
           use_unit_size=False, relations=None, seed=0, *, split_manifest=None, unlabelled_negatives=False,
           augmentation="none", resume=None, device="cpu", temperature=0.1, model_kwargs=None,
-          allow_grid_override=False, allow_grid_check_failure=False):
+          allow_grid_override=False, allow_grid_check_failure=False, progress_sink=None, progress_interval=10.0):
+    progress = Progress(progress_sink, progress_interval)
     if len(products) < 2:
         raise ValueError("제품이 둘 이상 있어야 학습할 수 있다")
     grid, grid_selection = resolve_training_grid(products, grid, allow_grid_override=allow_grid_override)
@@ -169,7 +172,11 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     different = {pair for pair in all_different if pair <= train_ids}
     sampler = RelationBatchSampler([p.product_id for p in training], batch_size, similar, different, unlabelled_negatives=unlabelled_negatives, lineage_ids=[p.lineage_id for p in training])
     roles, layers = build_vocab(training)
-    prepared_training = [prepare_product(p, grid, roles, layers) for p in training]
+    prepared_training, prepare_started = [], time.monotonic()
+    progress.emit("prepare", state="started", products=len(training), grid=grid)
+    for index, p in enumerate(training, 1):
+        prepared_training.append(prepare_product(p, grid, roles, layers))
+        progress.emit("prepare", state="product_prepared", index=index, products=len(training), product_id=p.product_id, elapsed_s=round(time.monotonic() - prepare_started, 1))
     prepared_cache = {p.product_id: item for p, item in zip(training, prepared_training)}
     failures = [{"product_id": p.product_id, "reasons": item.grid_check["reasons"]} for p, item in zip(training, prepared_training)
                 if any(e.get("thin_line_warning") or e.get("bridge_or_component_loss") for e in item.grid_check["elements"])]
@@ -209,10 +216,14 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     out.mkdir(parents=True, exist_ok=True)
     (out / "split.json").write_text(json.dumps(split_manifest, indent=2) + "\n")
     model.train()
+    progress.emit("train", state="started", device=str(device), cuda_device=torch.cuda.get_device_name(0) if torch.device(device).type == "cuda" else None,
+                  grid=grid, backbone=backbone, batch_size=batch_size, train_products=len(training), epochs=epochs, start_epoch=start)
     for epoch in range(start, epochs):
         total, steps, effective, excluded = 0.0, 0, 0, 0
         seen_negative, seen_positive, seen_products = set(), set(), set()
-        for indices in sampler.batches(gen):
+        epoch_started = time.monotonic()
+        epoch_batches = sampler.batches(gen)
+        for position, indices in enumerate(epoch_batches, 1):
             batch = [training[i] for i in indices]
             rel = sampler.relation[indices][:, indices].to(device)
             coverage = relation_coverage(rel)
@@ -231,11 +242,16 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
             effective += coverage["effective_pairs"]
             excluded += coverage["excluded_positive_only_rows"]
             seen_products.update(p.product_id for p in batch)
+            if position == len(epoch_batches) or progress.due():
+                elapsed = time.monotonic() - epoch_started
+                progress.emit("train", state="running", epoch=epoch + 1, epochs=epochs, step=position, steps=len(epoch_batches), loss=round(total / steps, 6),
+                              elapsed_s=round(elapsed, 1), epoch_eta_s=round(elapsed / position * (len(epoch_batches) - position), 1))
             seen_positive.update(tuple(sorted((batch[i].product_id, batch[j].product_id))) for i in range(len(batch)) for j in range(i + 1, len(batch)) if rel[i, j] == 1)
             seen_negative.update(tuple(sorted((batch[i].product_id, batch[j].product_id))) for i in range(len(batch)) for j in range(i + 1, len(batch)) if rel[i, j] == NEGATIVE)
         if not steps:
             raise ValueError("no usable contrastive rows")
         history.append(total / steps)
+        progress.emit("train", state="epoch_completed", epoch=epoch + 1, epochs=epochs, loss=round(history[-1], 6), steps=steps, elapsed_s=round(time.monotonic() - epoch_started, 1))
         metadata["epochs"].append({"epoch": epoch + 1, "steps": steps, "effective_pairs": effective,
                                     "excluded_positive_only_rows": excluded, "covered_negative_pairs": len(seen_negative),
                                     "required_negative_pairs": len(sampler.edges), "covered_positive_pairs": len(seen_positive),
@@ -270,6 +286,8 @@ def main(argv=None):
     ap.add_argument("--resume")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-progress", action="store_true", help="suppress JSON progress lines on stderr")
+    ap.add_argument("--progress-interval", type=float, default=10.0, help="seconds between in-epoch progress lines")
     if preliminary.config:
         defaults = json.loads(Path(preliminary.config).read_text())
         allowed = {action.dest for action in ap._actions} - {"help", "config"}
@@ -285,7 +303,8 @@ def main(argv=None):
                     a.use_unit_size, load_relations(a.relations) if a.relations else None, a.seed,
                     split_manifest=json.loads(Path(a.split).read_text()), unlabelled_negatives=a.unlabelled_negatives,
                     augmentation=a.augmentation, resume=a.resume, device=a.device, temperature=a.temperature, allow_grid_override=a.allow_grid_override,
-                    allow_grid_check_failure=a.allow_grid_check_failure)
+                    allow_grid_check_failure=a.allow_grid_check_failure,
+                    progress_sink=None if a.no_progress else stderr_sink, progress_interval=a.progress_interval)
     print(json.dumps({"last_loss": history[-1], "checkpoint": str(Path(a.out) / "dl1.pt"), "approval": approval_status()}))
 
 

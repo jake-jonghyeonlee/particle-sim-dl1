@@ -127,3 +127,37 @@ def test_timm_backbone_uses_its_own_stride():
     images, valid = torch.rand(2, 3, 64, 64), torch.ones(2, 1, 64, 64)
     mask = patch_mask(2, 64, 32, 0.5)
     assert net(images, valid, mask).shape == (2, 3, 64, 64)
+
+
+def test_pretrain_reports_scan_and_epoch_progress(case):
+    manifest, split, out = case
+    events = []
+    pretrain(manifest, split, out, epochs=2, batch_size=3, mask_ratio=0.5, progress_sink=events.append, progress_interval=0)
+    assert all(e["event"] == "progress" for e in events)
+    scan = [e for e in events if e["phase"] == "scan"]
+    assert scan[0]["state"] == "started" and scan[0]["products"] == 6 and scan[-1]["state"] == "completed"
+    states = {e["product_id"]: e["state"] for e in scan if "product_id" in e}
+    assert states["bus-40"] == "cached" and states["ring-40"] == "read_only_not_used"
+    train_events = [e for e in events if e["phase"] == "train"]
+    assert train_events[0]["state"] == "started" and train_events[0]["device"] == "cpu" and train_events[0]["steps_per_epoch"] == 2
+    assert [e["epoch"] for e in train_events if e["state"] == "epoch_completed"] == [1, 2]
+    running = [e for e in train_events if e["state"] == "running"]
+    assert running and running[-1]["step"] == running[-1]["steps"] and "epoch_eta_s" in running[0]
+    assert train_events[-1]["state"] == "completed"
+    json.dumps(events)  # every record is JSON serialisable
+    reused = []
+    pretrain(manifest, split, out, epochs=1, batch_size=3, mask_ratio=0.5, progress_sink=reused.append)
+    assert {e["state"] for e in reused if e["phase"] == "scan" and "product_id" in e and e["product_id"] != "ring-40" and e["product_id"] != "ring-64"} == {"reused"}
+
+
+def test_cli_writes_json_progress_to_stderr_and_can_be_silenced(case, capsys):
+    from psdl1.pretrain import main
+    manifest, split, out = case
+    split_path = out.parent / "split.json"
+    split_path.write_text(json.dumps(split))
+    args = ["--manifest", str(manifest), "--split", str(split_path), "--epochs", "1", "--batch-size", "3", "--mask-ratio", "0.5"]
+    main(args + ["--out", str(out)])
+    err = capsys.readouterr().err.strip().splitlines()
+    assert err and all(json.loads(line)["event"] == "progress" for line in err)
+    main(args + ["--out", str(out.parent / "quiet"), "--no-progress"])
+    assert capsys.readouterr().err == ""
