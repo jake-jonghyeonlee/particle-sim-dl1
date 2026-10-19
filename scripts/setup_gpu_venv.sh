@@ -10,6 +10,11 @@
 #   TORCH_SPEC        torch version (default 2.7.1+cu118, same as the main env); TV_SPEC for torchvision (0.22.1+cu118)
 #   TORCH_INDEX_URL   index/mirror that hosts the +cu118 wheels (PyPI's Windows torch is CPU-only).
 #                     Default: use the pip config as-is. If that mirror lacks +cu118, set this.
+#
+# Mirror address: pip reads PIP_INDEX_URL / PIP_TRUSTED_HOST / PIP_CERT from the environment, e.g.
+#   export PIP_INDEX_URL=http://<mirror>/simple PIP_TRUSTED_HOST=<mirror-host>
+# A new venv does not inherit a pip.conf that lives inside another venv; find the main env's with
+#   <main python> -m pip config list -v
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
@@ -32,7 +37,6 @@ pip() { "$VPY" -I -m pip --disable-pip-version-check "$@"; }
 index_args=()
 if [ -n "${TORCH_INDEX_URL:-}" ]; then index_args=(--extra-index-url "$TORCH_INDEX_URL"); fi
 
-pip install --upgrade pip
 pip install "numpy==2.5.3" "Pillow==12.3.0" "safetensors==0.8.0" "hatchling==1.27.0"
 pip install "${index_args[@]}" "torch==$TORCH_SPEC" "torchvision==$TV_SPEC"
 pip install "timm==1.0.30"
