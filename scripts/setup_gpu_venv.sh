@@ -42,8 +42,8 @@ if [ -n "${TORCH_INDEX_URL:-}" ]; then index_args=(--extra-index-url "$TORCH_IND
 pip install "numpy==2.5.3" "Pillow==12.3.0" "safetensors==0.8.0" "hatchling==1.27.0"
 pip install "${index_args[@]}" "torch==$TORCH_SPEC" "torchvision==$TV_SPEC"
 pip install "timm==1.0.30"
-# Application from this checkout; deps are already pinned above.
-pip install --no-deps --no-build-isolation "$ROOT"
+# Application from this checkout, editable: a later git pull updates the installed code. Deps are pinned above.
+pip install --no-deps --no-build-isolation -e "$ROOT"
 pip check
 
 "$VPY" -I - <<'PY'
