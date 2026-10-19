@@ -144,6 +144,26 @@ def _save_npy(path, array):
     _atomic_save(path, write)
 
 
+def check_split_ids(split, product_ids):
+    """캐시를 만들기 전에 split과 manifest의 제품 ID가 맞는지 확인하고, 틀린 ID를 오류에 그대로 적는다."""
+    if not isinstance(split, dict) or any(not isinstance(split.get(k), list) for k in ("train", "validation", "test")):
+        raise ValueError("split requires train/validation/test lists")
+    used = [pid for key in ("train", "validation", "test") for pid in split[key]]
+    known, seen, repeated = set(product_ids), set(), []
+    for pid in used:
+        (repeated if pid in seen else []).append(pid)
+        seen.add(pid)
+    problems = []
+    if seen - known:
+        problems.append(f"in split but not in manifest: {sorted(seen - known)[:10]}")
+    if repeated:
+        problems.append(f"repeated in split: {sorted(set(repeated))[:10]}")
+    if known - seen:
+        problems.append(f"in manifest but missing from split: {sorted(known - seen)[:10]}")
+    if problems:
+        raise ValueError("split does not match the manifest product IDs; " + "; ".join(problems))
+
+
 def scan_and_cache(manifest, split, cache_dir, grid, progress=None, total=None):
     """manifest를 한 번 훑어 계보를 검증하고 train/validation 요소 이미지를 캐시한다.
 
@@ -207,6 +227,7 @@ def pretrain(manifest, split, out_dir, *, progress_sink=None, progress_interval=
     grid = candidate if grid is None else grid
     if type(grid) is not int or grid <= 0 or (grid != candidate and not allow_grid_override):
         raise ValueError(f"grid {grid} conflicts with manifest candidate_grid {candidate}; explicit --allow-grid-override is required")
+    check_split_ids(split, [p["product_id"] for p in document.get("products", []) if isinstance(p, dict) and "product_id" in p])
     out = Path(out_dir)
     cache_dir = out / "cache"
     partitions, entries = scan_and_cache(manifest, split, cache_dir, grid, progress, len(document.get("products", [])))

@@ -161,3 +161,14 @@ def test_cli_writes_json_progress_to_stderr_and_can_be_silenced(case, capsys):
     assert err and all(json.loads(line)["event"] == "progress" for line in err)
     main(args + ["--out", str(out.parent / "quiet"), "--no-progress"])
     assert capsys.readouterr().err == ""
+
+
+def test_split_ids_are_checked_against_the_manifest_before_caching(case):
+    manifest, split, out = case
+    typo = dict(split, test=["ring-40", "ring-65"])
+    with pytest.raises(ValueError, match=r"not in manifest: \['ring-65'\].*missing from split: \['ring-64'\]"):
+        pretrain(manifest, typo, out, epochs=1)
+    twice = dict(split, test=["ring-40", "ring-64", "bus-40"])
+    with pytest.raises(ValueError, match=r"repeated in split: \['bus-40'\]"):
+        pretrain(manifest, twice, out, epochs=1)
+    assert not (out / "cache").exists()  # nothing was cached for a bad split
