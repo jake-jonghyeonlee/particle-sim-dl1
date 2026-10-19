@@ -533,6 +533,20 @@ MODEL-A,MODEL-C,different
 - different 쌍이 하나도 없으면 학습을 시작하지 않는다.
 - 정답이 없으면 `--unlabelled-negatives`로 "적지 않은 쌍은 다르다"고 가정할 수 있다. 실제로 비슷한 제품을 밀어낼 수 있는 실험 옵션이다. 같은 계열끼리는 이 경우에도 "모름"이다.
 
+### 6.2a `relations.csv` 초안 만들기 (`psdl1.relations_draft`)
+
+같은 계열(`lineage_id`)은 `similar`, 다른 계열은 `different` 후보로 쓰는 초안을 만든다. 다른 계열이라도 실제로 닮은 설계는 `different`로 넣기 어렵다. 그런 쌍은 **이미지 거리가 가장 가까운 순서대로 일부를 모름으로 남긴다**(`--hold-out-nearest`). 검토 목록(`*.review.csv`)을 보고 직접 판단한다.
+
+```bash
+.venv/bin/python -m psdl1.relations_draft --manifest "$EXPORT_OUT/manifest.json" --split "$SPLIT_JSON" \
+  --out relations.csv --partitions train --hold-out-nearest 0.3
+```
+
+- `relations.csv`는 머리글 없는 3열이라 `psdl1.train --relations`에 그대로 쓴다. 검토 목록에는 쌍마다 구획, 관계, 이미지 거리, 계열, 메모가 들어간다. 기존 파일은 덮어쓰지 않는다.
+- 쌍은 같은 구획 안에서만 만든다. 기본은 `train`이고, 평가에 쓰려면 `--partitions train test`처럼 지정한다.
+- 이미지 거리는 role/layer로 맞춘 낮은 해상도(`--grid`, 기본 64) 마스크의 평균 절대 차이다. 학습된 값이 아니라 판단을 돕는 지표이고 정답이 아니다. "다른 계열은 다른 설계"라는 가정이 맞는지는 사용자가 확인한다.
+- 출력 JSON의 `products_without_different_pair`에 `different` 쌍이 하나도 없는 제품이 나온다. 가능하면 비워 둔다.
+
 ### 6.3 학습
 
 ```bash
@@ -567,6 +581,23 @@ rem 이어서 학습 (--epochs는 총 목표 횟수)
 
 5–10개 제품은 가져오기와 연결 확인을 위한 시험 규모다. 학습에 충분한 수나 검색 품질의 근거가 아니다.
 
+### 6.3a 백본 사전학습 (`psdl1.pretrain`, 선택)
+
+라벨 없이 train 구획의 요소 이미지에서 가린 패치를 복원해 백본만 학습한다(FCMAE 방식의 dense 근사, sparse convolution 아님). 결과 `backbone.pt`를 `psdl1.train --weights`에 넣는다.
+
+```bash
+.venv/bin/python -m psdl1.pretrain --manifest "$EXPORT_OUT/manifest.json" --split "$SPLIT_JSON" --out "$PRETRAIN_OUT" \
+  --device cuda --batch-size 2 --epochs 100
+.venv/bin/python -m psdl1.train ... --weights "$PRETRAIN_OUT/backbone.pt" --backbone tiny
+```
+
+- train과 validation 제품만 쓴다. test는 캐시·학습·해시에 쓰지 않는다(manifest 검증 때문에 시작할 때 읽기만 한다). 같은 `split.json`을 본 학습에도 써야 한다.
+- 시작할 때 요소 이미지를 `--out/cache/`에 float16으로 저장하고, 에폭 중에는 배치마다 읽는다. 제품이 같으면 다음 실행에서 재사용한다. 제품당 요소 60~80장, grid 1024면 제품당 약 0.4GB다.
+- 진행 상황은 stderr에 JSON 줄(`event: "progress"`)로 나온다. `--no-progress`로 끈다. `psdl1.train`도 같은 형식이다.
+- 백본은 `tiny`와 timm 이름을 지원한다. 마스크 패치 크기는 백본의 stride(`tiny` 8, ConvNeXt 32)에 맞춘다.
+- `history.json`의 validation `loss`가 `baseline_loss`보다 낮고 `masked_foreground_iou`가 오르는지 본다. 사전학습이 본 학습 성능을 올리는지는 별도로 검증해야 한다(같은 split과 라벨로 `--weights` 없이/있이 학습해 validation에서 비교).
+- `--resume`은 설정·입력·split·코드가 같을 때만 허용한다. 학습 코드가 바뀌면 이전 체크포인트는 거부된다.
+
 ### 6.4 검색
 
 manifest 두 개를 받는다. 둘 다 같은 grid로 내보낸 것이어야 한다.
@@ -596,6 +627,20 @@ Windows (명령 프롬프트):
 ```
 
 `--hard-negatives <파일>`로 형상은 같고 연결 위치만 다른 제품 쌍 목록(`[["MODEL-E", "MODEL-F"]]`)을 줄 수 있다.
+
+### 6.6 임베딩 거리 보고서 (`psdl1.embed_plot`)
+
+학습된 체크포인트가 제품 사이 거리를 어떻게 만드는지 오프라인 HTML로 본다(외부 라이브러리·네트워크 없음).
+
+```bash
+.venv/bin/python -m psdl1.embed_plot --ckpt "$TRAIN_OUT/dl1.pt" --manifest "$EXPORT_OUT/manifest.json" --out "$REPORT_OUT" --device cpu
+```
+
+- 새 폴더에 `embedding_map.html`(2D 투영 두 종류, 코사인 거리 히트맵, 표), `embeddings.csv`, `distances.csv`, `summary.json`이 생긴다.
+- 색과 모양은 구획(train/validation/test)이고, 같은 계열은 가는 선으로 잇는다. 2D 투영은 거리를 왜곡할 수 있으니 정확한 값은 히트맵과 표를 본다.
+- `summary.json`과 화면 위쪽에 같은 계열 안/밖의 평균 거리와 "가장 가까운 제품이 같은 계열인 비율"이 나온다. 모든 거리가 0.02 미만이면 임베딩이 한 점으로 몰렸을 수 있다는 경고가 나온다.
+- 학습에서 못 본 role/layer가 있는 제품은 제외되고 사유가 표시된다. 체크포인트 학습 입력과 다른 제품은 `summary.json`의 `inputs_differing_from_checkpoint`에 나온다.
+- 제품 하나의 요소 전체를 한 번에 통과시키므로 grid 1024에서는 GPU 메모리가 부족할 수 있다. 기본은 `--device cpu`다.
 
 ## 7. 출력 형식
 
