@@ -22,6 +22,8 @@ VENV="${1:-.venv-gpu}"
 TORCH_SPEC="${TORCH_SPEC:-2.7.1+cu118}"
 TV_SPEC="${TV_SPEC:-0.22.1+cu118}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Git Bash gives /c/... paths that a Windows python.exe cannot resolve; hand it a C:/... path.
+if command -v cygpath >/dev/null 2>&1; then ROOT="$(cygpath -m "$ROOT")"; fi
 
 if [ -e "$VENV" ]; then
   echo "Venv already exists and was preserved: $VENV (choose a new path)" >&2
