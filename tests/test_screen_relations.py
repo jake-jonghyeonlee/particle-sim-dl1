@@ -6,107 +6,158 @@ import numpy as np
 import pytest
 
 from conftest import FAMILIES, make_product
-from psdl1.screen_relations import auc, compare, main, product_signature, screen, tolerant_distance
+from psdl1.screen_relations import auc, compare, main, product_signature, screen
 from psdl1.split import SPLIT_VERSION
 from psdl1.train import load_relations
 from test_pretrain import write_manifest
 
+FACTOR, TOL = 2, 1
 
-def variant(product, name, lineage, size):
-    return replace(make_product(product, size), product_id=name, lineage_id=lineage)
+
+def embed(product, name, lineage, size, offset):
+    """제품을 size×size 프레임의 offset 위치에 놓는다(같은 물리 크기의 설계가 프레임 안에서 다른 위치에 있는 상황)."""
+    oy, ox = offset
+
+    def place(mask):
+        out = np.zeros((size, size), dtype=mask.dtype)
+        out[oy:oy + mask.shape[0], ox:ox + mask.shape[1]] = mask
+        return out
+    return replace(product, product_id=name, lineage_id=lineage, unit_size_um=(size * 0.05, size * 0.05),
+                   elements=tuple(replace(e, mask=place(e.mask)) for e in product.elements), cnt=place(product.cnt))
+
+
+def sig(product):
+    return product_signature(product, FACTOR, TOL)
+
+
+OFFSETS = {"bus": ((14, 10), (30, 22)), "comb": ((10, 30), (26, 6)), "ring": ((20, 20), (6, 34))}
 
 
 @pytest.fixture
 def case(tmp_path):
-    products = [variant(f, f"{f.upper()}_{v}", f.upper(), s) for f in FAMILIES for s, v in ((40, "R00"), (64, "T00"))]
+    products = [embed(make_product(f, 48), f"{f.upper()}_{v}", f.upper(), 96, OFFSETS[f][i]) for f in FAMILIES for i, v in enumerate(("R00", "T00"))]
     manifest = write_manifest(tmp_path, products, 64)
     split = {"schema_version": SPLIT_VERSION, "train": [p.product_id for p in products if not p.product_id.startswith("RING")], "validation": [],
              "test": ["RING_R00", "RING_T00"]}
-    return manifest, split, tmp_path
+    return manifest, split, tmp_path, products
 
 
-def test_tolerant_distance_forgives_small_shifts_but_not_different_shapes():
-    base = np.zeros((32, 32), dtype=bool)
-    base[10:12, 4:28] = True
-    shifted = np.roll(base, 1, axis=0)
-    other = np.zeros_like(base)
-    other[4:28, 10:12] = True
-
-    def sig(mask):
-        from psdl1.screen_relations import F, torch
-        dilated = F.max_pool2d(torch.from_numpy(mask.astype(np.float32))[None, None], 5, 1, 2)[0, 0].numpy() > 0
-        return {"mask": mask, "dilated": dilated}
-    assert tolerant_distance(sig(base), sig(base)) == 0
-    assert tolerant_distance(sig(base), sig(shifted)) < 0.05
-    assert tolerant_distance(sig(base), sig(other)) > 0.5
+def test_shifted_copy_is_aligned_and_the_same_shift_applies_to_every_layer(case):
+    *_, products = case
+    a, b = products[0], products[1]  # BUS_R00 at (14,10), BUS_T00 at (30,22)
+    result = compare(sig(a), sig(b), tolerance=TOL)
+    assert result["shift"] == ((14 - 30) // FACTOR, (10 - 22) // FACTOR) and result["anchor"] == "CNT"
+    assert result["similarity"] > 0.97 and result["usage_jaccard"] == 1.0 and result["flags"] == []
+    assert all(distance < 0.05 for _, status, distance in result["bindings"] if status == "both")
+    assert result["shift"][0] * FACTOR * 0.05 == pytest.approx(-0.8)  # µm: 16 px at 0.05 µm/px
 
 
-def test_electrode_used_on_one_side_only_counts_as_fully_different(case):
-    manifest, _, _ = case
-    from psdl1.data import load_manifest
-    p = next(iter(load_manifest(manifest)))
-    emptied = replace(p, elements=(replace(p.elements[0], mask=np.zeros_like(p.elements[0].mask)), *p.elements[1:]))
-    a, b = product_signature(p, 64, 2), product_signature(emptied, 64, 2)
-    result = compare(a, b)
-    key = f"{p.elements[0].role}/{p.elements[0].layer}"
+def test_different_frame_sizes_compare_in_the_same_physical_scale(case):
+    *_, products = case
+    base = make_product("bus", 48)
+    a = embed(base, "A", "L", 96, (14, 10))
+    b = embed(base, "B", "L", 128, (40, 50))
+    result = compare(sig(a), sig(b), tolerance=TOL)
+    assert result["similarity"] > 0.97 and result["roi_overlap"] == pytest.approx(44 / 48) and "low_overlap" not in result["flags"]  # B's frame ends 4 raster px before A's right edge
+    assert result["shift"] == ((14 - 40) // FACTOR, (10 - 50) // FACTOR)
+
+
+def test_identical_products_and_a_missing_electrode(case):
+    *_, products = case
+    a = products[0]
+    same = compare(sig(a), sig(a), tolerance=TOL)
+    assert same["similarity"] == 1.0 and same["shift"] == (0, 0) and same["flags"] == []
+    emptied = replace(a, elements=(replace(a.elements[0], mask=np.zeros_like(a.elements[0].mask)), *a.elements[1:]))
+    result = compare(sig(a), sig(emptied), tolerance=TOL)
+    key = f"{a.elements[0].role}/{a.elements[0].layer}"
     assert (key, "only_a", 1.0) in result["bindings"] and result["usage_jaccard"] < 1 and result["similarity"] < 1
-    assert compare(a, a)["similarity"] == 1.0 and compare(a, a)["usage_jaccard"] == 1.0
+    assert result["shift"] == (0, 0)  # the CNT anchor still aligns the pair
 
 
-def test_same_lineage_is_similar_and_clearly_other_lineages_are_different_or_unknown(case):
-    manifest, split, _ = case
-    result = screen(manifest, split, grid=64, margin=0.0)
+def test_cnt_covering_the_whole_frame_falls_back_to_the_electrode_union(case):
+    *_, products = case
+    a, b = products[0], products[1]
+    whole = lambda p: replace(p, cnt=np.ones_like(p.cnt))
+    result = compare(sig(whole(a)), sig(whole(b)), tolerance=TOL)
+    assert result["anchor"] == "ELECTRODES" and "anchor_fallback_electrodes" in result["flags"]
+    assert result["shift"] == ((14 - 30) // FACTOR, (10 - 22) // FACTOR)
+    bare = lambda p: replace(p, cnt=np.zeros_like(p.cnt))
+    assert compare(sig(bare(a)), sig(bare(b)), tolerance=TOL)["anchor"] == "ELECTRODES"
+
+
+def test_periodic_pattern_is_flagged_as_ambiguous_and_anchor_mismatch_as_unreliable():
+    def striped(name, period=16, width=4, size=96):
+        m = np.zeros((size, size), dtype=np.float32)
+        for x in range(2, size, period):
+            m[:, x:x + width] = 1
+        base = make_product("bus", size)
+        return replace(base, product_id=name, lineage_id="L", unit_size_um=(size * 0.05,) * 2,
+                       elements=(replace(base.elements[0], mask=m),), cnt=m.copy())
+    result = compare(sig(striped("A")), sig(striped("B")), tolerance=TOL)
+    assert "ambiguous_alignment" in result["flags"]
+    base = make_product("bus", 96)
+    square, bar = np.zeros((96, 96), np.float32), np.zeros((96, 96), np.float32)
+    square[40:50, 40:50] = 1
+    bar[10:12, 5:90] = 1
+    a = replace(base, elements=(replace(base.elements[0], mask=np.ones((96, 96), np.float32)),), cnt=square)
+    b = replace(a, cnt=bar)
+    assert "alignment_unreliable" in compare(sig(a), sig(b), tolerance=TOL)["flags"]
+
+
+def test_same_lineage_is_similar_and_other_lineages_are_different_or_unknown(case):
+    manifest, split, *_ = case
+    result = screen(manifest, split, factor=FACTOR, margin=0.0)
     by = {(p["product_a"], p["product_b"]): p for p in result["pairs"]}
     assert by[("BUS_R00", "BUS_T00")]["tier"] == "similar" and by[("COMB_R00", "COMB_T00")]["tier"] == "similar"
-    same = [p["similarity"] for p in result["pairs"] if p["same_lineage"]]
-    assert result["floor"]["global"] == min(same)
+    assert by[("BUS_R00", "BUS_T00")]["similarity"] > 0.97 and by[("BUS_R00", "BUS_T00")]["shift_y_um"] != 0
+    assert result["floor"]["global"] == min(p["similarity"] for p in result["pairs"] if p["same_lineage"])
     for p in result["pairs"]:
         if not p["same_lineage"]:
             assert p["tier"] == ("different" if p["similarity"] < result["floor"]["global"] else "unknown")
-    assert all(p["partition"] == "train" for p in result["pairs"]) and len(result["pairs"]) == 6  # four train products
+    assert len(result["pairs"]) == 6 and result["summary"]["alignment"]["anchors"] == {"CNT": 6}
     assert 0 <= result["summary"]["separation_auc_same_vs_other_lineage"]["similarity"] <= 1
 
 
 def test_groups_cap_cross_group_pairs_and_must_cover_every_screened_product(case, tmp_path):
-    manifest, split, _ = case
+    manifest, split, *_ = case
     groups = tmp_path / "groups.json"
     groups.write_text(json.dumps({"BUS_R00": "mobile", "BUS_T00": "mobile", "COMB_R00": "it", "COMB_T00": "it", "RING_R00": "auto", "RING_T00": "auto"}))
-    result = screen(manifest, split, groups=groups, grid=64, margin=0.0, floor=0.99, cross_group_fraction=0.0)
+    result = screen(manifest, split, groups=groups, factor=FACTOR, margin=0.0, floor=0.99, cross_group_fraction=0.0)
     cross = [p for p in result["pairs"] if p["group_a"] != p["group_b"]]
-    assert cross and all(p["tier"] == "unknown" and p["reason"] == "cross_group_capped" for p in cross)  # no within-group different pair exists here
+    assert cross and all(p["tier"] == "unknown" and p["reason"] == "cross_group_capped" for p in cross)
     groups.write_text(json.dumps({"BUS_R00": "mobile"}))
     with pytest.raises(ValueError, match="missing for screened products"):
-        screen(manifest, split, groups=groups, grid=64)
+        screen(manifest, split, groups=groups, factor=FACTOR)
     groups.write_text(json.dumps({**{p: "x" for p in split["train"] + split["test"]}, "NOPE": "x"}))
     with pytest.raises(ValueError, match="unknown IDs"):
-        screen(manifest, split, groups=groups, grid=64)
+        screen(manifest, split, groups=groups, factor=FACTOR)
 
 
-def test_lineage_leakage_and_missing_calibration_rejected(case):
-    manifest, split, _ = case
+def test_invalid_options_lineage_leakage_and_missing_calibration_rejected(case):
+    manifest, split, *_ = case
     with pytest.raises(ValueError, match="lineage leakage"):
-        screen(manifest, dict(split, train=["BUS_R00", "COMB_R00", "COMB_T00"], test=["BUS_T00", "RING_R00", "RING_T00"]), grid=64)
-    solo = dict(split, train=["BUS_R00", "COMB_R00"], validation=["BUS_T00", "COMB_T00"])  # no same-lineage pair inside the partition
-    with pytest.raises(ValueError, match="lineage leakage"):
-        screen(manifest, solo, grid=64)
+        screen(manifest, dict(split, train=["BUS_R00", "COMB_R00", "COMB_T00"], test=["BUS_T00", "RING_R00", "RING_T00"]), factor=FACTOR)
+    for bad in ({"factor": 0}, {"anchor": "pcnt"}, {"max_shift": 0}, {"candidates": 0}):
+        with pytest.raises(ValueError):
+            screen(manifest, split, **{"factor": FACTOR, **bad})
 
 
 def test_cli_outputs_relations_scores_review_and_summary(case, capsys):
-    manifest, split, root = case
+    manifest, split, root, _ = case
     split_path = root / "split.json"
     split_path.write_text(json.dumps(split))
     out = root / "relations.csv"
-    main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(out), "--grid", "64", "--margin", "0.0"])
+    main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(out), "--factor", str(FACTOR), "--margin", "0.0"])
     summary = json.loads(capsys.readouterr().out)
     similar, different = load_relations(out)  # exactly what psdl1.train reads
     assert frozenset(("BUS_R00", "BUS_T00")) in similar and len(different) == summary["pairs_by_tier"]["different"]
     header = next(csv.reader(open(str(out) + ".scores.csv", encoding="utf-8")))
-    assert header[:3] == ["product_a", "product_b", "partition"] and "similarity" in header
+    assert {"similarity", "anchor", "shift_y_um", "shift_x_um", "alignment_score", "roi_overlap", "alignment_flag"} <= set(header)
     text = open(str(out) + ".review.html", encoding="utf-8").read()
-    assert "data:image/png;base64" in text and "http" not in text.replace("http-equiv", "")
-    assert json.loads(open(str(out) + ".summary.json", encoding="utf-8").read())["floor"]["global"] == summary["floor"]["global"]
+    assert "data:image/png;base64" in text and "정렬 기준 CNT" in text and "http" not in text.replace("http-equiv", "")
+    assert json.loads(open(str(out) + ".summary.json", encoding="utf-8").read())["alignment"]["anchors"] == {"CNT": 6}
     with pytest.raises(FileExistsError):
-        main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(out), "--grid", "64"])
+        main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(out), "--factor", str(FACTOR)])
 
 
 def test_auc_basics():

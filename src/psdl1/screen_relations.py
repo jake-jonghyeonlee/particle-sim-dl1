@@ -1,10 +1,14 @@
 """학습 전 1차 스크리닝: 전극(층)별 사용 패턴과 형상으로 제품 쌍의 유사도를 수치로 매기고 relations.csv 초안을 만든다.
 
-비교 단위는 모델이 보는 것과 같은 (role, layer) 요소 이미지와 CNT 합집합이다. 쌍마다
-  - 한쪽에서만 쓰이는 전극(마스크가 비어 있지 않은 binding)은 거리 1,
-  - 양쪽에서 쓰이면 이동을 허용한 형상 거리(1 - tolerant F1)
-를 구하고 binding 평균을 1에서 뺀 값을 유사도(0~1)로 쓴다. 같은 계열(lineage)의 쌍은 similar, 같은 계열 쌍 중 가장 낮은
-유사도보다 확실히 낮은 다른 계열 쌍만 different, 나머지는 모름으로 두고 검토 파일에 남긴다. 정답이 아니라 판단을 돕는 지표다."""
+비교 단위는 모델이 보는 것과 같은 (role, layer) 요소 마스크와 CNT 합집합이다. 프레임 크기가 다른 제품도 공정하게 비교하려고
+프레임에 맞춰 줄이지 않고, 모든 제품을 같은 정수 배율(`factor`, 픽셀 피치 × 배율 = 래스터 해상도)로 줄인 물리 래스터에서 비교한다.
+제품 쌍마다
+  1. 기준(CNT 합집합, 없거나 정보가 없으면 전극 합집합) 마스크의 교차상관으로 어긋남 후보를 찾고,
+  2. 후보마다 모든 층에 같은 이동을 적용해 겹친 영역(ROI)에서 층별 거리를 구하고,
+  3. 전체 유사도가 가장 큰 후보를 고른다.
+층별 거리는 한쪽에서만 쓰이는 전극이면 1, 양쪽에서 쓰이면 이동을 허용한 형상 거리(1 - tolerant F1)다. 유사도는 1에서 층별 거리의 평균을
+뺀 값(0~1)이다. 같은 계열(lineage)의 쌍은 similar, 같은 계열 쌍 중 가장 낮은 유사도보다 확실히 낮은 다른 계열 쌍만 different, 나머지는
+모름으로 두고 검토 파일에 남긴다. 정답이 아니라 판단을 돕는 지표다."""
 from __future__ import annotations
 
 import argparse
@@ -23,28 +27,47 @@ import torch.nn.functional as F
 
 from .data import _iter_manifest_products
 from .losses import validate_relations
-from .pretrain import check_split_ids, element_images
+from .pretrain import check_split_ids
+from .schema import binary_mask
 from .split import validate_split
 
 PARTITIONS = ("train", "validation", "test")
 CNT = "CNT"
-SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "lineage_a", "lineage_b", "similarity",
-                "usage_jaccard", "geometry_distance", "tier", "reason")
+CHECK_GRID = 64  # manifest 읽기용 grid 검사 해상도. 스크리닝 결과와 무관하다
+SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "lineage_a", "lineage_b", "similarity", "usage_jaccard",
+                "geometry_distance", "anchor", "shift_y_um", "shift_x_um", "alignment_score", "roi_overlap", "alignment_flag", "tier", "reason")
 
 
-def product_signature(product, grid, tolerance):
-    """binding 이름 → 마스크, 이동 허용 범위로 부풀린 마스크. 모델 입력과 같은 정규화(element_images)를 쓴다."""
-    images, _ = element_images(product, grid)
-    masks = {f"{e.role}/{e.layer}": images[i, 0] > 0 for i, e in enumerate(product.elements)}
-    masks[CNT] = images[0, 1] > 0
-    signature = {}
+def block_reduce(mask, factor, how):
+    h, w = mask.shape
+    mask = np.pad(mask, ((0, -h % factor), (0, -w % factor)))
+    blocks = mask.reshape(mask.shape[0] // factor, factor, mask.shape[1] // factor, factor)
+    return blocks.any(axis=(1, 3)) if how == "any" else blocks.mean(axis=(1, 3)) > 0.5
+
+
+def dilate(mask, radius):
+    if radius <= 0:
+        return mask
+    return F.max_pool2d(torch.from_numpy(mask.astype(np.float32))[None, None], 2 * radius + 1, 1, radius)[0, 0].numpy() > 0
+
+
+def product_signature(product, factor, tolerance):
+    """binding 이름 → 물리 래스터 마스크. 프레임에 맞춰 줄이지 않고 모든 제품에 같은 정수 배율을 쓴다(얇은 선이 남도록 any 축소)."""
+    shape = next(e.mask.shape for e in product.elements)
+    valid = np.ones(shape, dtype=bool) if product.valid is None else binary_mask(product.valid) > 0
+    masks = {f"{e.role}/{e.layer}": (binary_mask(e.mask) > 0) & valid for e in product.elements}
+    cnt_sources = [binary_mask(c.mask) > 0 for c in product.connections if c.mask is not None]
+    if product.cnt is not None:
+        cnt_sources.append(binary_mask(product.cnt) > 0)
+    masks[CNT] = np.logical_or.reduce(cnt_sources) & valid if cnt_sources else np.zeros(shape, dtype=bool)
+    rasters = {}
     for key, mask in masks.items():
-        if tolerance:
-            dilated = F.max_pool2d(torch.from_numpy(mask.astype(np.float32))[None, None], 2 * tolerance + 1, 1, tolerance)[0, 0].numpy() > 0
-        else:
-            dilated = mask
-        signature[key] = {"mask": mask, "dilated": dilated, "used": bool(mask.any())}
-    return signature
+        coarse = block_reduce(mask, factor, "any")
+        rasters[key] = {"mask": coarse, "dilated": dilate(coarse, tolerance), "used": bool(coarse.any())}
+    electrodes = np.logical_or.reduce([r["mask"] for k, r in rasters.items() if k != CNT])
+    valid_raster = block_reduce(valid, factor, "mean")
+    pitch = product.frame.pixel_pitch_um if product.frame is not None else 1.0
+    return {"rasters": rasters, "electrodes": electrodes, "valid": valid_raster, "shape": valid_raster.shape, "um_per_px": float(pitch * factor)}
 
 
 def tolerant_distance(a, b):
@@ -54,19 +77,117 @@ def tolerant_distance(a, b):
     return 1.0 - (0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall))
 
 
-def compare(sa, sb):
-    used_a = {k for k, v in sa.items() if v["used"]}
-    used_b = {k for k, v in sb.items() if v["used"]}
+def roi_box(shape_a, shape_b, dy, dx):
+    """B[y, x]가 A[y + dy, x + dx]에 놓일 때 두 프레임이 겹치는 영역. A 좌표의 (y0, y1, x0, x1)이고 겹침이 없으면 None."""
+    y0, y1 = max(0, dy), min(shape_a[0], shape_b[0] + dy)
+    x0, x1 = max(0, dx), min(shape_a[1], shape_b[1] + dx)
+    return (y0, y1, x0, x1) if y1 > y0 and x1 > x0 else None
+
+
+def roi_views(sa, sb, dy, dx):
+    box = roi_box(sa["shape"], sb["shape"], dy, dx)
+    if box is None:
+        return None
+    y0, y1, x0, x1 = box
+    a_slice, b_slice = (slice(y0, y1), slice(x0, x1)), (slice(y0 - dy, y1 - dy), slice(x0 - dx, x1 - dx))
+    return box, a_slice, b_slice, sa["valid"][a_slice] & sb["valid"][b_slice]
+
+
+def anchor_layers(sa, sb, mode):
+    """기준 마스크 고르기. CNT 합집합이 비었거나 프레임 대부분을 덮어(흰색 전체 마스크 등) 위치 정보가 없으면 전극 합집합을 쓴다."""
+    def informative(sig, mask):
+        valid = sig["valid"]
+        return mask.any() and (mask & valid).sum() <= 0.9 * max(valid.sum(), 1)
+    kinds = [CNT, "ELECTRODES"] if mode == "auto" else [mode]
+    for kind in kinds:
+        get = (lambda s: s["rasters"][CNT]["mask"]) if kind == CNT else (lambda s: s["electrodes"])
+        if informative(sa, get(sa)) and informative(sb, get(sb)):
+            return kind, get(sa), get(sb)
+    return None, None, None
+
+
+def candidate_shifts(a, b, center, limit, tolerance, count, suppress):
+    """교차상관 상위 후보(이동량 dy, dx와 상관값). center는 두 프레임 중심을 맞췄을 때의 이동, limit는 그 주변 탐색 반경(픽셀)."""
+    (ha, wa), (hb, wb) = a.shape, b.shape
+    size = (ha + hb, wa + wb)
+    fa, fb = dilate(a, tolerance).astype(np.float32), dilate(b, tolerance).astype(np.float32)
+    corr = np.fft.irfft2(np.fft.rfft2(fa, size) * np.conj(np.fft.rfft2(fb, size)), size)
+    dys, dxs = np.arange(-(hb - 1), ha), np.arange(-(wb - 1), wa)
+    window = corr[np.ix_(dys % size[0], dxs % size[1])].copy()
+    window[np.abs(dys - center[0]) > limit[0], :] = -np.inf
+    window[:, np.abs(dxs - center[1]) > limit[1]] = -np.inf
+    found = []
+    for _ in range(count):
+        iy, ix = np.unravel_index(np.argmax(window), window.shape)
+        value = window[iy, ix]
+        if not np.isfinite(value) or value <= 0:
+            break
+        found.append((int(dys[iy]), int(dxs[ix]), float(value)))
+        window[max(0, iy - suppress):iy + suppress + 1, max(0, ix - suppress):ix + suppress + 1] = -np.inf
+    cy, cx = (np.argwhere(a).mean(0) - np.argwhere(b).mean(0))  # 기준 마스크 무게중심을 맞추는 후보도 하나 더 본다
+    near = lambda c: any(abs(c[0] - f[0]) <= suppress and abs(c[1] - f[1]) <= suppress for f in found)  # 이미 있는 후보와 겹치면 추가하지 않는다
+    if not found or not near((round(cy), round(cx))):
+        found.append((int(round(cy)), int(round(cx)), 0.0))
+    return found
+
+
+def evaluate_shift(sa, sb, dy, dx, anchor_pair=None):
+    views = roi_views(sa, sb, dy, dx)
+    if views is None:
+        return None
+    box, a_slice, b_slice, valid = views
     parts = []
-    for key in sorted(used_a | used_b):
-        if key in used_a and key in used_b:
-            parts.append((key, "both", float(tolerant_distance(sa[key], sb[key]))))
+    for key in sorted(sa["rasters"].keys() | sb["rasters"].keys()):
+        ra, rb = sa["rasters"].get(key), sb["rasters"].get(key)
+        a = np.zeros(valid.shape, bool) if ra is None else ra["mask"][a_slice] & valid
+        b = np.zeros(valid.shape, bool) if rb is None else rb["mask"][b_slice] & valid
+        if not a.any() and not b.any():
+            continue
+        if a.any() and b.any():
+            da, db = (ra["dilated"][a_slice] & valid), (rb["dilated"][b_slice] & valid)
+            parts.append((key, "both", float(tolerant_distance({"mask": a, "dilated": da}, {"mask": b, "dilated": db}))))
         else:
-            parts.append((key, "only_a" if key in used_a else "only_b", 1.0))
+            parts.append((key, "only_a" if a.any() else "only_b", 1.0))
     both = [d for _, status, d in parts if status == "both"]
+    anchor_score = None
+    if anchor_pair is not None:
+        am, bm = anchor_pair[0][a_slice] & valid, anchor_pair[1][b_slice] & valid
+        anchor_score = None if not (am.any() and bm.any()) else 1.0 - float(tolerant_distance(
+            {"mask": am, "dilated": dilate(am, 1)}, {"mask": bm, "dilated": dilate(bm, 1)}))
     return {"similarity": 1.0 - (float(np.mean([d for _, _, d in parts])) if parts else 0.0),
-            "usage_jaccard": len(used_a & used_b) / len(used_a | used_b) if parts else 1.0,
-            "geometry_distance": float(np.mean(both)) if both else None, "bindings": parts}
+            "usage_jaccard": sum(s == "both" for _, s, _ in parts) / len(parts) if parts else 1.0,
+            "geometry_distance": float(np.mean(both)) if both else None, "bindings": parts,
+            "shift": (dy, dx), "roi": box, "anchor_score": anchor_score,
+            "roi_overlap": (box[1] - box[0]) * (box[3] - box[2]) / min(np.prod(sa["shape"]), np.prod(sb["shape"]))}
+
+
+def compare(sa, sb, *, anchor="auto", max_shift=0.35, candidates=5, tolerance=1):
+    """제품 쌍을 정렬하고 비교한다. 후보 이동마다 전체 유사도를 구해 가장 높은 것을 쓴다."""
+    center = ((sa["shape"][0] - sb["shape"][0]) // 2, (sa["shape"][1] - sb["shape"][1]) // 2)
+    kind, a_anchor, b_anchor = anchor_layers(sa, sb, anchor)
+    flags = []
+    if kind is None:
+        options, kind = [(center[0], center[1], 0.0)], "none"
+        flags.append("no_anchor")
+    else:
+        limit = tuple(math.ceil(max_shift * max(sa["shape"][i], sb["shape"][i])) for i in range(2))
+        suppress = max(3, round(0.03 * max(sa["shape"] + sb["shape"])))
+        options = candidate_shifts(a_anchor, b_anchor, center, limit, tolerance, candidates, suppress)
+        if kind != CNT:
+            flags.append("anchor_fallback_electrodes")
+    scored = [(evaluate_shift(sa, sb, dy, dx, None if kind == "none" else (a_anchor, b_anchor)), corr) for dy, dx, corr in options]
+    scored = [(r, c) for r, c in scored if r is not None]
+    if not scored:
+        raise ValueError("the two frames do not overlap for any candidate shift")
+    scored.sort(key=lambda rc: (-rc[0]["similarity"], -rc[1]))
+    best = scored[0][0]
+    if len(scored) > 1 and best["similarity"] - scored[1][0]["similarity"] < 0.02:
+        flags.append("ambiguous_alignment")
+    if best["anchor_score"] is not None and best["anchor_score"] < 0.5:
+        flags.append("alignment_unreliable")
+    if best["roi_overlap"] < 0.5:
+        flags.append("low_overlap")
+    return {**best, "anchor": kind, "flags": flags, "um_per_px": sa["um_per_px"]}
 
 
 def auc(higher, lower):
@@ -88,10 +209,12 @@ def load_groups(path, product_ids, needed):
     return groups
 
 
-def screen(manifest, split, *, groups=None, partitions=("train",), grid=128, tolerance=2, margin=0.05, floor=None,
-           cross_group_fraction=0.2, min_group_pairs=3):
-    if type(grid) is not int or grid <= 0 or type(tolerance) is not int or tolerance < 0 or not 0 <= margin < 1 or not 0 <= cross_group_fraction <= 1:
-        raise ValueError("grid > 0, tolerance >= 0, margin in [0,1) and cross_group_fraction in [0,1] required")
+def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
+           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5):
+    if type(factor) is not int or factor <= 0 or type(tolerance) is not int or tolerance < 0 or not 0 <= margin < 1 or not 0 <= cross_group_fraction <= 1:
+        raise ValueError("factor > 0, tolerance >= 0, margin in [0,1) and cross_group_fraction in [0,1] required")
+    if anchor not in {"auto", CNT, "ELECTRODES"} or not 0 < max_shift <= 1 or type(candidates) is not int or candidates < 1:
+        raise ValueError("anchor must be auto/CNT/ELECTRODES, max_shift in (0,1] and candidates >= 1")
     if not partitions or any(p not in PARTITIONS for p in partitions):
         raise ValueError(f"partitions must be chosen from {PARTITIONS}")
     document = json.loads(Path(manifest).read_text(encoding="utf-8"))
@@ -100,22 +223,25 @@ def screen(manifest, split, *, groups=None, partitions=("train",), grid=128, tol
     wanted = {pid for part in partitions for pid in split[part]}
     group_of = {pid: "-" for pid in wanted} if groups is None else load_groups(groups, ids, wanted)
     stubs, signatures, lineage = [], {}, {}
-    for product in _iter_manifest_products(manifest, grid=grid):  # 끝까지 읽어 manifest 전체를 검증한다
+    for product in _iter_manifest_products(manifest, grid=CHECK_GRID):  # 끝까지 읽어 manifest 전체를 검증한다
         stubs.append(SimpleNamespace(product_id=product.product_id, lineage_id=product.lineage_id))
         lineage[product.product_id] = product.lineage_id
         if product.product_id in wanted:
-            signatures[product.product_id] = product_signature(product, grid, tolerance)
+            signatures[product.product_id] = product_signature(product, factor, tolerance)
     validate_split(stubs, split)
     pairs = []
     for part in partitions:
         names = sorted(split[part])
         for i, a in enumerate(names):
             for b in names[i + 1:]:
-                result = compare(signatures[a], signatures[b])
+                result = compare(signatures[a], signatures[b], anchor=anchor, max_shift=max_shift, candidates=candidates, tolerance=tolerance)
                 pairs.append({"product_a": a, "product_b": b, "partition": part, "group_a": group_of[a], "group_b": group_of[b],
                               "lineage_a": lineage[a], "lineage_b": lineage[b], "same_lineage": lineage[a] == lineage[b], "result": result,
                               "similarity": round(result["similarity"], 6), "usage_jaccard": round(result["usage_jaccard"], 6),
-                              "geometry_distance": None if result["geometry_distance"] is None else round(result["geometry_distance"], 6)})
+                              "geometry_distance": None if result["geometry_distance"] is None else round(result["geometry_distance"], 6),
+                              "anchor": result["anchor"], "shift_y_um": round(result["shift"][0] * result["um_per_px"], 3), "shift_x_um": round(result["shift"][1] * result["um_per_px"], 3),
+                              "alignment_score": None if result["anchor_score"] is None else round(result["anchor_score"], 4), "roi_overlap": round(float(result["roi_overlap"]), 4),
+                              "alignment_flag": ";".join(result["flags"])})
     same = [p for p in pairs if p["same_lineage"]]
     global_floor = floor if floor is not None else (min(p["similarity"] for p in same) if same else None)
     if global_floor is None:
@@ -162,6 +288,9 @@ def summarize(pairs, split, partitions, group_of, global_floor, group_floor, mar
             "floor": {"global": global_floor, "per_group": group_floor, "margin": margin},
             "separation_auc_same_vs_other_lineage": {"similarity": separation(lambda p: p["similarity"]), "usage_jaccard": separation(lambda p: p["usage_jaccard"]),
                                                       "geometry": separation(lambda p: 0.0 if p["geometry_distance"] is None else 1 - p["geometry_distance"])},
+            "alignment": {"anchors": {k: sum(p["anchor"] == k for p in pairs) for k in sorted({p["anchor"] for p in pairs})},
+                          "flags": {f: sum(f in p["alignment_flag"].split(";") for p in pairs) for f in ("no_anchor", "anchor_fallback_electrodes", "ambiguous_alignment", "alignment_unreliable", "low_overlap")},
+                          "median_roi_overlap": float(np.median([p["roi_overlap"] for p in pairs])) if pairs else None},
             "products_without_different_pair": uncovered, "groups": {g: sum(v == g for v in group_of.values()) for g in sorted(set(group_of.values()))}}
 
 
@@ -184,13 +313,18 @@ def write_csvs(result, out, scores_path):
 
 
 def overlay_png(a, b, size=168):
+    """겹친 영역(ROI)을 비율을 유지한 채 size 안에 그린다. 남는 부분은 투명하다."""
     from PIL import Image
     rgba = np.zeros(a.shape + (4,), dtype=np.uint8)
     rgba[a & ~b] = (57, 135, 229, 255)    # A만: 파랑
     rgba[b & ~a] = (235, 104, 52, 255)    # B만: 주황
     rgba[a & b] = (122, 122, 118, 255)    # 둘 다: 회색
+    scale = size / max(a.shape)
+    image = Image.fromarray(rgba, "RGBA").resize((max(1, round(a.shape[1] * scale)), max(1, round(a.shape[0] * scale))), Image.NEAREST)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(image, (0, 0))
     buffer = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").resize((size, size), Image.NEAREST).save(buffer, "PNG")
+    canvas.save(buffer, "PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
@@ -217,19 +351,26 @@ def render_review(result, top_pairs=40, top_bindings=6):
     chosen = chosen[:top_pairs]
     cards = []
     for p in chosen:
-        a, b = result["signatures"][p["product_a"]], result["signatures"][p["product_b"]]
+        sa, sb = result["signatures"][p["product_a"]], result["signatures"][p["product_b"]]
+        dy, dx = p["result"]["shift"]
+        _, a_slice, b_slice, valid = roi_views(sa, sb, dy, dx)
         parts = sorted(p["result"]["bindings"], key=lambda item: (-item[2], item[0]))[:top_bindings]
+
+        def roi_mask(sig, key, view):
+            return np.zeros(valid.shape, bool) if key not in sig["rasters"] else sig["rasters"][key]["mask"][view] & valid
         rows = "".join(f'<tr><td>{html.escape(k)}</td><td>{ {"both": "양쪽 사용", "only_a": "A만 사용", "only_b": "B만 사용"}[s] }</td><td class="n">{d:.3f}</td></tr>' for k, s, d in parts)
-        tiles = "".join(f'<div class="tile"><img alt="{html.escape(k)}" src="{overlay_png(a[k]["mask"] if k in a else np.zeros_like(b[k]["mask"]), b[k]["mask"] if k in b else np.zeros_like(a[k]["mask"]))}"><span>{html.escape(k)} · 거리 {d:.2f}</span></div>' for k, s, d in parts)
+        tiles = "".join(f'<div class="tile"><img alt="{html.escape(k)}" src="{overlay_png(roi_mask(sa, k, a_slice), roi_mask(sb, k, b_slice))}"><span>{html.escape(k)} · 거리 {d:.2f}</span></div>' for k, s, d in parts)
         reason = REASON_TEXT.get("same_lineage" if p.get("flag") else p["reason"], p["reason"])
         cards.append(f'<section class="card"><header><h2>A {html.escape(p["product_a"])} ↔ B {html.escape(p["product_b"])}</h2><span class="badge">유사도 {p["similarity"]:.3f}</span>'
                      f'<span class="badge">기준 {p["floor"]:.3f}</span><span class="badge">전극 사용 일치 {p["usage_jaccard"]:.2f}</span><span class="badge">{html.escape(p["group_a"])}/{html.escape(p["group_b"])}</span>'
+                     f'<span class="badge">정렬 기준 {html.escape(p["anchor"])} · 이동 ({p["shift_y_um"]:.1f}, {p["shift_x_um"]:.1f})µm · 겹침 {p["roi_overlap"]:.0%}</span>'
+                     f'{"".join(f"<span class=badge>{html.escape(f)}</span>" for f in p["alignment_flag"].split(";") if f)}'
                      f'<span class="badge">현재: {p["tier"]}</span></header><p class="sub">{html.escape(reason)}</p>'
                      f'<table><tr><th>binding (role/layer)</th><th>사용</th><th>거리</th></tr>{rows}</table><div class="tiles">{tiles}</div></section>')
     summary = result["summary"]
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
             f'<h1>DL1 스크리닝 검토</h1><p class="sub">판단이 필요한 쌍입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
-            f'확정할 쌍은 relations.csv에 similar/different로 직접 추가하세요. 아래 {len(chosen)}쌍 외에는 scores.csv에 있습니다.</p>'
+            f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하세요. 아래 {len(chosen)}쌍 외에는 scores.csv에 있습니다.</p>'
             f'<div class="legend"><span><i style="background:var(--a)"></i>A만</span><span><i style="background:var(--b)"></i>B만</span><span><i style="background:var(--both)"></i>둘 다</span>'
             f'<span>기준(같은 계열 최저 유사도) {summary["floor"]["global"]:.3f}</span></div>{"".join(cards) or "<p>검토할 쌍이 없습니다.</p>"}</body></html>')
 
@@ -241,8 +382,11 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="new relations.csv (similar/different only, header-free)")
     ap.add_argument("--groups", help="JSON {product_id: group}, e.g. mobile/it/auto")
     ap.add_argument("--partitions", nargs="+", default=["train"], choices=PARTITIONS, help="pairs are made inside each partition only")
-    ap.add_argument("--grid", type=int, default=128, help="working resolution of the normalised element images")
-    ap.add_argument("--tolerance", type=int, default=2, help="pixels of shift tolerated at --grid")
+    ap.add_argument("--factor", type=int, default=8, help="integer downsampling of every product (raster pitch = pixel pitch x factor); the same for all products")
+    ap.add_argument("--tolerance", type=int, default=1, help="raster pixels of residual misalignment tolerated after alignment")
+    ap.add_argument("--anchor", default="auto", choices=("auto", "CNT", "ELECTRODES"), help="mask used to align a pair; auto = CNT union, else the electrode union")
+    ap.add_argument("--max-shift", type=float, default=0.35, help="search radius around the centred position, as a fraction of the larger frame side")
+    ap.add_argument("--candidates", type=int, default=5, help="alignment candidates (correlation peaks) verified with the full similarity")
     ap.add_argument("--margin", type=float, default=0.05, help="a cross-lineage pair is 'different' only this far below the weakest same-lineage similarity")
     ap.add_argument("--floor", type=float, help="explicit similarity floor instead of the weakest same-lineage pair")
     ap.add_argument("--cross-group-fraction", type=float, default=0.2, help="cross-group 'different' pairs kept, as a fraction of within-group ones")
@@ -250,8 +394,8 @@ def main(argv=None):
     ap.add_argument("--review-bindings", type=int, default=6)
     a = ap.parse_args(argv)
     split = json.loads(Path(a.split).read_text(encoding="utf-8"))
-    result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), grid=a.grid, tolerance=a.tolerance, margin=a.margin,
-                    floor=a.floor, cross_group_fraction=a.cross_group_fraction)
+    result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
+                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates)
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     for path in (review, summary):

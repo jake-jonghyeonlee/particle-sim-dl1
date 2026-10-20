@@ -556,10 +556,13 @@ MODEL-A,MODEL-C,different
   --out relations.csv --groups groups.json --partitions train
 ```
 
-- **비교 단위**: 모델이 보는 것과 같은 (role, layer) 요소 이미지와 CNT 합집합이다. 한쪽에서만 쓰이는 전극(마스크가 비어 있지 않은 binding)은 거리 1, 양쪽에서 쓰이면 이동을 허용한 형상 거리(`--tolerance`, `--grid` 해상도 기준 픽셀)다. 유사도는 `1 − binding별 거리의 평균`이다.
+- **비교 단위**: (role, layer)별 요소 마스크와 CNT 합집합이다. 프레임에 맞춰 줄이면 프레임 크기가 다른 제품의 물리 크기가 달라지므로, **모든 제품을 같은 정수 배율(`--factor`, 기본 8)로 줄인 물리 래스터**에서 비교한다(래스터 해상도 = 픽셀 피치 × 배율, 제품 사이 픽셀 피치는 같아야 한다). 얇은 선이 남도록 any 방식으로 줄인다.
+- **정렬**: 단위 이미지의 중심이 제품마다 달라서 제품 쌍마다 먼저 맞춘다. 기준 마스크(CNT 합집합. 비었거나 프레임 대부분을 덮어 위치 정보가 없으면 전극 합집합, `--anchor`로 지정 가능)의 교차상관으로 두 프레임 중심 맞춤 주변 `--max-shift`(기본 0.35, 큰 변 대비) 안에서 후보 이동량 `--candidates`(기본 5)개를 찾는다. 후보마다 **모든 층에 같은 이동**을 적용해 두 프레임이 겹치는 영역(ROI)에서 층별 거리를 구하고 전체 유사도가 가장 큰 후보를 쓴다. 회전·뒤집힘·크기 보정은 하지 않는다. manifest에는 CNT 파일별 마스크가 아니라 합집합만 있어서 `pcnt`만 따로 기준으로 쓸 수는 없다.
+- **층별 거리**: 한쪽에서만 쓰이는 전극(ROI 안에서 마스크가 비어 있지 않은 binding)은 거리 1, 양쪽에서 쓰이면 정렬 후 남는 어긋남(`--tolerance`, 래스터 픽셀)을 허용한 형상 거리다. 유사도는 `1 − 층별 거리의 평균`이다.
+- **정렬 표시(`alignment_flag`)**: `ambiguous_alignment`(1등과 2등 후보 유사도 차이가 0.02 미만. 반복 패턴 등), `alignment_unreliable`(기준 마스크 일치도가 0.5 미만), `low_overlap`(ROI가 작은 프레임의 50% 미만), `anchor_fallback_electrodes`(전극 합집합을 기준으로 씀), `no_anchor`(기준 없음, 프레임 중심 맞춤).
 - **판정**: 같은 계열(`lineage_id`)은 `similar`. 같은 계열 쌍 중 **가장 낮은 유사도**(기준)보다 `--margin`(기본 0.05) 이상 낮은 다른 계열 쌍만 `different`. 나머지는 모름이다. 다른 계열인데 기준 이상으로 비슷한 쌍은 같은 회로일 수 있어 검토 대상이다.
 - **제품군**: `--groups groups.json`(`{"제품명": "mobile", ...}`, 검사 대상 제품 모두 필요)을 주면 군 안의 같은 계열 쌍이 3개 이상일 때 군별 기준을 쓰고, 아니면 전체 기준을 쓴다. 군이 다른 `different` 쌍은 쉬운 쌍이라 군 안의 `different` 수의 `--cross-group-fraction`(기본 0.2)만큼만 가장 비슷한 것부터 쓰고 나머지는 모름(`cross_group_capped`)이다. 제품군이 같은 회로를 뜻하지 않으므로 같은 군이라고 `similar`로 보지 않는다.
-- **출력**: `relations.csv`(similar/different만, 머리글 없음, `psdl1.train --relations`에 그대로 쓴다), `relations.csv.scores.csv`(모든 쌍의 유사도·전극 사용 일치도·형상 거리·판정·사유), `relations.csv.review.html`(판단이 필요한 쌍을 binding별로 겹쳐 그림. A만 파랑, B만 주황, 둘 다 회색), `relations.csv.summary.json`(기준, 판정 수, 계열 분리도 AUC, `different` 쌍이 없는 제품). 기존 파일은 덮어쓰지 않는다.
+- **출력**: `relations.csv`(similar/different만, 머리글 없음, `psdl1.train --relations`에 그대로 쓴다), `relations.csv.scores.csv`(모든 쌍의 유사도·전극 사용 일치도·형상 거리·정렬 기준과 이동량(µm)·정렬 신뢰도·ROI 겹침·판정·사유), `relations.csv.review.html`(판단이 필요한 쌍을 정렬한 뒤 ROI만 binding별로 겹쳐 그림. A만 파랑, B만 주황, 둘 다 회색), `relations.csv.summary.json`(기준, 판정 수, 계열 분리도 AUC, `different` 쌍이 없는 제품). 기존 파일은 덮어쓰지 않는다.
 - 쌍은 같은 구획 안에서만 만든다. 같은 계열이 두 구획에 걸치면 분할 검사에서 거부한다.
 - 이 값은 정답이 아니라 판단을 돕는 지표다. 검토 자료를 보고 확정한 쌍을 `relations.csv`에 직접 고쳐 넣는다. `summary.json`의 `separation_auc_same_vs_other_lineage`는 유사도, 전극 사용 일치도, 형상 중 무엇이 계열을 잘 가르는지 보여 준다(1에 가까울수록 잘 갈림).
 - 같은 계열이 1개뿐이어서 기준을 못 잡으면 `--floor`로 직접 정한다. 점수는 나중에 정도(degree)를 쓰는 학습으로 넘어갈 때 다시 계산하지 않도록 `scores.csv`에 모두 남는다.
