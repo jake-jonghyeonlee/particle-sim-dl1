@@ -662,6 +662,19 @@ Windows (명령 프롬프트):
 - 학습에서 못 본 role/layer가 있는 제품은 제외되고 사유가 표시된다. 체크포인트 학습 입력과 다른 제품은 `summary.json`의 `inputs_differing_from_checkpoint`에 나온다.
 - 제품 하나의 요소 전체를 한 번에 통과시키므로 grid 1024에서는 GPU 메모리가 부족할 수 있다. 기본은 `--device cpu`다.
 
+### 6.7 단일 파일 실행기 (`scripts/build_single_file.py`)
+
+서버에 `.py` 파일만 올릴 수 있고 명령줄 옵션을 넘길 수 없을 때, `src/psdl1/*.py` 전체를 `.py` 하나로 묶는다.
+
+```bash
+.venv/bin/python scripts/build_single_file.py --out psdl1_job.py
+```
+
+- 만들어진 파일 맨 위 `EDIT BELOW` ~ `EDIT ABOVE` 블록만 고친다: `JOBS`(작업 이름과 명령줄 인자 리스트, 위에서부터 차례로 실행하고 하나가 실패하면 멈춤), `LOG_FILE`(stdout/stderr 진행 줄을 이 파일에도 기록), `WORK_DIR`(패키지를 풀 폴더, `None`이면 파일 옆 또는 임시 폴더).
+- 작업 이름은 `train`, `pretrain`, `screen_relations`, `evaluate`, `embed_plot`, `search`, `import_png`, `data`, `relations_draft`이다. 인자는 명령줄에서 쓰던 그대로 문자열 리스트로 적고, 경로는 서버 기준 절대 경로를 권장한다.
+- 실행하면 패키지를 `.psdl1_pkg_<해시>/psdl1/`에 바이트 그대로 풀고(`code_hash`가 저장소와 같음) 그 복사본을 먼저 import한다. 서버에 다른 `psdl1`이 설치돼 있어도 묶음 쪽이 우선하고, 로그 첫 줄에 어느 `psdl1`을 쓰는지 적힌다. 서버에는 torch, numpy, Pillow(timm은 timm 백본을 쓸 때만)가 있어야 한다.
+- 데이터(manifest, NPY, `split.json`, `relations.csv`, `backbone.pt`)는 `.py`가 아니므로 서버에 이미 있어야 한다. 소스를 고치면 묶음을 다시 만들어서 올린다(같은 소스면 같은 파일이 나온다).
+
 ## 7. 출력 형식
 
 ### 7.1 격자 보고서 (`psdl1.data --report`)
