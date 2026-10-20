@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .data import CHANNELS
 
@@ -83,6 +84,9 @@ class ProductEncoder(nn.Module):
         if any(type(v) is not int or v <= 0 for v in (n_roles, n_layers, dim, out_dim, heads)) or type(blocks) is not int or blocks < 0 or dim % heads:
             raise ValueError("positive dimensions and divisible attention heads required")
         self.backbone = build_backbone(backbone, CHANNELS + 1, weights_file)
+        # 학습 전용 메모리 절약 스위치. 가중치·연산 결과는 바뀌지 않으므로 config/체크포인트 계약에 넣지 않는다.
+        self.grad_checkpoint = False
+        self.checkpoint_chunk = 16
         self.feat_norm = nn.LayerNorm(self.backbone.num_features)  # 이미지 특징과 조건의 크기를 맞춘다
         self.role = nn.Embedding(n_roles + 1, 32, padding_idx=0)
         self.layer = nn.Embedding(n_layers + 1, 32, padding_idx=0)
@@ -99,6 +103,13 @@ class ProductEncoder(nn.Module):
         self.connectivity = nn.Embedding(3, dim)  # unavailable, partial, source-complete
         # LayerNorm supports singleton batches; collapse prevention requires evaluation.
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.LayerNorm(dim), nn.GELU(), nn.Linear(dim, out_dim))
+
+    def _run_backbone(self, x):
+        if not (self.grad_checkpoint and self.training and torch.is_grad_enabled()):
+            return self.backbone(x)
+        # TinyBackbone은 GroupNorm이라 샘플끼리 독립이므로 조각내도 결과가 같다. 다른 백본(BatchNorm 가능)은 통째로 한 번에.
+        chunks = x.split(self.checkpoint_chunk) if isinstance(self.backbone, TinyBackbone) else (x,)
+        return torch.cat([checkpoint(self.backbone, c, use_reentrant=False) for c in chunks])
 
     def forward(self, images, role_ids, layer_ids, valid, unit=None, *, spatial_valid=None,
                 connection_features=None, connection_valid=None, connectivity_status=None):
@@ -117,7 +128,7 @@ class ProductEncoder(nn.Module):
             raise ValueError("spatial validity must have observed coverage per product")
         coverage = spatial_valid[:, None, None].expand(b, n, 1, g, g)
         backbone_input = torch.cat([images, coverage], dim=2)
-        feats = self.feat_norm(self.backbone(backbone_input.flatten(0, 1))).view(b, n, -1)
+        feats = self.feat_norm(self._run_backbone(backbone_input.flatten(0, 1))).view(b, n, -1)
         cond = [self.role(role_ids), self.layer(layer_ids)]
         if self.use_unit_size:
             if unit is None or unit.shape != (b, 2) or not torch.isfinite(unit).all():

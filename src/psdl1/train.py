@@ -145,7 +145,8 @@ def resolve_training_grid(products, grid=None, *, allow_grid_override=False):
 def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backbone="tiny", weights_file=None,
           use_unit_size=False, relations=None, seed=0, *, split_manifest=None, unlabelled_negatives=False,
           augmentation="none", resume=None, device="cpu", temperature=0.1, model_kwargs=None,
-          allow_grid_override=False, allow_grid_check_failure=False, progress_sink=None, progress_interval=10.0):
+          allow_grid_override=False, allow_grid_check_failure=False, progress_sink=None, progress_interval=10.0,
+          amp=False, grad_checkpoint=False):
     progress = Progress(progress_sink, progress_interval)
     if len(products) < 2:
         raise ValueError("제품이 둘 이상 있어야 학습할 수 있다")
@@ -160,6 +161,10 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
         raise ValueError("unlabelled_negatives must be an explicit boolean")
     if torch.device(device).type not in {"cpu", "cuda"}:
         raise ValueError("training resume supports CPU/CUDA RNG only")
+    if type(amp) is not bool or type(grad_checkpoint) is not bool:
+        raise ValueError("amp and grad_checkpoint must be boolean")
+    if amp and torch.device(device).type != "cuda":
+        raise ValueError("amp requires a CUDA device")
     if split_manifest is None:
         split_manifest = training_only_split(products)
     partitions = validate_split(products, split_manifest)
@@ -191,7 +196,9 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(seed)
     model = ProductEncoder(len(roles), len(layers), backbone, weights_file, use_unit_size=use_unit_size, **config["model_kwargs"]).to(device)
+    model.grad_checkpoint = grad_checkpoint
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)  # 재개 시 스케일은 기본값에서 다시 적응한다
     records = {p.product_id: {"identity": input_identity(p), "lineage": p.lineage_id, "design": p.design_version} for p in products}
     input_hash = json_hash(records)
     contract = {"split": split_manifest, "similar": sorted(map(sorted, all_similar)), "different": sorted(map(sorted, all_different)),
@@ -227,16 +234,19 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
             batch = [training[i] for i in indices]
             rel = sampler.relation[indices][:, indices].to(device)
             coverage = relation_coverage(rel)
-            z1 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation, prepared=[prepared_cache[p.product_id] for p in batch])
-            z2 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation, prepared=[prepared_cache[p.product_id] for p in batch])
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+                z1 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation, prepared=[prepared_cache[p.product_id] for p in batch])
+                z2 = encode_products(model, batch, grid, roles, layers, gen, augmentation=augmentation, prepared=[prepared_cache[p.product_id] for p in batch])
+            z1, z2 = z1.float(), z2.float()
             l1, n1 = masked_contrastive_loss(z1, z2, rel, temperature)
             l2, n2 = masked_contrastive_loss(z2, z1, rel.T, temperature)
             if n1 + n2 == 0:
                 continue
             optimizer.zero_grad()
             loss = (l1 + l2) * 0.5
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total += float(loss.detach())
             steps += 1
             effective += coverage["effective_pairs"]
@@ -286,6 +296,8 @@ def main(argv=None):
     ap.add_argument("--resume")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--amp", action="store_true", help="CUDA fp16 autocast + GradScaler to cut activation memory")
+    ap.add_argument("--grad-checkpoint", action="store_true", help="recompute backbone activations in backward to cut memory (slower)")
     ap.add_argument("--no-progress", action="store_true", help="suppress JSON progress lines on stderr")
     ap.add_argument("--progress-interval", type=float, default=10.0, help="seconds between in-epoch progress lines")
     if preliminary.config:
@@ -304,7 +316,8 @@ def main(argv=None):
                     split_manifest=json.loads(Path(a.split).read_text()), unlabelled_negatives=a.unlabelled_negatives,
                     augmentation=a.augmentation, resume=a.resume, device=a.device, temperature=a.temperature, allow_grid_override=a.allow_grid_override,
                     allow_grid_check_failure=a.allow_grid_check_failure,
-                    progress_sink=None if a.no_progress else stderr_sink, progress_interval=a.progress_interval)
+                    progress_sink=None if a.no_progress else stderr_sink, progress_interval=a.progress_interval,
+                    amp=a.amp, grad_checkpoint=a.grad_checkpoint)
     print(json.dumps({"last_loss": history[-1], "checkpoint": str(Path(a.out) / "dl1.pt"), "approval": approval_status()}))
 
 
