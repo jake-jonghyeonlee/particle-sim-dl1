@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from conftest import FAMILIES, make_product
-from psdl1.screen_relations import auc, compare, main, product_signature, screen
+from psdl1.screen_relations import auc, compare, main, product_signature, render_review, screen
 from psdl1.split import SPLIT_VERSION
 from psdl1.train import load_relations
 from test_pretrain import write_manifest
@@ -158,6 +158,33 @@ def test_cli_outputs_relations_scores_review_and_summary(case, capsys):
     assert json.loads(open(str(out) + ".summary.json", encoding="utf-8").read())["alignment"]["anchors"] == {"CNT": 6}
     with pytest.raises(FileExistsError):
         main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(out), "--factor", str(FACTOR)])
+
+
+def test_review_lists_every_pair_that_needs_a_look_even_when_cards_are_capped(case):
+    manifest, split, *_ = case
+    narrow = screen(manifest, split, factor=FACTOR, margin=0.0, review_band=0.0)
+    wide = screen(manifest, split, factor=FACTOR, margin=0.0, review_band=1.0)
+    nothing_extra = [p for p in narrow["pairs"] if "different_near_boundary" in p["review"]]
+    near = [p for p in wide["pairs"] if "different_near_boundary" in p["review"]]
+    assert len(near) == sum(p["tier"] == "different" for p in wide["pairs"]) > len(nothing_extra)  # a wide band lists every auto-different pair
+    assert wide["summary"]["review"]["pairs_to_review"] == sum(bool(p["review"]) for p in wide["pairs"])
+    assert wide["summary"]["review"]["by_reason"]["weakest_same_lineage"] >= 1
+    page = render_review(wide, top_pairs=1)
+    listed = sum(f"{p['product_a']} ↔ {p['product_b']}" in page for p in wide["pairs"] if p["review"])
+    assert listed == wide["summary"]["review"]["pairs_to_review"]  # the table has them all
+    assert page.count('<section class="card">') == 1 and "나머지" in page
+
+
+def test_alignment_problems_put_a_pair_on_the_review_list(case, monkeypatch):
+    import psdl1.screen_relations as module
+    manifest, split, *_ = case
+    original = module.compare
+    monkeypatch.setattr(module, "compare", lambda *a, **k: {**original(*a, **k), "flags": ["ambiguous_alignment", "low_overlap", "anchor_fallback_electrodes"]})
+    result = screen(manifest, split, factor=FACTOR, margin=0.0, review_band=0.0)
+    for p in result["pairs"]:
+        assert {"ambiguous_alignment", "low_overlap"} <= set(p["review"]) and "anchor_fallback_electrodes" not in p["review"]  # routine fallback is not a review reason
+    assert result["summary"]["review"]["pairs_to_review"] == len(result["pairs"])
+    assert result["summary"]["review"]["by_reason"]["low_overlap"] == len(result["pairs"])
 
 
 def test_auc_basics():

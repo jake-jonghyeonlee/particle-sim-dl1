@@ -210,7 +210,7 @@ def load_groups(path, product_ids, needed):
 
 
 def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
-           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5):
+           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15):
     if type(factor) is not int or factor <= 0 or type(tolerance) is not int or tolerance < 0 or not 0 <= margin < 1 or not 0 <= cross_group_fraction <= 1:
         raise ValueError("factor > 0, tolerance >= 0, margin in [0,1) and cross_group_fraction in [0,1] required")
     if anchor not in {"auto", CNT, "ELECTRODES"} or not 0 < max_shift <= 1 or type(candidates) is not int or candidates < 1:
@@ -269,6 +269,15 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     weakest = sorted(same, key=lambda p: p["similarity"])[:max(1, math.ceil(0.2 * len(same)))] if same else []
     for p in weakest:
         p["flag"] = "weakest_same_lineage"
+    for p in pairs:  # 사람이 봐야 하는 쌍과 그 이유를 모두 모은다
+        p["review"] = []
+        if p["tier"] == "unknown" and p["reason"] in {"close_to_same_lineage", "near_boundary"}:
+            p["review"].append(p["reason"])
+        if p.get("flag") == "weakest_same_lineage":
+            p["review"].append("weakest_same_lineage")
+        if p["tier"] == "different" and p["similarity"] >= p["floor"] - margin - review_band:
+            p["review"].append("different_near_boundary")
+        p["review"] += [f for f in p["alignment_flag"].split(";") if f in {"ambiguous_alignment", "alignment_unreliable", "low_overlap", "no_anchor"}]
     return {"pairs": pairs, "signatures": signatures, "floor": {"global": global_floor, "groups": group_floor, "margin": margin},
             "summary": summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin)}
 
@@ -291,6 +300,8 @@ def summarize(pairs, split, partitions, group_of, global_floor, group_floor, mar
             "alignment": {"anchors": {k: sum(p["anchor"] == k for p in pairs) for k in sorted({p["anchor"] for p in pairs})},
                           "flags": {f: sum(f in p["alignment_flag"].split(";") for p in pairs) for f in ("no_anchor", "anchor_fallback_electrodes", "ambiguous_alignment", "alignment_unreliable", "low_overlap")},
                           "median_roi_overlap": float(np.median([p["roi_overlap"] for p in pairs])) if pairs else None},
+            "review": {"pairs_to_review": sum(bool(p["review"]) for p in pairs),
+                       "by_reason": {r: sum(r in p["review"] for p in pairs) for r in sorted({r for p in pairs for r in p["review"]})}},
             "products_without_different_pair": uncovered, "groups": {g: sum(v == g for v in group_of.values()) for g in sorted(set(group_of.values()))}}
 
 
@@ -340,17 +351,24 @@ h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:0}p.sub{color:var(--te
 .tile span{display:block;font-size:11px;color:var(--text2);word-break:break-all}table{border-collapse:collapse;font-size:12px;margin-bottom:12px}
 td,th{padding:3px 10px;border-bottom:1px solid var(--grid);text-align:left}th{color:var(--text2);font-weight:500}td.n{text-align:right;font-variant-numeric:tabular-nums}
 """
-REASON_TEXT = {"close_to_same_lineage": "다른 계열인데 같은 계열 쌍만큼 비슷함: 같은 회로일 수 있음", "near_boundary": "경계 부근: 판단 필요", "same_lineage": "같은 계열 쌍 중 유사도가 가장 낮은 쌍: 정말 비슷한지 확인",
-               "cross_group_capped": "제품군이 다른 쉬운 쌍(일부만 사용)", "below_same_lineage_floor": "확실히 다름"}
+REASON_TEXT = {"close_to_same_lineage": "다른 계열인데 같은 계열 쌍만큼 비슷함: 같은 회로일 수 있음", "near_boundary": "경계 부근: 판단 필요",
+               "weakest_same_lineage": "같은 계열 쌍 중 유사도가 가장 낮은 쌍: 정말 비슷한지 확인", "different_near_boundary": "자동으로 different가 됐지만 기준에 가까움: 정말 다른지 확인",
+               "ambiguous_alignment": "정렬 후보가 여러 개(반복 패턴 등): 유사도를 덜 믿을 것", "alignment_unreliable": "기준 마스크가 잘 맞지 않음: 유사도를 덜 믿을 것",
+               "low_overlap": "두 프레임이 겹치는 영역이 작음: 유사도를 덜 믿을 것", "no_anchor": "정렬 기준이 없어 프레임 중심으로 맞춤"}
+REASON_ORDER = list(REASON_TEXT)
+TIER_TEXT = {"similar": "similar", "different": "different", "unknown": "모름"}
 
 
-def render_review(result, top_pairs=40, top_bindings=6):
+def render_review(result, top_pairs=60, top_bindings=6):
+    """검토 대상 쌍(p["review"]가 비어 있지 않은 모든 쌍)을 위쪽 표에 전부 나열하고, 경계에 가까운 순으로 top_pairs쌍은 층별 겹침 이미지 카드로 보여 준다."""
     pairs = result["pairs"]
-    chosen = [p for p in pairs if p["tier"] == "unknown" and p["reason"] in {"close_to_same_lineage", "near_boundary"} or p.get("flag") == "weakest_same_lineage"]
-    chosen.sort(key=lambda p: (abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
-    chosen = chosen[:top_pairs]
+    chosen = sorted((p for p in pairs if p["review"]), key=lambda p: (abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
+    summary = result["summary"]
+    counts = "".join(f'<li>{html.escape(r)}: {n}쌍 — {html.escape(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
+    table = "".join(f'<tr><td>{i}</td><td>{html.escape(p["product_a"])} ↔ {html.escape(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
+                    f'<td class="n">{p["floor"]:.3f}</td><td>{html.escape(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
     cards = []
-    for p in chosen:
+    for p in chosen[:top_pairs]:
         sa, sb = result["signatures"][p["product_a"]], result["signatures"][p["product_b"]]
         dy, dx = p["result"]["shift"]
         _, a_slice, b_slice, valid = roi_views(sa, sb, dy, dx)
@@ -360,19 +378,23 @@ def render_review(result, top_pairs=40, top_bindings=6):
             return np.zeros(valid.shape, bool) if key not in sig["rasters"] else sig["rasters"][key]["mask"][view] & valid
         rows = "".join(f'<tr><td>{html.escape(k)}</td><td>{ {"both": "양쪽 사용", "only_a": "A만 사용", "only_b": "B만 사용"}[s] }</td><td class="n">{d:.3f}</td></tr>' for k, s, d in parts)
         tiles = "".join(f'<div class="tile"><img alt="{html.escape(k)}" src="{overlay_png(roi_mask(sa, k, a_slice), roi_mask(sb, k, b_slice))}"><span>{html.escape(k)} · 거리 {d:.2f}</span></div>' for k, s, d in parts)
-        reason = REASON_TEXT.get("same_lineage" if p.get("flag") else p["reason"], p["reason"])
+        reasons = "".join(f'<li>{html.escape(REASON_TEXT[r])}</li>' for r in p["review"])
         cards.append(f'<section class="card"><header><h2>A {html.escape(p["product_a"])} ↔ B {html.escape(p["product_b"])}</h2><span class="badge">유사도 {p["similarity"]:.3f}</span>'
                      f'<span class="badge">기준 {p["floor"]:.3f}</span><span class="badge">전극 사용 일치 {p["usage_jaccard"]:.2f}</span><span class="badge">{html.escape(p["group_a"])}/{html.escape(p["group_b"])}</span>'
                      f'<span class="badge">정렬 기준 {html.escape(p["anchor"])} · 이동 ({p["shift_y_um"]:.1f}, {p["shift_x_um"]:.1f})µm · 겹침 {p["roi_overlap"]:.0%}</span>'
                      f'{"".join(f"<span class=badge>{html.escape(f)}</span>" for f in p["alignment_flag"].split(";") if f)}'
-                     f'<span class="badge">현재: {p["tier"]}</span></header><p class="sub">{html.escape(reason)}</p>'
+                     f'<span class="badge">현재: {TIER_TEXT[p["tier"]]}</span></header><ul class="sub">{reasons}</ul>'
                      f'<table><tr><th>binding (role/layer)</th><th>사용</th><th>거리</th></tr>{rows}</table><div class="tiles">{tiles}</div></section>')
-    summary = result["summary"]
+    omitted = len(chosen) - min(len(chosen), top_pairs)
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
-            f'<h1>DL1 스크리닝 검토</h1><p class="sub">판단이 필요한 쌍입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
-            f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하세요. 아래 {len(chosen)}쌍 외에는 scores.csv에 있습니다.</p>'
+            f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
+            f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하고, 틀린 자동 줄은 지우세요.</p>'
+            f'<ul class="sub">{counts or "<li>검토 대상이 없습니다.</li>"}</ul>'
             f'<div class="legend"><span><i style="background:var(--a)"></i>A만</span><span><i style="background:var(--b)"></i>B만</span><span><i style="background:var(--both)"></i>둘 다</span>'
-            f'<span>기준(같은 계열 최저 유사도) {summary["floor"]["global"]:.3f}</span></div>{"".join(cards) or "<p>검토할 쌍이 없습니다.</p>"}</body></html>')
+            f'<span>기준(같은 계열 최저 유사도) {summary["floor"]["global"]:.3f}</span></div>'
+            f'<h2>검토 대상 전체</h2><table><tr><th>#</th><th>쌍</th><th>현재 판정</th><th>유사도</th><th>기준</th><th>이유</th><th>이미지</th></tr>{table}</table>'
+            + (f'<p class="sub">카드는 {top_pairs}쌍까지만 그렸습니다. 나머지 {omitted}쌍은 위 표와 scores.csv로 보세요(--review-pairs로 늘릴 수 있음).</p>' if omitted else "")
+            + f'<h2>카드</h2>{"".join(cards) or "<p>검토할 쌍이 없습니다.</p>"}</body></html>')
 
 
 def main(argv=None):
@@ -390,12 +412,13 @@ def main(argv=None):
     ap.add_argument("--margin", type=float, default=0.05, help="a cross-lineage pair is 'different' only this far below the weakest same-lineage similarity")
     ap.add_argument("--floor", type=float, help="explicit similarity floor instead of the weakest same-lineage pair")
     ap.add_argument("--cross-group-fraction", type=float, default=0.2, help="cross-group 'different' pairs kept, as a fraction of within-group ones")
-    ap.add_argument("--review-pairs", type=int, default=40)
+    ap.add_argument("--review-pairs", type=int, default=60, help="pairs drawn as image cards; the table always lists every pair to review")
+    ap.add_argument("--review-band", type=float, default=0.15, help="auto-different pairs within margin + band of the floor are listed for review")
     ap.add_argument("--review-bindings", type=int, default=6)
     a = ap.parse_args(argv)
     split = json.loads(Path(a.split).read_text(encoding="utf-8"))
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
-                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates)
+                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band)
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     for path in (review, summary):
