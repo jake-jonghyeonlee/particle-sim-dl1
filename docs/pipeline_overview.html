@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>particle-sim 전체 흐름 — DL1 · compare · DL2</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --line:#d1d9e0; --bg:#ffffff; --soft:#f6f8fa;
+          --dl1:#2f6fdb; --cmp:#1a7f37; --dl2:#8250df; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6edf3; --muted:#9198a1; --line:#3d444d; --bg:#0d1117; --soft:#151b23;
+            --dl1:#6ea8ff; --cmp:#4ac26b; --dl2:#b59bff; --warn:#d29922; }
+  }
+  body { font-family: -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+         color:var(--fg); background:var(--bg); max-width:1100px; margin:0 auto; padding:28px 20px 60px; line-height:1.6; }
+  h1 { font-size:1.6rem; margin-bottom:4px; }
+  h2 { font-size:1.25rem; border-bottom:1px solid var(--line); padding-bottom:6px; margin-top:40px; }
+  h3 { font-size:1.05rem; margin-top:26px; }
+  .meta { color:var(--muted); font-size:.9rem; }
+  table { border-collapse:collapse; width:100%; font-size:.88rem; margin:10px 0 18px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; vertical-align:top; text-align:left; }
+  th { background:var(--soft); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:.85em;
+         background:var(--soft); padding:1px 4px; border-radius:4px; }
+  pre { background:var(--soft); border:1px solid var(--line); border-radius:6px; padding:10px 12px;
+        overflow-x:auto; font-size:.8rem; line-height:1.45; }
+  pre code { background:none; padding:0; }
+  .flow { display:flex; gap:10px; align-items:stretch; flex-wrap:wrap; margin:16px 0; }
+  .stage { flex:1 1 220px; border:2px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--soft); }
+  .stage h4 { margin:0 0 6px; font-size:1rem; }
+  .stage ul { margin:0; padding-left:18px; font-size:.85rem; }
+  .arrow { align-self:center; font-size:1.4rem; color:var(--muted); }
+  .s-dl1 { border-color:var(--dl1); } .s-dl1 h4 { color:var(--dl1); }
+  .s-cmp { border-color:var(--cmp); } .s-cmp h4 { color:var(--cmp); }
+  .s-dl2 { border-color:var(--dl2); } .s-dl2 h4 { color:var(--dl2); }
+  .tag { display:inline-block; font-size:.75rem; padding:0 6px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+  .note { border-left:4px solid var(--warn); background:var(--soft); padding:8px 12px; margin:12px 0; font-size:.9rem; }
+  .handoff { font-size:.85rem; color:var(--muted); margin:-4px 0 12px; }
+</style>
+</head>
+<body>
+
+<h1>particle-sim 전체 흐름 — DL1 · compare · DL2</h1>
+<p class="meta">작성 2026-10-20 · 기준 commit: particle-sim-dl1 <code>ff1188d</code>, particle-sim-compare <code>8bc937b</code>, particle-sim-dl2 <code>63e806e</code><br>
+같은 문서가 세 저장소의 <code>docs/pipeline_overview.html</code>에 들어 있습니다. 세부 규칙은 각 저장소의 <code>docs/USAGE.md</code>와 compare의 <code>docs/handoff/commands.md</code>가 기준입니다.</p>
+
+<div class="note">검증 범위: 세 저장소 모두 합성 자료로만 검증됐습니다. 실제 자료에서의 성능, Windows에서의 DL1·DL2 전체 연동은 아직 확인되지 않았습니다. 창 크기, grid, 흔들림 폭, epochs 같은 값에는 기본값이 없습니다. 이 문서의 숫자는 형식을 보여 주는 예시이며 권장값이 아닙니다.</div>
+
+<h2>1. 전체 흐름</h2>
+<p>네 단계로 진행합니다. <b>DL1 → compare(1차) → DL2 → compare(2차)</b>. 저장소끼리는 코드로 서로 부르지 않습니다. 각 단계는 schema가 정해진 JSON 파일로 결과를 넘깁니다.</p>
+
+<div class="flow">
+  <div class="stage s-dl1"><h4>① DL1 — 제품 단위</h4>
+    <ul><li>새 제품과 원본 형상·전극 연결이 비슷한 기존 제품을 찾습니다</li>
+        <li>입력: 모델별 전극·CNT PNG</li>
+        <li>출력: 비교군 후보 제품 목록 <code>dl1_search.json</code></li></ul></div>
+  <div class="arrow">→</div>
+  <div class="stage s-cmp"><h4>② compare 1차 — 수치·ROI</h4>
+    <ul><li>reference/target 수치 비교와 제품별 전극 수 지도</li>
+        <li>검토 위치(ROI) 내보내기 <code>review_rois.json</code></li>
+        <li>두 제품 취약 영역 → 질의 ROI·색인 export (<code>candidates</code>)</li></ul></div>
+  <div class="arrow">→</div>
+  <div class="stage s-dl2"><h4>③ DL2 — 위치(ROI) 단위</h4>
+    <ul><li>ROI 하나와 국부 구조가 비슷한 다른 위치를 찾습니다</li>
+        <li>검색 범위: DL1 비교군(cohort) 안</li>
+        <li>출력: <code>dl2_index.json</code>, <code>dl2_search.json</code>. 학습이 없는 NCC 기준선도 함께 냅니다</li></ul></div>
+  <div class="arrow">→</div>
+  <div class="stage s-cmp"><h4>④ compare 2차 — 확정·결합</h4>
+    <ul><li>사용자가 후보 쌍을 확정합니다 → <code>roi_correspondence_v1</code></li>
+        <li>대응 위치의 국부 ΔCA (<code>compare-windows</code>)</li>
+        <li>DL 결과를 원본 CA 옆에 붙입니다 (<code>dl_results</code>), HTML 보고서</li></ul></div>
+</div>
+
+<h3>단계 사이에 넘어가는 파일</h3>
+<table>
+<tr><th>보내는 쪽 → 받는 쪽</th><th>파일 / schema</th><th>쓰임</th></tr>
+<tr><td>DL1 → DL2</td><td><code>cohort.json</code> (제품 id 배열, 사용자가 DL1 결과에서 작성)</td><td>DL2 검색 주 결과의 대상 제품</td></tr>
+<tr><td>DL1 → compare</td><td><code>dl1_search.json</code></td><td>어떤 제품끼리 비교할지(reference/target) 정하는 근거. ④에서 <code>dl_results seal --dl1</code>로 붙입니다</td></tr>
+<tr><td>compare → DL2</td><td><code>review_rois.json</code> (<code>review_roi_v1</code>) + 원본 asset</td><td>DL2 학습·색인·검색의 입력. DL2 입력은 이것 하나입니다</td></tr>
+<tr><td>compare → DL2</td><td><code>pairs_ids.json</code> (<code>roi_correspondence_v1</code>), <code>dl2_relations.json</code> (<code>roi_relations_v1</code>)</td><td>위치 평가의 정답, 학습 라벨(선택)</td></tr>
+<tr><td>DL2 → compare</td><td><code>dl2_search.json</code>, <code>dl2_index.json</code>, NCC <code>baseline*.json</code></td><td>후보 확정(<code>confirm-pairs --match</code>), 수치 결합(<code>dl_results</code>)</td></tr>
+</table>
+
+<div class="note">연결 규칙
+<ul style="margin:4px 0 0">
+<li>DL2는 export의 <code>producer_commit</code>(40자리 hash)을 확인합니다. compare를 git 밖 사본으로 설치해 <code>producer_commit=null</code>이 되면 기본적으로 거부합니다. 이때는 commit을 명시하거나 <code>--allow-unversioned-producer</code>를 붙입니다.</li>
+<li>hotspot·CA·fab 값은 DL1·DL2 어느 쪽에도 입력으로 넣지 않습니다. 넣으면 오류가 납니다.</li>
+<li>결합할 때 <code>source_identity</code>가 전부 맞아야 연결됩니다. <code>case_id</code>만 같아서는 연결되지 않습니다.</li>
+</ul></div>
+
+<h2>2. 학습 방법 — DL1과 DL2</h2>
+<table>
+<tr><th></th><th>DL1</th><th>DL2</th></tr>
+<tr><td>찾는 것</td><td>비슷한 <b>제품</b></td><td>비슷한 <b>위치(ROI)</b></td></tr>
+<tr><td>학습 단위</td><td>제품 전체 이미지. 전극 × layer별 요소와 CNT, valid 채널</td><td>ROI 하나를 가까운(near)·넓은(wide) 두 창으로 자른 원본 형상. 전극 역할·layer, CNT/VIA</td></tr>
+<tr><td>사전학습</td><td><b>있음, 선택</b>: <code>psdl1.pretrain</code>. 라벨 없이 train·validation 제품의 요소 이미지에서 가린 패치를 복원합니다(FCMAE dense 근사). 결과 <code>backbone.pt</code>를 본 학습 <code>--weights</code>에 넣습니다. 효과가 있는지는 <code>--weights</code> 없이/있이 학습해 validation에서 비교해야 합니다</td><td><b>별도 단계 없음</b>. 본 학습 자체가 자기지도입니다. 미리 학습된 가중치 없이 처음부터 학습합니다</td></tr>
+<tr><td>본 학습</td><td>지도 대조학습. <code>relations.csv</code>의 similar/different 쌍을 씁니다. 적지 않은 쌍은 "모름"으로 학습에서 빠집니다. 라벨이 없으면 <code>--unlabelled-negatives</code>(실험 옵션)가 필요합니다</td><td>자기지도. 같은 ROI의 중심을 <code>jitter_xy_um</code>만큼 흔들어 두 view를 만들고, 두 view가 가까워지도록 배웁니다(alignment + variance + covariance 손실). <code>labels.json</code>은 선택이며 있으면 지도 손실을 더합니다</td></tr>
+<tr><td>쌍이 필요한가</td><td>제품 쌍 라벨이 필요합니다. 초안은 <code>relations_draft</code> 또는 <code>screen_relations</code>로 만들고 사용자가 확정합니다</td><td>필요 없습니다. 제품 하나만으로 ROI를 내보내 학습할 수 있습니다. 쌍은 <b>평가</b>에만 필요합니다</td></tr>
+<tr><td>분할</td><td><code>split.json</code> (<code>dl1_split_v1</code>): 제품 → train/validation/test. 같은 lineage는 한 구획에만 둡니다</td><td><code>split.json</code>: ROI → 구획, <code>lineages.json</code>: 제품 → 계열. 같은 계열·겹치는 ROI는 한 구획에만 둡니다. train에 서로 다른 위치가 2개 이상 있어야 합니다</td></tr>
+<tr><td>사용자가 정할 값</td><td>candidate grid, epochs/batch/lr/seed, 라벨</td><td>near/wide 창 크기, pitch, resampling, jitter, core, intermediate layer 정책, max_pair_attempts, 손실 가중치, epochs/batch/lr/seed</td></tr>
+<tr><td>checkpoint</td><td><code>dl1.pt</code>(+ <code>history.json</code>, <code>split.json</code>). <code>--resume</code> 가능</td><td><code>dl2.pt</code>. epoch마다 원자적으로 교체됩니다. config의 epochs를 늘리고 <code>--resume</code></td></tr>
+<tr><td>GPU</td><td><code>--device cuda</code> 선택</td><td><code>--device cuda</code> (train/index/search). CPU로 자동 전환하지 않습니다</td></tr>
+</table>
+
+<h2>3. 단계별 명령 · 입력 · 출력</h2>
+<p class="handoff">각 표의 "하는 일" 열은 그 명령이 무엇을 하는지 한 줄로 적은 것입니다. 아래 명령은 Git Bash 기준이고 <code>$PY</code>는 각 저장소 venv의 python입니다. CMD 형식은 compare <code>docs/handoff/commands.md</code>에 있습니다. 경로는 실제 위치로 바꾸세요.</p>
+
+<h3><span class="tag">①</span> DL1 (particle-sim-dl1)</h3>
+<table>
+<tr><th>#</th><th>하는 일</th><th>명령</th><th>입력</th><th>출력</th></tr>
+<tr><td>1</td><td>PNG 폴더를 읽어 형식을 검사하고 CNT 형상 미리보기를 만든다</td><td><code>psdl1.import_png --root R --out D</code></td><td>PNG 폴더 <code>&lt;모델&gt;/&lt;전극&gt;/&lt;순번&gt;-&lt;layer&gt;.png</code>, <code>&lt;모델&gt;/cno/…</code>. 0.1 µm/pixel, 흰 바탕에 검은 패턴</td><td><code>import-report.json</code>, <code>preview.html</code></td></tr>
+<tr><td>2</td><td>후보 grid마다 가는 선이 사라지거나 끊기는지 검사해 grid를 고른다</td><td><code>psdl1.import_png … --inspect-grids G1 G2</code></td><td>후보 grid 숫자</td><td>grid별 가는 선·끊김 경고, 진단 PNG</td></tr>
+<tr><td>3</td><td>고른 grid와 계보 정보로 학습용 manifest와 NPY를 만든다</td><td><code>psdl1.import_png … --export --metadata M --candidate-grid G</code></td><td>계보 metadata(<code>dl1_png_metadata_v1</code>: lineage_id, design_version)</td><td><code>manifest.json</code>(<code>dl1_shape_v1_draft</code>), NPY</td></tr>
+<tr><td>4</td><td>내보낸 묶음이 온전하고 격자 조건을 만족하는지 확인한다</td><td><code>psdl1.import_png --verify-bundle D</code>, <code>psdl1.data manifest.json --report r.json</code></td><td>3의 결과</td><td>확인 결과, 격자 보고서</td></tr>
+<tr><td>5</td><td>학습용 제품 쌍 라벨(similar/different) 초안을 만든다</td><td><code>psdl1.relations_draft</code> / <code>psdl1.screen_relations</code> (선택)</td><td>manifest, split(, groups.json)</td><td><code>relations.csv</code> 초안, <code>*.review.csv|html</code>, <code>scores.csv</code>, <code>summary.json</code></td></tr>
+<tr><td>6</td><td>라벨 없이 백본만 미리 학습한다</td><td><code>psdl1.pretrain --manifest … --split … --out P</code> (선택)</td><td>manifest, split (test는 쓰지 않음)</td><td><code>P/backbone.pt</code>, <code>history.json</code>, <code>cache/</code></td></tr>
+<tr><td>7</td><td>제품 임베딩 모델을 학습한다</td><td><code>psdl1.train --manifest … --split … --relations … --out T [--weights P/backbone.pt]</code></td><td>manifest, split, relations</td><td><code>T/dl1.pt</code>, <code>history.json</code>, <code>split.json</code></td></tr>
+<tr><td>8</td><td>새 제품과 비슷한 기존 제품을 찾아 순위를 낸다</td><td><code>psdl1.search --ckpt T/dl1.pt --query-manifest Q --query ID --candidates-manifest C --topk K --out s.json</code></td><td>query manifest(같은 grid로 export), 후보 manifest</td><td><code>dl1_search.json</code>: score/rank/excluded/grid/fingerprint</td></tr>
+<tr><td>9</td><td>정답 쌍으로 모델과 기준선의 검색 성능을 평가한다</td><td><code>psdl1.evaluate … --relations … --out e.json</code></td><td>승인된 relations (없으면 보류)</td><td>평가 JSON (모델 vs 정규화 이미지 기준선)</td></tr>
+</table>
+
+<h3><span class="tag">②</span> compare 1차 (particle-sim-compare)</h3>
+<table>
+<tr><th>#</th><th>하는 일</th><th>명령</th><th>입력</th><th>출력</th></tr>
+<tr><td>0</td><td>여러 export-simcompare 결과를 data_dir 하나로 합친다</td><td><code>simcompare merge-exports --out DIR src1 src2 …</code> (필요할 때)</td><td>particle-sim <code>export-simcompare</code> 결과 여러 개(원안·변경본·다른 제품)</td><td>data_dir 하나</td></tr>
+<tr><td>1</td><td>수치 입력이 계약(형식·누락·단위)에 맞는지 점검한다</td><td><code>simcompare validate-data --config cfg.yaml --out V</code></td><td><code>numeric_config_v1</code> YAML, numeric_v2 자료</td><td>계약·누락·단위 점검 JSON</td></tr>
+<tr><td>2</td><td>reference와 target 제품의 수치(line/pixel, CA)를 비교한다</td><td><code>simcompare compare --config cfg.yaml --out CMP</code></td><td>reference/target 수치, pair table, density</td><td><code>comparison.json</code>, CSV, HTML (line/pixel, failure pieces, 원본 CA)</td></tr>
+<tr><td>3</td><td>제품 하나의 위치별 전극 수 지도를 만든다</td><td><code>simcompare electrode-map --config cfg.yaml --out MAP [--min-count k]</code></td><td>제품 하나(<code>electrode_map.product</code>)</td><td><code>electrode_map.json</code>, <code>.npz</code>, layer/summary PNG. 영역은 <code>--min-count</code>를 줄 때만 만듭니다</td></tr>
+<tr><td>4</td><td>지도 영역이나 직접 지정한 좌표를 DL2 입력용 ROI 목록으로 내보낸다</td><td><code>simcompare export-review-rois --config cfg.yaml --out ROI</code></td><td>config의 <code>map.input</code>(제품 하나), asset manifest, <code>review_rois</code> 선택(<code>map_region_ids</code> / <code>manual</code>)</td><td><code>ROI/review_rois.json</code> (<code>review_roi_v1</code>). case가 없는 위치는 blocked</td></tr>
+<tr><td>5</td><td>두 제품의 취약 영역에서 질의 ROI와 매칭용 export를 만든다</td><td><code>simcompare candidates --config cfg.yaml --min-count k --window-um W --merge-overlap r --out CAND</code></td><td>reference·target 각각 단일 제품</td><td>방향별 질의 <code>review_rois.json|csv</code>, 매칭용 index export, <code>funnel.json|csv</code>, <code>execution.json</code></td></tr>
+<tr><td>5b</td><td>설계자가 짝지은 대응 위치를 ROI id와 DL2 라벨로 바꾼다</td><td><code>simcompare.correspondence to-review-rois / attach-roi-ids / to-dl2-relations</code> (설계자 쌍이 있을 때)</td><td>설계자가 짝지은 <code>roi_correspondence_v1</code></td><td><code>config_a|b.yaml</code> → <code>roi_a|b/review_rois.json</code>, <code>pairs_ids.json</code>, <code>dl2_relations.json</code></td></tr>
+</table>
+
+<h3><span class="tag">③</span> DL2 (particle-sim-dl2)</h3>
+<table>
+<tr><th>#</th><th>하는 일</th><th>명령</th><th>입력</th><th>출력</th></tr>
+<tr><td>1</td><td>ROI 목록과 원본 asset을 검증하고 메모리 사용량을 확인한다</td><td><code>psdl2.data review_rois.json --assets-root A [--max-asset-memory-mb N]</code></td><td>compare의 <code>review_rois.json</code>, 원본 asset</td><td>검증 요약 JSON(stdout): ready/blocked 수, 사유, <code>asset_memory</code></td></tr>
+<tr><td>2</td><td>ROI 위치 임베딩 모델을 자기지도로 학습한다</td><td><code>psdl2.train review_rois.json --assets-root A --config config.json --lineages lineages.json --split split.json [--labels labels.json] --out runs/dl2.pt --device cuda</code></td><td>export, <code>psdl2_run_v1</code> config, lineages, split, (labels)</td><td><code>dl2.pt</code>, 결과 JSON(stdout: history, 거부 사유 통계), 진행 JSON 줄(stderr)</td></tr>
+<tr><td>3</td><td>후보 ROI 전체를 벡터로 바꿔 색인을 만든다</td><td><code>psdl2.index candidates/review_rois.json --assets-root A --checkpoint dl2.pt --out dl2_index.json</code></td><td>후보 ROI export</td><td><code>dl2_index.json</code> (<code>psdl2_index_v2</code>): ROI별 embedding, source_identity, coverage</td></tr>
+<tr><td>4</td><td>query ROI 하나와 비슷한 위치를 비교군 안에서 찾는다</td><td><code>psdl2.search query/review_rois.json --roi-id ID --checkpoint dl2.pt --index dl2_index.json --cohort cohort.json --topk K [--expand] --out dl2_search.json</code></td><td>query export, 색인, DL1 비교군 cohort</td><td><code>dl2_search.json</code>: primary(cohort 안) / supplementary(<code>--expand</code>) / no-match</td></tr>
+<tr><td>5</td><td>라벨이 있을 때 검색 결과를 평가한다</td><td><code>psdl2.evaluate results.json --k K --split split.json --partition test --labels labels.json</code></td><td>검색 결과 배열, 라벨</td><td>평가 JSON(stdout)</td></tr>
+<tr><td>6</td><td>학습 없는 NCC template matching으로 기준선 후보를 낸다</td><td><code>psdl2.baseline_ncc --query-export Q --index-export C (--correspondence P | --all-ready --max-memory-mb N) --window-um W --topk K --out baseline.json [--sheet-dir S]</code></td><td>query/후보 export (학습 없음)</td><td><code>baseline.json</code>, 검토 시트 <code>S/sheet.html</code></td></tr>
+<tr><td>7</td><td>DL2와 기준선 결과를 정답 위치 기준의 같은 지표로 비교한다</td><td><code>psdl2.eval_position (--search … | --baseline …) --correspondence pairs_ids.json --hit-tolerance-um T --k K --out eval.json</code></td><td>검색/기준선 결과, 정답 쌍</td><td>top-1 hit rate, hit rate@k, top-1 거리</td></tr>
+</table>
+
+<h3><span class="tag">④</span> compare 2차 (particle-sim-compare)</h3>
+<table>
+<tr><th>#</th><th>하는 일</th><th>명령</th><th>입력</th><th>출력</th></tr>
+<tr><td>1</td><td>NCC/DL2 후보 중 사용자가 accept한 쌍만 대응 위치 파일로 확정한다</td><td><code>simcompare confirm-pairs --config cfg.yaml --candidates CAND --match reference_to_target=ncc.json --list</code> → <code>decisions.csv</code> 작성 → <code>… --decisions decisions.csv --labelled-by USER --mutual-tolerance-um T --out CONF</code></td><td>②-5 candidates 출력, NCC/DL2 매칭 결과, 사용자 accept/reject</td><td><code>roi_correspondence.json</code> (<code>roi_correspondence_v1</code>), <code>confirmed_pairs_sidecar.json</code>(점수), <code>confirm_funnel.json|csv</code></td></tr>
+<tr><td>2</td><td>대응 위치의 같은 물리 창에서 국부 ΔCA를 계산한다</td><td><code>simcompare compare-windows --config cfg.yaml --correspondence P --window-sizes 10 20 30 --out LOCAL</code></td><td>대응 위치 쌍, 창 크기 후보</td><td><code>local_delta.json|_rows.csv|.html</code>, <code>window_sensitivity.*</code></td></tr>
+<tr><td>3</td><td>ROI의 원본 수치 문맥을 모은다</td><td><code>simcompare.dl_results context SOURCE_ROOT review_rois.json --asset-manifest M --out numeric_context.json</code></td><td>수치 원본, ROI export</td><td><code>numeric_context.json</code></td></tr>
+<tr><td>4</td><td>DL1·DL2 결과를 hash·fingerprint와 함께 묶어 봉인한다</td><td><code>simcompare.dl_results seal --context … --dl1 dl1_search.json --dl1-fingerprint F --dl1-bindings b.json --dl2 dl2_search.json --dl2-cohort cohort.json --dl2-index dl2_index.json --dl2-expected dl2_expected.json --pending-gates g.json --out exchange.json</code></td><td>DL1·DL2 결과, 승인한 fingerprint</td><td><code>exchange.json</code> (sidecar. 원래 DL 결과 JSON은 수정하지 않음)</td></tr>
+<tr><td>5</td><td>봉인한 결과를 원본 수치 옆에 나란히 붙인다</td><td><code>simcompare.dl_results read exchange.json --out joined.json</code></td><td>4의 결과</td><td><code>joined.json</code>: DL score/scope/coverage와 원본 수치를 나란히</td></tr>
+<tr><td>6</td><td>앞 단계 결과를 HTML 보고서 하나로 모은다</td><td><code>simcompare report --compare-dir CMP [--map-dir --windows-dir --rois-dir --candidates-dir --confirm-dir] --out REP</code></td><td>앞 단계 출력 폴더</td><td>HTML 보고서 한 파일</td></tr>
+</table>
+
+<h2>4. 운영 메모</h2>
+<ul>
+<li><b>DL2 학습 자료</b>: DL2가 학습·검색하는 위치는 compare가 내보낸 ROI뿐입니다. 학습·색인에 넣을 제품은 모두 compare에서 export해야 합니다. 제품 하나씩으로도 되며 비교 제품은 필요 없습니다. 다만 수치 자료(case)가 없는 위치는 blocked 됩니다.</li>
+<li><b>export는 파일 하나</b>: DL2 <code>train</code>과 <code>index</code>는 export 파일을 하나만 받습니다. 여러 제품을 한 export로 묶으려면 <code>merge-exports</code>로 data_dir을 합친 뒤 내보내는 방법을 생각할 수 있습니다. 이 방법은 <b>아직 확인하지 않았습니다</b>.</li>
+<li><b>색인과 검색은 같은 PC에서</b>: compare가 결과를 읽을 때 점수를 색인으로 다시 계산해 대조합니다.</li>
+<li><b>DL1 이름 제한</b>: 학습에 없던 전극·layer 이름을 가진 제품은 DL1 검색에서 <code>unavailable</code> 또는 <code>excluded</code>가 됩니다.</li>
+<li><b>점수의 의미</b>: 유사도 점수는 원인 판정이나 위험 예측이 아닙니다. CA 값은 항상 원본 결과에서 읽습니다.</li>
+<li><b>폐쇄망에서 정할 것</b>: DL1 grid, DL2 창·pitch·jitter·core, 라벨 형식과 수락 기준(G6), ΔCA 창 크기(G4).</li>
+</ul>
+
+<h2>5. 근거 문서</h2>
+<ul>
+<li>particle-sim-dl1: <code>docs/USAGE.md</code> 1장(전체 순서), 6장(학습·사전학습·검색·평가), 7장(출력)</li>
+<li>particle-sim-compare: <code>docs/handoff/commands.md</code> 2~7절, <code>src/simcompare/cli.py</code>, <code>src/simcompare/roi_export.py</code></li>
+<li>particle-sim-dl2: <code>docs/USAGE.md</code> 1·3·4·5장, <code>docs/data_contract.md</code>, <code>docs/training.md</code></li>
+</ul>
+</body>
+</html>
