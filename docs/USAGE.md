@@ -632,6 +632,10 @@ Windows (명령 프롬프트):
 ".venv-cmd\Scripts\python.exe" -I -m psdl1.search --ckpt "D:\runs\dl1\dl1.pt" --query-manifest "D:\out\query1\manifest.json" --query NEW-MODEL --candidates-manifest "D:\out\bundle1\manifest.json" --topk 5 --out "D:\out\search1.json"
 ```
 
+**HTML 보고서(선택)**: `--html "$SEARCH_OUT.html"`을 더하면 JSON과 별개로 단일 HTML 파일을 만든다(네트워크·외부 파일 없음, 이미지는 파일 안에 포함). 질의·상위 후보 카드(순위, cosine 막대와 6자리 점수, 연결 상태, 미리보기), 제품별 크기 정보(`unit_size_um`, frame 크기·pixel pitch, 없으면 `n/a`), 질의와 크기가 다르면 "크기 다름" 표시, 제외된 후보 표, layer 색 범례가 들어 있다. 미리보기는 원본 mask를 layer별 반투명 색으로 겹쳐 그리고(CNT는 검정), 긴 변 240px에 맞춰 비율을 유지한 채 작은 mask는 키우고 큰 mask는 줄이므로 실제 크기 비교는 크기 정보로 한다. `valid`가 false인 픽셀은 material/CNT로 그리지 않고 회색 사선("관측 불가(valid=false)")으로 표시하며, CNT는 전역 `cnt`와 관측된 원본 connection mask를 합쳐 그린다. 크기 비교는 데이터 계약과 같은 허용오차(atol=1e-9, rtol=1e-9)를 쓴다. 두 출력은 먼저 임시 파일로 모두 만든 뒤 JSON → HTML 순서로 `replace`해 게시하므로, 게시 전 실패(없는 폴더, 권한 등)에서는 기존 파일이 바뀌지 않고 기존 보고서의 권한도 유지된다(임시 파일은 처음부터 목적지보다 넓게 읽히지 않는 모드로 만든다). `--out`/`--html`이 기존 디렉터리이거나 `/`(또는 플랫폼 구분자)로 끝나는 디렉터리 형태면 아무것도 쓰기 전에 오류로 끝나며(구분자를 조용히 떼어 내지 않는다), `--out`을 생략해 JSON을 stdout으로 내보낼 때는 HTML 임시 파일을 먼저 만든 뒤에야 stdout에 JSON을 출력하므로 예측 가능한 준비 실패에서는 stdout에 아무것도 나오지 않는다. 첫 `replace` 이후에 일어나는 예기치 못한 실패(드문 경우)는 롤백하지 않으므로 JSON만 새 내용일 수 있다. 기존 출력 파일의 불변/추가 전용 플래그(macOS·BSD `UF_IMMUTABLE` 등)와 Windows 읽기 전용 속성, `missing/..`처럼 해석할 수 없는 경로는 게시 전에 거부하지만, Linux `chattr +i`나 ACL류 제한은 사전에 감지하지 못하며 첫 `replace` 이후의 실패는 롤백되지 않는다. layer가 12개를 넘으면 12번째 이후 layer의 색은 서로 비슷할 수 있다는 안내가 붙는다.
+
+`--html` 미리보기는 NPY 입력이어도 Pillow(선택 extra `png`: `pip install 'psdl1[png]'`)가 필요하다. 없으면 어떤 출력도 쓰기 전에 "--html 미리보기에는 Pillow가 필요합니다 … pip install 'psdl1[png]'" 오류로 즉시 종료한다. `--html`을 쓰지 않으면 Pillow 의존성은 그대로 없다. `--html`은 `--out`과 같은 파일일 수 없고(같으면 오류), HTML은 같은 폴더의 고유 임시 파일에 쓴 뒤 교체한다. JSON 출력은 `--html` 유무와 관계없이 같다.
+
 **이름 제한**: 전극 폴더명이 그대로 역할 이름이 된다. 학습에 없던 전극 이름이나 layer 이름을 가진 제품은 검색할 수 없다. 찾으려는 제품이 그러면 결과가 `unavailable`이 되고, 후보가 그러면 사유와 함께 `excluded`에 들어간다. 같은 이름은 같은 것으로 취급되지만, 두 전극이 실제로 같은 기능이라는 뜻은 아니다. 별칭을 맞추는 기능은 없다.
 
 ### 6.5 평가 (정답이 있을 때)
@@ -727,6 +731,8 @@ Windows (명령 프롬프트):
 | `grid`, `grid_selection`, `grid_gate` | 실제로 쓴 격자와 제품별 격자 확인 근거 |
 | `fingerprint` | 모델 설정 fingerprint. 수치 저장소에서 결과를 읽을 때 대조한다 |
 | `approval` | 무엇이 확정되고 무엇이 미정인지 |
+
+`--html`로 만든 보고서는 위 JSON 내용을 사람이 보기 좋게 옮긴 것이며, `unavailable`이면 질의 카드는 유지하고 후보 카드는 생략한 채 사유를 크게 보여 준다.
 
 후보가 없다는 것은 "비슷한 제품이 없다"는 뜻일 뿐 위험이 0이라는 뜻이 아니다. 전체 제품 유사도이며, 제품 사이에서 대응하는 위치를 찾아 주지 않는다.
 
