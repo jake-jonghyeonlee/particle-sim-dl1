@@ -334,6 +334,10 @@ def test_train_file_pretrains_trains_evaluates_and_skips_finished_steps(stages, 
     evaluation.unlink()
     fresh = run_script(only, tmp_path)  # EVALUATE_ONLY runs only evaluate
     assert fresh.returncode == 0 and "start evaluate" in fresh.stderr and "start train" not in fresh.stderr and evaluation.is_file()
+    assert "was trained for 1 epochs (TRAIN_ARGS --epochs: 1)" in fresh.stderr and "WARNING" not in fresh.stderr
+    short = stage_script(stages, "psdl1_train.py", tmp_path / "short", **train_values(work, EVALUATE_ONLY=True, TRAIN_ARGS=["--epochs", "5"])) if (tmp_path / "short").mkdir() is None else None
+    warned = run_script(short, tmp_path)  # unfinished-checkpoint warning only; it still evaluates (here: skips the finished evaluation)
+    assert warned.returncode == 0 and "WARNING: the checkpoint has 1 of 5 epochs" in warned.stderr
 
 
 def test_evaluate_only_needs_a_checkpoint(stages, tmp_path):
@@ -412,3 +416,144 @@ def test_relations_are_screened_per_partition_with_the_train_floor(stages, tmp_p
     rows = [line.split(",") for line in (work / "relations" / "relations.csv").read_text(encoding="utf-8").split()]
     assert sorted(r[2] for r in rows) == ["similar", "similar"] and {frozenset(r[:2]) for r in rows} == {frozenset(("W1", "W2")), frozenset(("W3", "W4"))}
     assert (work / "relations" / "test" / "relations.csv.review.html").is_file() and "relations/test/relations.csv.review.html" in result.stderr
+
+
+# ---- 리뷰 권고 반영: 약어·--config·안전 이동·실패 경로·CSV 합치기 ----
+
+def stage_globals(stages, name):
+    """묶음 파일을 import 해(실행하지 않고) 함수들이 쓰는 globals 를 돌려준다. 여기서 바꾼 값이 함수에 반영된다."""
+    return __import__("runpy").run_path(str(stages / name), run_name="psdl1_stage")["_say"].__globals__
+
+
+@pytest.mark.parametrize("name,key,args", [
+    ("psdl1_assets.py", "SCREEN_ARGS", ["--partition", "test"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--manif=x"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--sp", "x"]),
+    ("psdl1_train.py", "TRAIN_ARGS", ["--resum", "x"]), ("psdl1_train.py", "PRETRAIN_ARGS", ["--wei", "x"]), ("psdl1_train.py", "EVALUATE_ARGS", ["--ckp", "x"]),
+    ("psdl1_train.py", "TRAIN_ARGS", ["--config", "x.json"]), ("psdl1_train.py", "TRAIN_ARGS", ["--conf=x.json"]), ("psdl1_train.py", "TRAIN_ARGS", ["--c", "x"]),
+    ("psdl1_assets.py", "SCREEN_ARGS", ["--flo", "2"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--fl=2"])])
+def test_abbreviations_and_config_stop_before_anything_starts(stages, assets_done, tmp_path, name, key, args):
+    _, _, work = assets_done
+    values = assets_values(tmp_path / "no-png", tmp_path / "w") if name == "psdl1_assets.py" else train_values(work)
+    values[key] = args
+    result = run_script(stage_script(stages, name, tmp_path, **values), tmp_path)
+    assert result.returncode != 0 and "STOP:" in result.stderr and " start " not in result.stderr and "psdl1 from" not in result.stderr
+    assert not [p.name for p in (tmp_path / "w").glob("*") if p.name != "logs"]  # nothing but the log was written
+    if "config" in " ".join(args) or "conf" in " ".join(args):
+        assert "JOBS-style" in result.stderr
+
+
+def test_floor_abbreviation_is_refused_and_the_full_name_is_read(stages):
+    g = stage_globals(stages, "psdl1_assets.py")
+    assert g["_floor_arg"](["--floor", "2"]) == "2" and g["_floor_arg"](["--floor=3"]) == "3" and g["_floor_arg"](["--groups", "g.json"]) is None
+    for bad in (["--fl", "2"], ["--flo=2"], ["--floo", "2"]):
+        with pytest.raises(SystemExit) as stopped:
+            g["_floor_arg"](bad)
+        assert stopped.value.code == 2
+
+
+def test_user_floor_is_used_for_both_partitions(stages, tmp_path):
+    png = tmp_path / "png"
+    names = ["W1", "W2", "W3", "W4"]
+    for name in names:
+        write_wide_import_fixture(png, model=name)
+    metadata = {"metadata_schema_version": "dl1_png_metadata_v1", "models": {
+        n: {"lineage_id": "F1" if n in ("W1", "W2") else "F2", "design_version": "V1"} for n in names}}
+    work = tmp_path / "work"
+    (work / "inputs").mkdir(parents=True)
+    (work / "inputs" / "split.json").write_text(json.dumps({"schema_version": SPLIT_VERSION, "train": ["W1", "W2"], "validation": [], "test": ["W3", "W4"]}))
+    script = stage_script(stages, "psdl1_assets.py", tmp_path, **assets_values(png, work, METADATA=metadata, NO_PREVIEW=True, SCREEN_ARGS=["--floor", "0.7"]))
+    result = run_script(script, tmp_path)
+    assert result.returncode == 0, result.stderr[-3000:]
+    for part in ("train", "test"):
+        summary = json.loads((work / "relations" / part / "relations.csv.summary.json").read_text(encoding="utf-8"))
+        assert summary["floor"]["global"] == 0.7
+
+
+def test_stack_order_none_moves_the_old_file_aside(stages, tmp_path):
+    work = tmp_path / "work"
+    (work / "inputs").mkdir(parents=True)
+    old = work / "inputs" / "stack-order.json"
+    old.write_text(json.dumps(STACK_ORDER))
+    script = stage_script(stages, "psdl1_assets.py", tmp_path, **assets_values(tmp_path / "no-png", work, STACK_ORDER=None))
+    result = run_script(script, tmp_path)  # the export fails later (no PNGs); the old file was already moved, not deleted
+    moved = [p for p in (work / "inputs").iterdir() if p.name.startswith("stack-order.json.removed-")]
+    assert not old.exists() and len(moved) == 1 and json.loads(moved[0].read_text(encoding="utf-8")) == STACK_ORDER
+    assert f"moved {old} to {moved[0]}" in result.stderr
+
+
+def test_failure_names_do_not_collide_and_the_cause_is_logged_first(stages, tmp_path, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    g["time"] = type("T", (), {"strftime": staticmethod(lambda fmt: "T"), "time": staticmethod(lambda: 0.0)})
+    out = tmp_path / "export"
+    out.mkdir()
+    (out / "new.txt").write_text("new")
+    older = tmp_path / "export.failed-T"
+    older.mkdir()
+    (older / "old.txt").write_text("old")
+    assert g["_aside"](out, "failed") == tmp_path / "export.failed-T-2"
+    g["_call"] = lambda name, args: (_ for _ in ()).throw(SystemExit(3))
+    with pytest.raises(SystemExit) as stopped:
+        g["_call_keeping_failed"]("import_png", [], out)
+    assert stopped.value.code == 3 and not out.exists()
+    assert (older / "old.txt").read_text() == "old" and (tmp_path / "export.failed-T-2" / "new.txt").read_text() == "new"
+    err = capsys.readouterr().err
+    assert err.index("import_png failed: exit code 3") < err.index("kept its output at")
+
+
+def test_failure_when_the_move_fails_keeps_the_original_exit_code(stages, tmp_path, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+
+    def no_replace(src, dst):
+        raise OSError("read-only")
+    g["os"] = type("O", (), {"replace": staticmethod(no_replace), "path": os.path})
+    g["_call"] = lambda name, args: (_ for _ in ()).throw(RuntimeError("boom"))
+    out = tmp_path / "export"
+    out.mkdir()
+    with pytest.raises(RuntimeError, match="boom"):
+        g["_call_keeping_failed"]("import_png", [], out)
+    err = capsys.readouterr().err
+    assert out.is_dir() and "import_png failed: RuntimeError: boom" in err and f"이동 실패: {out}" in err and "손으로 옮긴 뒤 다시 실행" in err
+
+
+def test_partial_or_broken_screen_output_stops_with_guidance(stages, tmp_path, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    part = tmp_path / "train"
+    part.mkdir()
+    (part / "relations.csv").write_text("A,B,similar\n")  # only one of the three outputs
+    with pytest.raises(SystemExit) as stopped:
+        g["_screen"]("m.json", "s.json", "train", part, [])
+    assert stopped.value.code == 2 and "partial output" in capsys.readouterr().err
+    (part / "relations.csv.review.html").write_text("<html>")
+    (part / "relations.csv.summary.json").write_text("{not json")
+    with pytest.raises(SystemExit) as stopped:
+        g["_screen"]("m.json", "s.json", "train", part, [])
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and f"부분 출력: {part} 를 옮긴 뒤 다시 실행" in err and "Traceback" not in err
+    (part / "relations.csv.summary.json").write_text("[1]")
+    with pytest.raises(SystemExit):
+        g["_screen"]("m.json", "s.json", "train", part, [])
+    (part / "relations.csv.summary.json").write_text(json.dumps({"floor": {"global": 1.5}}))
+    assert g["_screen"]("m.json", "s.json", "train", part, [])["floor"]["global"] == 1.5
+
+
+def test_merge_stops_on_a_pair_in_two_partitions_and_keeps_csv_quoting(stages, tmp_path):
+    import csv
+    g = stage_globals(stages, "psdl1_assets.py")
+    a, b = tmp_path / "a.csv", tmp_path / "b.csv"
+    a.write_text('"P,1","P 2",similar\nQ1,Q2,different\n')
+    b.write_text('X1,"X,2",similar\n')
+    rows = g["_merge_rows"]([a, b])
+    merged = tmp_path / "merged.csv"
+    g["_write_rows"](merged, rows)
+    with open(merged, newline="", encoding="utf-8") as handle:
+        assert list(csv.reader(handle)) == [["P,1", "P 2", "similar"], ["Q1", "Q2", "different"], ["X1", "X,2", "similar"]]
+    assert '"P,1"' in merged.read_text(encoding="utf-8") and not (tmp_path / "merged.csv.tmp").exists()
+    b.write_text("Q2,Q1,similar\n")  # the same pair, reversed, in the other partition
+    with pytest.raises(SystemExit) as stopped:
+        g["_merge_rows"]([a, b])
+    assert stopped.value.code == 2
+
+
+def test_target_epochs_reads_train_args(stages):
+    g = stage_globals(stages, "psdl1_train.py")
+    assert g["_target_epochs"](["--backbone", "tiny"]) == 100 and g["_target_epochs"](["--epochs", "7"]) == 7
+    assert g["_target_epochs"](["--epochs=9"]) == 9 and g["_target_epochs"](["--epoch", "4"]) == 4 and g["_target_epochs"](["--epochs", "x"]) is None

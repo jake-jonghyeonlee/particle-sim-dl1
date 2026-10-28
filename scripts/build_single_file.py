@@ -224,25 +224,51 @@ def _call(name, args):
     _say(f"done {name} in {time.time() - started:.0f}s")
 
 
+def _aside(path, tag):
+    """<path>.<tag>-<시각> 이름을 돌려준다. 이미 있으면 -2, -3 … 을 붙여 기존 것과 겹치지 않게 한다."""
+    base = path.name + "." + tag + "-" + time.strftime("%Y%m%d-%H%M%S")
+    target, n = path.with_name(base), 1
+    while os.path.lexists(target):
+        n += 1
+        target = path.with_name(f"{base}-{n}")
+    return target
+
+
+def _why(exc):
+    return f"exit code {exc.code!r}" if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}"
+
+
 def _call_keeping_failed(name, args, out):
-    """_call 이 실패하면 출력 폴더를 <out>.failed-<시각> 으로 옮겨 증거를 보존하고, 다음 실행이 새로 만들게 한다."""
+    """_call 이 실패하면 원인을 먼저 로그에 남기고, 출력 폴더를 <out>.failed-<시각> 으로 옮겨 증거를 보존한다. 다음 실행은 새로 만든다."""
     try:
         _call(name, args)
-    except BaseException:
+    except BaseException as exc:
+        _say(f"{name} failed: {_why(exc)}")
         out = Path(out)
         if out.exists():
-            moved = out.with_name(out.name + ".failed-" + time.strftime("%Y%m%d-%H%M%S"))
-            os.replace(out, moved)
-            _say(f"{name} failed; kept its output at {moved}")
+            try:
+                moved = _aside(out, "failed")
+                os.replace(out, moved)
+            except OSError as move_error:
+                _say(f"이동 실패: {out} ({move_error}), 손으로 옮긴 뒤 다시 실행")
+            else:
+                _say(f"{name} failed; kept its output at {moved}")
         raise
 
 
 def _check_reserved(label, args, flags):
-    """실행기가 채우는 인자가 EDIT 인자 리스트에 있으면(--flag=value 포함) 시작 전에 멈춘다."""
+    """실행기가 채우는 인자가 EDIT 인자 리스트에 있으면 시작 전에 멈춘다. --flag=value 와 argparse 약어(--manif 등)도 막는다."""
     for arg in args:
-        flag = str(arg).split("=", 1)[0]
-        if flag in flags:
-            _stop(f"{label} must not contain {flag}: this file sets it itself")
+        name = str(arg).split("=", 1)[0]
+        if not name.startswith("--") or len(name) < 3:
+            continue
+        for flag in flags:
+            if flag.startswith(name):
+                what = "" if name == flag else "an abbreviation of "
+                if flag == "--config":
+                    _stop(f"{label} must not contain {name}: it is {what}--config, whose JSON can set resume/weights/out behind this file's back. "
+                          f"Write the options in {label} itself, or use a JOBS-style file (--out) for psdl1.train --config")
+                _stop(f"{label} must not contain {name}: it is {what}{flag}, which this file sets itself")
 
 
 def _skip(step, path):
@@ -340,11 +366,16 @@ def _write_json_once(path, obj, what, replace=False):
 
 
 def _floor_arg(args):
+    """사용자가 준 --floor 값(없으면 None). argparse 약어(--flo 등)는 인식하지 않고 전체 이름을 쓰라며 멈춘다."""
     for i, arg in enumerate(args):
-        if str(arg) == "--floor" and i + 1 < len(args):
-            return str(args[i + 1])
-        if str(arg).startswith("--floor="):
-            return str(arg).split("=", 1)[1]
+        name = str(arg).split("=", 1)[0]
+        if name.startswith("--") and len(name) > 2 and name != "--floor" and "--floor".startswith(name):
+            _stop(f"SCREEN_ARGS has {name}: write the full name --floor")
+        if name == "--floor":
+            if "=" in str(arg):
+                return str(arg).split("=", 1)[1]
+            if i + 1 < len(args):
+                return str(args[i + 1])
     return None
 
 
@@ -360,13 +391,40 @@ def _screen(manifest, split_path, part, out_dir, extra):
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
         _call("screen_relations", ["--manifest", manifest, "--split", split_path, "--out", csv, "--partitions", part, *SCREEN_ARGS, *extra])
-    return json.loads(outputs[2].read_text(encoding="utf-8"))
+    try:
+        summary = json.loads(outputs[2].read_text(encoding="utf-8"))
+        if not isinstance(summary, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        _stop(f"부분 출력: {out_dir} 를 옮긴 뒤 다시 실행 ({outputs[2].name}: {exc})")
+    return summary
 
 
 def _rows(path):
     import csv as csv_module
     with open(path, newline="", encoding="utf-8") as handle:
         return [row for row in csv_module.reader(handle) if row]
+
+
+def _merge_rows(parts):
+    """구획별 relations.csv 의 행을 순서대로 모은다. 한 쌍이 둘 이상의 구획에 나오면 멈춘다."""
+    seen, rows = set(), []
+    for part in parts:
+        for row in _rows(part):
+            key = frozenset(row[:2])
+            if key in seen:
+                _stop(f"pair {row[:2]} appears in more than one partition's relations; not merging")
+            seen.add(key)
+            rows.append(row)
+    return rows
+
+
+def _write_rows(path, rows):
+    import csv as csv_module
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as handle:
+        csv_module.writer(handle, lineterminator="\n").writerows(rows)
+    os.replace(tmp, path)
 
 
 def _split(manifest, split_path):
@@ -392,6 +450,7 @@ def _split(manifest, split_path):
 
 def stage():
     _check_reserved("SCREEN_ARGS", SCREEN_ARGS, ("--out", "--manifest", "--split", "--partitions"))
+    _floor_arg(SCREEN_ARGS)  # --floor 약어는 시작 전에 멈춘다
     _boot()
     work = Path(WORK)
     work.mkdir(parents=True, exist_ok=True)
@@ -408,8 +467,9 @@ def stage():
     elif order_path.exists():
         if exported:
             _stop(f"STACK_ORDER is None but {order_path} exists; set STACK_ORDER to its content or move the file away")
-        order_path.unlink()
-        _say(f"removed {order_path} (STACK_ORDER is None and there is no export yet)")
+        moved = _aside(order_path, "removed")
+        os.replace(order_path, moved)
+        _say(f"moved {order_path} to {moved} (STACK_ORDER is None and there is no export yet)")
 
     # b. export. 실패하면 출력 폴더를 .failed-* 로 보존한다.
     if exported:
@@ -454,18 +514,9 @@ def stage():
             review.append(test_dir / "relations.csv.review.html")
         else:
             _say("no test products in the split; relations come from train only")
-        seen, lines = set(), []
-        for part in parts:
-            for row in _rows(part):
-                key = frozenset(row[:2])
-                if key in seen:
-                    _stop(f"pair {row[:2]} appears in more than one partition's relations; not merging")
-                seen.add(key)
-                lines.append(",".join(row))
-        tmp = csv.with_name(csv.name + ".tmp")
-        tmp.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
-        os.replace(tmp, csv)
-        _say(f"wrote merged relations: {csv} ({len(lines)} pairs)")
+        rows = _merge_rows(parts)
+        _write_rows(csv, rows)
+        _say(f"wrote merged relations: {csv} ({len(rows)} pairs)")
     review = review or [p for p in (relations / "train" / "relations.csv.review.html", relations / "test" / "relations.csv.review.html")]
 
     # g. 사람이 확인할 파일
@@ -512,6 +563,34 @@ def _evaluation_problem(evaluation, checkpoint):
     return None if recorded == current else "it was made from a different checkpoint"
 
 
+def _target_epochs(args):
+    """TRAIN_ARGS 의 --epochs 값(약어 --epoch 도 허용). 없으면 psdl1.train 기본값 100. 읽을 수 없으면 None."""
+    value = 100
+    for i, arg in enumerate(args):
+        name = str(arg).split("=", 1)[0]
+        if name.startswith("--ep") and "--epochs".startswith(name):
+            raw = str(arg).split("=", 1)[1] if "=" in str(arg) else (str(args[i + 1]) if i + 1 < len(args) else "")
+            try:
+                value = int(raw)
+            except ValueError:
+                return None
+    return value
+
+
+def _report_epochs(checkpoint):
+    """평가 전에 체크포인트가 몇 epoch 까지 학습됐는지 남긴다. 목표(TRAIN_ARGS --epochs)보다 작으면 경고만 하고 멈추지 않는다."""
+    from psdl1.checkpoint import read_checkpoint
+    try:
+        done = int(read_checkpoint(checkpoint)["epoch"])
+    except Exception as exc:
+        _say(f"cannot read the epoch of {checkpoint}: {type(exc).__name__}: {exc}")
+        return
+    target = _target_epochs(TRAIN_ARGS)
+    _say(f"checkpoint {checkpoint} was trained for {done} epochs" + (f" (TRAIN_ARGS --epochs: {target})" if target is not None else ""))
+    if target is not None and done < target:
+        _say(f"WARNING: the checkpoint has {done} of {target} epochs (training may have stopped early); evaluating it anyway")
+
+
 def stage():
     work = Path(WORK)
     manifest, split_path, csv = work / "export" / "manifest.json", work / "inputs" / "split.json", work / "relations" / "relations.csv"
@@ -519,8 +598,9 @@ def stage():
     if missing:
         _stop("missing " + ", ".join(missing) + ". Run psdl1_assets.py first (same WORK)")
     reserved = ("--manifest", "--split", "--relations", "--out", "--weights", "--resume", "--ckpt")
-    for label, args in (("PRETRAIN_ARGS", PRETRAIN_ARGS), ("TRAIN_ARGS", TRAIN_ARGS), ("EVALUATE_ARGS", EVALUATE_ARGS)):
-        _check_reserved(label, args, reserved)
+    _check_reserved("PRETRAIN_ARGS", PRETRAIN_ARGS, reserved)
+    _check_reserved("TRAIN_ARGS", TRAIN_ARGS, reserved + ("--config",))  # psdl1.train --config JSON 은 resume/weights 를 줄 수 있다
+    _check_reserved("EVALUATE_ARGS", EVALUATE_ARGS, reserved)
     pdir, tdir = work / "pretrain", work / "train"
     checkpoint, evaluation = tdir / "dl1.pt", tdir / "evaluation.json"
     if EVALUATE_ONLY:
@@ -547,13 +627,15 @@ def stage():
         split = json.loads(split_path.read_text(encoding="utf-8"))
         if not split.get("test"):
             _say("skip evaluate (no test products in the split; evaluate uses only the test partition)")
-        elif evaluation.exists():
-            problem = _evaluation_problem(evaluation, checkpoint)
-            if problem:
-                _stop(f"{evaluation} does not match {checkpoint} ({problem}); not overwriting. Move it away and run again")
-            _skip("evaluate", evaluation)
         else:
-            _call("evaluate", ["--ckpt", checkpoint, "--manifest", manifest, "--split", split_path, "--relations", csv, "--out", evaluation, *EVALUATE_ARGS])
+            _report_epochs(checkpoint)
+            if evaluation.exists():
+                problem = _evaluation_problem(evaluation, checkpoint)
+                if problem:
+                    _stop(f"{evaluation} does not match {checkpoint} ({problem}); not overwriting. Move it away and run again")
+                _skip("evaluate", evaluation)
+            else:
+                _call("evaluate", ["--ckpt", checkpoint, "--manifest", manifest, "--split", split_path, "--relations", csv, "--out", evaluation, *EVALUATE_ARGS])
     _say(f"checkpoint: {checkpoint}")
 
 
