@@ -84,8 +84,9 @@ STACK_ORDER = None
 SPLIT_SEED = 0                          # 자동 split(계보 단위) 설정. WORK/inputs/split.json 이 있으면 다시 만들지 않고 재사용한다
 VALIDATION_FRACTION = 0.2
 TEST_FRACTION = 0.2
-SCREEN_PARTITIONS = ["train", "validation", "test"]   # relations 스크리닝 대상 구획
-SCREEN_ARGS = []                        # screen_relations 추가 인자. 예: ["--groups", "/data/groups.json", "--margin", "0.05"]
+# screen_relations 추가 인자. 예: ["--groups", "/data/groups.json", "--margin", "0.05"]. --out/--manifest/--split/--partitions 는 쓰지 않는다.
+# train 구획에 같은 계보 쌍이 없으면 ["--floor", "<값>"] 이 필요하다. 있으면 두 구획(train, test)에 같은 값을 쓴다.
+SCREEN_ARGS = []
 LOG_FILE = WORK + "/logs/assets.log"    # stdout/stderr(진행 줄)를 이 파일에도 남긴다. 필요 없으면 None
 WORK_DIR = None                         # 패키지를 풀 폴더. None이면 이 파일 옆, 쓸 수 없으면 임시 폴더
 # ============================== EDIT ABOVE ==============================================
@@ -93,13 +94,14 @@ WORK_DIR = None                         # 패키지를 풀 폴더. None이면 �
 
 HEAD_TRAIN = r'''# ============================== EDIT BELOW: 이 블록만 고치세요 ==============================
 # 3단계: (선택) 사전학습 -> 학습 -> (선택) 평가. psdl1_assets.py 가 만든 WORK 를 입력으로 쓴다.
-# --manifest/--split/--relations/--out/--weights 는 이 파일이 채운다. 아래 인자 리스트에는 나머지 옵션만 적는다.
+# --manifest/--split/--relations/--out/--weights/--resume/--ckpt 는 이 파일이 채운다. 아래 인자 리스트에는 나머지 옵션만 적는다.
 WORK = "/data/work"                     # psdl1_assets.py 와 같은 폴더
 PRETRAIN = False                        # True 면 backbone 사전학습을 먼저 하고 그 가중치로 학습한다
 PRETRAIN_ARGS = ["--backbone", "tiny", "--device", "cuda", "--batch-size", "2", "--epochs", "100"]
 TRAIN_ARGS = ["--backbone", "tiny", "--device", "cuda", "--batch-size", "2", "--epochs", "100"]
-EVALUATE = True                         # validation/test 제품이 있을 때만 평가한다
-EVALUATE_ARGS = ["--topk", "5"]
+EVALUATE = True                         # split 에 test 제품이 있을 때만 평가한다
+EVALUATE_ARGS = ["--topk", "5"]         # TRAIN_ARGS 에 --allow-grid-check-failure 를 넣었다면 여기에도 넣는다
+EVALUATE_ONLY = False                   # True 면 학습하지 않고 WORK/train/dl1.pt 를 평가만 한다(dl1.pt 가 있어야 한다)
 LOG_FILE = WORK + "/logs/train.log"     # stdout/stderr(진행 줄)를 이 파일에도 남긴다. 필요 없으면 None
 WORK_DIR = None                         # 패키지를 풀 폴더. None이면 이 파일 옆, 쓸 수 없으면 임시 폴더
 # ============================== EDIT ABOVE ==============================================
@@ -222,6 +224,27 @@ def _call(name, args):
     _say(f"done {name} in {time.time() - started:.0f}s")
 
 
+def _call_keeping_failed(name, args, out):
+    """_call 이 실패하면 출력 폴더를 <out>.failed-<시각> 으로 옮겨 증거를 보존하고, 다음 실행이 새로 만들게 한다."""
+    try:
+        _call(name, args)
+    except BaseException:
+        out = Path(out)
+        if out.exists():
+            moved = out.with_name(out.name + ".failed-" + time.strftime("%Y%m%d-%H%M%S"))
+            os.replace(out, moved)
+            _say(f"{name} failed; kept its output at {moved}")
+        raise
+
+
+def _check_reserved(label, args, flags):
+    """실행기가 채우는 인자가 EDIT 인자 리스트에 있으면(--flag=value 포함) 시작 전에 멈춘다."""
+    for arg in args:
+        flag = str(arg).split("=", 1)[0]
+        if flag in flags:
+            _stop(f"{label} must not contain {flag}: this file sets it itself")
+
+
 def _skip(step, path):
     _say(f"skip {step} (exists: {path})")
 
@@ -278,7 +301,7 @@ def stage():
     if out.exists():
         _skip("inspect", out)
     else:
-        _call("import_png", ["--root", PNG_ROOT, "--out", out, "--inspect-grids", *grids, *(["--no-preview"] if NO_PREVIEW else [])])
+        _call_keeping_failed("import_png", ["--root", PNG_ROOT, "--out", out, "--inspect-grids", *grids, *(["--no-preview"] if NO_PREVIEW else [])], out)
     preview = out / "preview.html"
     _say(f"check: {preview if preview.is_file() else out}")
     _say("pick the grid from the inspection result, then set GRID in psdl1_assets.py and run it")
@@ -293,24 +316,57 @@ if __name__ == "__main__":
 '''
 
 TAIL_ASSETS = r'''
-def _write_json_once(path, obj, what):
-    """파일이 없으면 쓰고, 같은 내용이면 재사용하고, 다르면 덮어쓰지 않고 멈춘다."""
+def _write_json_once(path, obj, what, replace=False):
+    """파일이 없으면 쓴다. 같으면 재사용한다. 다르면 replace(export 전)일 때만 덮어쓰고 로그에 남기고, 아니면 멈춘다."""
     new = json.loads(json.dumps(obj))
+    replaced = False
     if path.exists():
         try:
             old = json.loads(path.read_text(encoding="utf-8"))
         except ValueError:
             old = object()
-        if old != new:
+        if old == new:
+            _skip(what, path)
+            return
+        if not replace:
             _stop(f"{path} differs from {what} in the EDIT block; not overwriting. Restore the EDIT value, or move {path} "
                   f"and the dependent WORK/export folder away to start over.")
-        _skip(what, path)
-        return
+        replaced = True
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(new, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
-    _say(f"wrote {what}: {path}")
+    _say(f"{'replaced (no export yet)' if replaced else 'wrote'} {what}: {path}")
+
+
+def _floor_arg(args):
+    for i, arg in enumerate(args):
+        if str(arg) == "--floor" and i + 1 < len(args):
+            return str(args[i + 1])
+        if str(arg).startswith("--floor="):
+            return str(arg).split("=", 1)[1]
+    return None
+
+
+def _screen(manifest, split_path, part, out_dir, extra):
+    """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다."""
+    csv = out_dir / "relations.csv"
+    outputs = [csv, csv.with_name(csv.name + ".review.html"), csv.with_name(csv.name + ".summary.json")]
+    found = [p for p in outputs if p.exists()]
+    if len(found) == len(outputs):
+        _skip(f"screen_relations {part}", csv)
+    elif found:
+        _stop("screen_relations left partial output: " + ", ".join(str(p) for p in found) + f". Move {out_dir} away and run again")
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _call("screen_relations", ["--manifest", manifest, "--split", split_path, "--out", csv, "--partitions", part, *SCREEN_ARGS, *extra])
+    return json.loads(outputs[2].read_text(encoding="utf-8"))
+
+
+def _rows(path):
+    import csv as csv_module
+    with open(path, newline="", encoding="utf-8") as handle:
+        return [row for row in csv_module.reader(handle) if row]
 
 
 def _split(manifest, split_path):
@@ -335,6 +391,7 @@ def _split(manifest, split_path):
 
 
 def stage():
+    _check_reserved("SCREEN_ARGS", SCREEN_ARGS, ("--out", "--manifest", "--split", "--partitions"))
     _boot()
     work = Path(WORK)
     work.mkdir(parents=True, exist_ok=True)
@@ -343,21 +400,25 @@ def stage():
     manifest, split_path, grid_report = export / "manifest.json", inputs / "split.json", reports / "grid-report.json"
     csv = relations / "relations.csv"
 
-    # a. 입력 파일
-    _write_json_once(meta_path, METADATA, "METADATA")
+    # a. 입력 파일. export 가 끝나기 전에는 EDIT 값으로 바꿔 쓰고, 끝난 뒤에는 다르면 멈춘다.
+    exported = manifest.is_file()
+    _write_json_once(meta_path, METADATA, "METADATA", replace=not exported)
     if STACK_ORDER is not None:
-        _write_json_once(order_path, STACK_ORDER, "STACK_ORDER")
+        _write_json_once(order_path, STACK_ORDER, "STACK_ORDER", replace=not exported)
     elif order_path.exists():
-        _stop(f"STACK_ORDER is None but {order_path} exists; set STACK_ORDER to its content or move the file away")
+        if exported:
+            _stop(f"STACK_ORDER is None but {order_path} exists; set STACK_ORDER to its content or move the file away")
+        order_path.unlink()
+        _say(f"removed {order_path} (STACK_ORDER is None and there is no export yet)")
 
-    # b. export
-    if manifest.is_file():
+    # b. export. 실패하면 출력 폴더를 .failed-* 로 보존한다.
+    if exported:
         _skip("export", manifest)
     elif export.exists():
-        _stop(f"{export} exists without manifest.json (failed or partial export). Read its diagnostic report, fix the cause, move the folder away, and run again")
+        _stop(f"{export} exists without manifest.json (killed or partial export). Read its diagnostic report, fix the cause, move the folder away, and run again")
     else:
-        _call("import_png", ["--root", PNG_ROOT, "--out", export, "--export", "--metadata", meta_path, "--candidate-grid", GRID,
-                             *(["--stack-order", order_path] if STACK_ORDER is not None else []), *(["--no-preview"] if NO_PREVIEW else [])])
+        _call_keeping_failed("import_png", ["--root", PNG_ROOT, "--out", export, "--export", "--metadata", meta_path, "--candidate-grid", GRID,
+                                            *(["--stack-order", order_path] if STACK_ORDER is not None else []), *(["--no-preview"] if NO_PREVIEW else [])], export)
 
     # c. 묶음 검증(매번)
     _call("import_png", ["--verify-bundle", export])
@@ -365,28 +426,51 @@ def stage():
     # d. 격자 보고서
     reports.mkdir(parents=True, exist_ok=True)
     if grid_report.is_file():
+        try:
+            json.loads(grid_report.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            _stop(f"{grid_report} is not valid JSON ({exc}); move it away and run again")
         _skip("grid report", grid_report)
     else:
         _call("data", [manifest, "--report", grid_report])
 
     # e. 자동 split
     inputs.mkdir(parents=True, exist_ok=True)
-    _split(manifest, split_path)
+    split = _split(manifest, split_path)
 
-    # f. relations 초안과 검토 페이지
-    outputs = [csv, csv.with_name(csv.name + ".review.html"), csv.with_name(csv.name + ".summary.json")]
-    found = [p for p in outputs if p.exists()]
-    if len(found) == len(outputs):
-        _skip("screen_relations", csv)
-    elif found:
-        _stop("screen_relations left partial output: " + ", ".join(str(p) for p in found) + ". Move the relations folder away and run again")
+    # f. relations. held-out 이 train 기준값(floor)에 섞이지 않도록 train 과 test 를 따로 만들어 합친다.
+    review = []
+    if csv.is_file():
+        _skip("relations", csv)
     else:
-        relations.mkdir(parents=True, exist_ok=True)
-        _call("screen_relations", ["--manifest", manifest, "--split", split_path, "--out", csv, "--partitions", *SCREEN_PARTITIONS, *SCREEN_ARGS])
+        train_dir, test_dir = relations / "train", relations / "test"
+        train_summary = _screen(manifest, split_path, "train", train_dir, [])
+        parts = [train_dir / "relations.csv"]
+        review.append(train_dir / "relations.csv.review.html")
+        if split.get("test"):
+            floor = [] if _floor_arg(SCREEN_ARGS) is not None else ["--floor", repr(train_summary["floor"]["global"])]
+            _screen(manifest, split_path, "test", test_dir, floor)
+            parts.append(test_dir / "relations.csv")
+            review.append(test_dir / "relations.csv.review.html")
+        else:
+            _say("no test products in the split; relations come from train only")
+        seen, lines = set(), []
+        for part in parts:
+            for row in _rows(part):
+                key = frozenset(row[:2])
+                if key in seen:
+                    _stop(f"pair {row[:2]} appears in more than one partition's relations; not merging")
+                seen.add(key)
+                lines.append(",".join(row))
+        tmp = csv.with_name(csv.name + ".tmp")
+        tmp.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        os.replace(tmp, csv)
+        _say(f"wrote merged relations: {csv} ({len(lines)} pairs)")
+    review = review or [p for p in (relations / "train" / "relations.csv.review.html", relations / "test" / "relations.csv.review.html")]
 
     # g. 사람이 확인할 파일
     _say("check these files before training:")
-    for path in (export / "preview.html", split_path, outputs[1], grid_report):
+    for path in (export / "preview.html", split_path, *review, grid_report):
         if path.exists():
             _say(f"  {path}")
     _say("after checking, run psdl1_train.py")
@@ -417,38 +501,58 @@ def _pretrain_complete(pdir):
     return None
 
 
+def _evaluation_problem(evaluation, checkpoint):
+    """evaluation.json 이 현재 dl1.pt 의 평가면 None, 아니면 이유를 돌려준다."""
+    from psdl1.checkpoint import read_checkpoint
+    try:
+        recorded = json.loads(evaluation.read_text(encoding="utf-8"))["checkpoint_weights_hash"]
+        current = read_checkpoint(checkpoint)["weights_hash"]
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None if recorded == current else "it was made from a different checkpoint"
+
+
 def stage():
     work = Path(WORK)
     manifest, split_path, csv = work / "export" / "manifest.json", work / "inputs" / "split.json", work / "relations" / "relations.csv"
     missing = [str(p) for p in (manifest, split_path, csv) if not p.is_file()]
     if missing:
         _stop("missing " + ", ".join(missing) + ". Run psdl1_assets.py first (same WORK)")
+    reserved = ("--manifest", "--split", "--relations", "--out", "--weights", "--resume", "--ckpt")
+    for label, args in (("PRETRAIN_ARGS", PRETRAIN_ARGS), ("TRAIN_ARGS", TRAIN_ARGS), ("EVALUATE_ARGS", EVALUATE_ARGS)):
+        _check_reserved(label, args, reserved)
+    pdir, tdir = work / "pretrain", work / "train"
+    checkpoint, evaluation = tdir / "dl1.pt", tdir / "evaluation.json"
+    if EVALUATE_ONLY:
+        if not checkpoint.is_file():
+            _stop(f"EVALUATE_ONLY needs {checkpoint}; train first (EVALUATE_ONLY = False)")
+    elif checkpoint.exists():
+        _stop(f"{checkpoint} already exists; psdl1.train would overwrite it, so this file stops. To train again, move {tdir} to another name. "
+              f"To only evaluate this checkpoint, set EVALUATE_ONLY = True")
     _boot()
-    pdir, tdir, evaluation = work / "pretrain", work / "train", work / "reports" / "evaluation.json"
-    weights = []
-    if PRETRAIN:
-        if pdir.exists():
-            reason = _pretrain_complete(pdir)
-            if reason:
-                _stop(f"{pdir} exists but is not a completed pretraining ({reason}). Resume it with a JOBS-mode file "
-                      f"(pretrain --resume {pdir / 'pretrain.pt'}) or move the folder away")
-            _skip("pretrain", pdir / "pretrain.json")
-        else:
-            _call("pretrain", ["--manifest", manifest, "--split", split_path, "--out", pdir, *PRETRAIN_ARGS])
-        weights = ["--weights", pdir / "backbone.pt"]
-    checkpoint = tdir / "dl1.pt"
-    if checkpoint.exists():
-        _stop(f"{checkpoint} already exists; psdl1.train would overwrite it, so this file stops. To continue that run, use a JOBS-mode "
-              f"file (--out FILE) with train --resume {checkpoint} and a larger --epochs. To train again, move {tdir} away")
-    _call("train", ["--manifest", manifest, "--split", split_path, "--relations", csv, "--out", tdir, *weights, *TRAIN_ARGS])
-    if EVALUATE:
+    if not EVALUATE_ONLY:
+        weights = []
+        if PRETRAIN:
+            if pdir.exists():
+                reason = _pretrain_complete(pdir)
+                if reason:
+                    _stop(f"{pdir} exists but is not a completed pretraining ({reason}). Resume it with a JOBS-mode file "
+                          f"(pretrain --resume {pdir / 'pretrain.pt'}) or move the folder away")
+                _skip("pretrain", pdir / "pretrain.json")
+            else:
+                _call("pretrain", ["--manifest", manifest, "--split", split_path, "--out", pdir, *PRETRAIN_ARGS])
+            weights = ["--weights", pdir / "backbone.pt"]
+        _call("train", ["--manifest", manifest, "--split", split_path, "--relations", csv, "--out", tdir, *weights, *TRAIN_ARGS])
+    if EVALUATE or EVALUATE_ONLY:
         split = json.loads(split_path.read_text(encoding="utf-8"))
-        if not (split.get("validation") or split.get("test")):
-            _say("skip evaluate (no validation or test products in the split)")
-        elif evaluation.is_file():
+        if not split.get("test"):
+            _say("skip evaluate (no test products in the split; evaluate uses only the test partition)")
+        elif evaluation.exists():
+            problem = _evaluation_problem(evaluation, checkpoint)
+            if problem:
+                _stop(f"{evaluation} does not match {checkpoint} ({problem}); not overwriting. Move it away and run again")
             _skip("evaluate", evaluation)
         else:
-            evaluation.parent.mkdir(parents=True, exist_ok=True)
             _call("evaluate", ["--ckpt", checkpoint, "--manifest", manifest, "--split", split_path, "--relations", csv, "--out", evaluation, *EVALUATE_ARGS])
     _say(f"checkpoint: {checkpoint}")
 

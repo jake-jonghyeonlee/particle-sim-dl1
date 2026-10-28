@@ -702,7 +702,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 | `GRID_CANDIDATES` | 비교할 grid 후보 리스트 |
 | `NO_PREVIEW` | `True` 면 미리보기 이미지·HTML 을 만들지 않는다 |
 
-**psdl1_assets.py** — 순서: (a) `WORK/inputs/metadata.json`(`stack-order.json`) 쓰기 → (b) `import_png --export` → `WORK/export/` → (c) `import_png --verify-bundle`(매번) → (d) `data` 격자 보고서 `WORK/reports/grid-report.json` → (e) 자동 split `WORK/inputs/split.json`(계보 단위, 구획별 제품·계보 수를 로그에 출력) → (f) `screen_relations` → `WORK/relations/relations.csv`(+ `.review.html`, `.scores.csv`, `.summary.json`) → (g) 사람이 확인할 파일 경로 출력.
+**psdl1_assets.py** — 순서: (a) `WORK/inputs/metadata.json`(`stack-order.json`) 쓰기 → (b) `import_png --export` → `WORK/export/` → (c) `import_png --verify-bundle`(매번) → (d) `data` 격자 보고서 `WORK/reports/grid-report.json` → (e) 자동 split `WORK/inputs/split.json`(계보 단위, 구획별 제품·계보 수를 로그에 출력) → (f) `screen_relations` 을 구획별로 두 번 실행(train → `WORK/relations/train/`, split 에 test 제품이 있으면 test → `WORK/relations/test/`, 각각 `relations.csv`·`.review.html`·`.scores.csv`·`.summary.json`)하고 두 `relations.csv` 를 합쳐 `WORK/relations/relations.csv` 로 쓴다(쌍이 겹치면 멈춤) → (g) 사람이 확인할 파일 경로 출력.
 
 | 항목 | 뜻 |
 |---|---|
@@ -711,33 +711,37 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 | `METADATA` | 모델별 `lineage_id`·`design_version`(metadata JSON 내용) |
 | `STACK_ORDER` | 층 순서 dict 또는 `None`(`None` 이면 CNT 는 이미지로만 내보낸다) |
 | `SPLIT_SEED`, `VALIDATION_FRACTION`, `TEST_FRACTION` | 자동 split 설정(기본 0, 0.2, 0.2) |
-| `SCREEN_PARTITIONS` | relations 를 만들 구획(기본 train·validation·test) |
-| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`) |
+| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`). `--out`·`--manifest`·`--split`·`--partitions` 는 쓰지 않는다(쓰면 시작 전에 멈춤) |
 
-**psdl1_train.py** — 시작할 때 `WORK/export/manifest.json`, `WORK/inputs/split.json`, `WORK/relations/relations.csv` 가 없으면 "psdl1_assets.py 를 먼저 실행" 오류로 멈춘다. 순서: (a) `PRETRAIN` 이면 `pretrain` → `WORK/pretrain/` → (b) `WORK/train/dl1.pt` 가 있으면 멈춤 → (c) `train` → `WORK/train/`(사전학습했으면 `--weights WORK/pretrain/backbone.pt` 자동) → (d) `EVALUATE` 이고 split 에 validation 또는 test 제품이 있으면 `evaluate` → `WORK/reports/evaluation.json`(없으면 이유를 로그에 남기고 건너뜀).
+**psdl1_train.py** — 시작할 때 `WORK/export/manifest.json`, `WORK/inputs/split.json`, `WORK/relations/relations.csv` 가 없으면 "psdl1_assets.py 를 먼저 실행" 오류로 멈춘다. 순서: (a) `PRETRAIN` 이면 `pretrain` → `WORK/pretrain/` → (b) `WORK/train/dl1.pt` 가 있으면 멈춤(이 확인은 pretrain 보다 먼저 한다) → (c) `train` → `WORK/train/`(사전학습했으면 `--weights WORK/pretrain/backbone.pt` 자동) → (d) `EVALUATE` 이고 split 에 **test** 제품이 있으면 `evaluate` → `WORK/train/evaluation.json`(`evaluate` 는 test 구획만 쓴다. test 가 없으면 이유를 로그에 남기고 건너뜀). `WORK/train/` 을 옮기면 평가 결과도 함께 움직인다.
 
 | 항목 | 뜻 |
 |---|---|
 | `WORK` | assets 와 같은 폴더 |
 | `PRETRAIN`, `PRETRAIN_ARGS` | 사전학습 여부(기본 `False`)와 추가 인자 |
 | `TRAIN_ARGS` | 학습 옵션 리스트. 예: `["--backbone","tiny","--device","cuda","--batch-size","2","--epochs","100"]` |
-| `EVALUATE`, `EVALUATE_ARGS` | 평가 여부(기본 `True`)와 추가 인자 |
+| `EVALUATE`, `EVALUATE_ARGS` | 평가 여부(기본 `True`)와 추가 인자. `TRAIN_ARGS` 에 `--allow-grid-check-failure` 를 넣었다면 `EVALUATE_ARGS` 에도 넣는다 |
+| `EVALUATE_ONLY` | `True` 면 학습하지 않고 `WORK/train/dl1.pt`(있어야 함)를 평가만 한다. 기본 `False` |
 
-`--manifest`·`--split`·`--relations`·`--out`·`--weights` 는 실행기가 채우므로 인자 리스트에 쓰지 않는다. `LOG_FILE` 기본값은 `WORK/logs/<단계>.log`, `WORK_DIR` 은 위와 같다(`None` 이면 패키지를 파일 옆에 푼다).
+`--manifest`·`--split`·`--relations`·`--out`·`--weights`·`--resume`·`--ckpt` 는 실행기가 채우므로 `PRETRAIN_ARGS`·`TRAIN_ARGS`·`EVALUATE_ARGS` 에 쓰지 않는다(`--flag=value` 형태도 시작 전에 멈춘다). `LOG_FILE` 기본값은 `WORK/logs/<단계>.log`, `WORK_DIR` 은 위와 같다(`None` 이면 패키지를 파일 옆에 푼다).
 
 **다시 실행하면**
 - 끝난 단계는 건너뛰고 로그에 `[psdl1_job] <시각> skip <단계> (exists: <경로>)` 를 남긴다. `import_png --verify-bundle` 은 매번 실행한다.
-- `METADATA`·`STACK_ORDER` 를 바꿨는데 저장된 JSON 과 다르면 덮어쓰지 않고 0 아닌 코드로 멈춘다. 바꾸려면 `WORK/inputs/` 의 해당 파일과 `WORK/export/` 를 직접 옮긴 뒤 다시 실행한다.
-- `WORK/export/` 가 `manifest.json` 없이 있으면(실패한 export) 멈춘다. 진단 보고서를 읽고 폴더를 옮긴 뒤 다시 실행한다. `relations/` 에 일부 파일만 있어도 멈춘다.
+- export 가 끝나기 전(`WORK/export/manifest.json` 없음)에는 `METADATA`·`STACK_ORDER` 가 저장된 JSON 과 달라도 EDIT 값으로 바꿔 쓰고 로그에 남긴다. export 가 끝난 뒤에 다르면 덮어쓰지 않고 0 아닌 코드로 멈춘다. 바꾸려면 `WORK/inputs/` 의 해당 파일과 `WORK/export/` 를 직접 옮긴 뒤 다시 실행한다.
+- `import_png` 가 실패하면(inspect 의 출력 폴더, assets 의 `WORK/export/`) 그 폴더를 `<폴더>.failed-<YYYYmmdd-HHMMSS>` 로 옮겨 진단 근거를 보존하고 경로를 로그에 남긴 뒤 멈춘다. 다음 실행은 새로 만든다. 프로세스가 강제 종료되어 `manifest.json` 없는 `WORK/export/` 가 남았으면 멈춘다. 폴더를 직접 옮긴 뒤 다시 실행한다. `relations/train`·`relations/test` 에 일부 파일만 있어도 멈춘다.
+- `reports/grid-report.json` 이 있으면 JSON 으로 파싱되는지 확인하고 깨졌으면 멈춘다.
 - `split.json` 이 있으면 다시 만들지 않고 재사용한다(제품과 맞는지 검증한다). 직접 쓴 split 을 넣어 두어도 된다.
 - `WORK/pretrain/` 은 `pretrain.json` 과 가중치 해시가 맞을 때만 끝난 것으로 본다. 중단된 결과면 멈추고 JOBS 방식의 `pretrain --resume` 을 안내한다.
-- `WORK/train/dl1.pt` 가 있으면 **덮어쓰지 않고 멈춘다**(`psdl1.train` 은 출력 폴더가 있어도 덮어쓰기 때문이다). 이어서 하려면 `--out FILE` 방식(JOBS)으로 `train --resume <dl1.pt>` 를 쓰고 `--epochs` 를 더 크게 준다. 새로 학습하려면 `WORK/train/` 을 직접 옮긴다.
+- `WORK/train/dl1.pt` 가 있으면 **덮어쓰지 않고 멈춘다**(`psdl1.train` 은 출력 폴더가 있어도 덮어쓰기 때문이다). 새로 학습하려면 `WORK/train/` 을 다른 이름으로 옮긴다. 이미 학습한 체크포인트를 평가만 하려면 `EVALUATE_ONLY = True` 로 둔다.
+- `WORK/train/evaluation.json` 이 있으면 안의 `checkpoint_weights_hash` 가 현재 `dl1.pt` 와 같을 때만 건너뛴다. 다르거나 깨졌으면 덮어쓰지 않고 멈춘다.
 
 **학습 전에 사람이 확인할 파일** (assets 가 마지막에 경로를 출력한다)
 - `WORK/export/preview.html` — export 미리보기(`NO_PREVIEW=False` 일 때)
 - `WORK/inputs/split.json` — 자동 split 결과
-- `WORK/relations/relations.csv.review.html` — 애매한 쌍 검토. 고친 `relations.csv` 를 쓰려면 그 파일을 직접 수정한 뒤 train 을 실행한다
+- `WORK/relations/train/relations.csv.review.html`, `WORK/relations/test/relations.csv.review.html`(test 제품이 있을 때) — 애매한 쌍 검토. 고친 relations 를 쓰려면 합친 `WORK/relations/relations.csv` 를 직접 수정한 뒤 train 을 실행한다
 - `WORK/reports/grid-report.json` — 격자 보고서(얇은 선 경고)
+
+**relations 기준값**: held-out(test)이 train 라벨의 기준(floor)에 섞이지 않도록 train 구획의 global floor 를 먼저 구하고, test 구획은 그 값을 `--floor` 로 받아 판정한다. `--groups` 를 쓰면 group 별 floor 는 train 안에서만 쓰이고 test 로 넘어가지 않는다(`--floor` 를 주면 `screen_relations` 가 group floor 를 계산하지 않는다). train 구획에 같은 계보 쌍이 없으면 `SCREEN_ARGS` 에 `--floor <값>` 이 필요하다. `SCREEN_ARGS` 에 `--floor` 가 있으면 두 구획에 같은 값을 쓴다. validation 은 train·evaluate 가 쓰지 않으므로 스크리닝하지 않는다.
 
 학습 파일은 CUDA 를 확인하지 않는다. 얇은 선 경고를 승인했다면 `TRAIN_ARGS` 에 `"--allow-grid-check-failure"` 를 넣는다.
 

@@ -131,13 +131,13 @@ def run_script(script, cwd):
 
 def assets_values(png, work, **overrides):
     values = dict(PNG_ROOT=str(png), WORK=str(work), GRID=128, NO_PREVIEW=False, METADATA=METADATA, STACK_ORDER=STACK_ORDER, SPLIT_SEED=0,
-                  VALIDATION_FRACTION=0.2, TEST_FRACTION=0.2, SCREEN_PARTITIONS=["train", "validation", "test"], SCREEN_ARGS=["--floor", "2"])
+                  VALIDATION_FRACTION=0.2, TEST_FRACTION=0.2, SCREEN_ARGS=["--floor", "2"])
     return {**values, **overrides}
 
 
 def train_values(work, **overrides):
     values = dict(WORK=str(work), PRETRAIN=False, PRETRAIN_ARGS=[], TRAIN_ARGS=["--backbone", "tiny", "--epochs", "1", "--batch-size", "2", "--allow-grid-check-failure"],
-                  EVALUATE=True, EVALUATE_ARGS=[])
+                  EVALUATE=True, EVALUATE_ARGS=[], EVALUATE_ONLY=False)
     return {**values, **overrides}
 
 
@@ -237,8 +237,10 @@ def test_assets_produces_every_file_without_inspect(assets_done):
     validate_split(products, split)
     assert json.loads((work / "inputs" / "metadata.json").read_text(encoding="utf-8")) == METADATA
     assert json.loads((work / "inputs" / "stack-order.json").read_text(encoding="utf-8")) == STACK_ORDER
-    assert (work / "reports" / "grid-report.json").is_file() and (work / "relations" / "relations.csv").read_text(encoding="utf-8").strip().endswith("different")
-    assert all((work / "relations" / f"relations.csv{suffix}").is_file() for suffix in (".review.html", ".scores.csv", ".summary.json"))
+    rows = (work / "relations" / "relations.csv").read_text(encoding="utf-8").split()
+    assert (work / "reports" / "grid-report.json").is_file() and [r.rsplit(",", 1)[1] for r in rows] == ["different"]
+    assert all((work / "relations" / "train" / f"relations.csv{suffix}").is_file() for suffix in (".review.html", ".scores.csv", ".summary.json"))
+    assert not (work / "relations" / "test").exists()  # no test products in this split
     text = (work / "logs" / "stage.log").read_text(encoding="utf-8")
     assert "split train: 2 products, 2 lineages" in text and "check these files before training" in text and "relations.csv.review.html" in text
 
@@ -254,7 +256,7 @@ def test_assets_second_run_skips_everything_except_verify(assets_done, tmp_path)
     starts = [line.split("start ", 1)[1].split()[0:2] for line in second.splitlines() if "] " in line and " start " in line]
     assert starts == [["import_png", "--verify-bundle"]]  # the only job that runs again
     kinds = " ".join(skips(second))
-    for step in ("METADATA", "STACK_ORDER", "export", "grid report", "split", "screen_relations"):
+    for step in ("METADATA", "STACK_ORDER", "export", "grid report", "split", "relations"):
         assert f"skip {step} (exists:" in kinds
     assert snapshot == {p: sha256(p) for p in work.rglob("*") if p.is_file() and p.parent.name != "logs"}
 
@@ -281,10 +283,10 @@ def test_train_runs_after_assets_then_refuses_to_overwrite_the_checkpoint(stages
     result = run_script(script, tmp_path)
     assert result.returncode == 0, result.stderr[-3000:]
     checkpoint = work / "train" / "dl1.pt"
-    assert checkpoint.is_file() and "skip evaluate (no validation or test products" in result.stderr
+    assert checkpoint.is_file() and "skip evaluate (no test products" in result.stderr
     digest = sha256(checkpoint)
     again = run_script(script, tmp_path)
-    assert again.returncode != 0 and "already exists" in again.stderr and "--resume" in again.stderr
+    assert again.returncode != 0 and "already exists" in again.stderr and "EVALUATE_ONLY" in again.stderr and "--resume" not in again.stderr
     assert sha256(checkpoint) == digest
 
 
@@ -313,11 +315,100 @@ def test_train_file_pretrains_trains_evaluates_and_skips_finished_steps(stages, 
                                                                              TRAIN_ARGS=["--backbone", "tiny", "--epochs", "1", "--batch-size", "4"]))
     result = run_script(script, tmp_path)
     assert result.returncode == 0, result.stderr[-3000:]
-    assert (work / "pretrain" / "pretrain.json").is_file() and (work / "train" / "dl1.pt").is_file() and (work / "reports" / "evaluation.json").is_file()
+    assert (work / "pretrain" / "pretrain.json").is_file() and (work / "train" / "dl1.pt").is_file() and (work / "train" / "evaluation.json").is_file()
     saved = __import__("torch").load(work / "train" / "dl1.pt", map_location="cpu", weights_only=True)
     assert saved["metadata"]["initial_weights_hash"] is not None  # the pretrained backbone was used
-    (work / "train" / "dl1.pt").unlink()  # train again; pretrain and evaluate are already finished
-    again = run_script(script, tmp_path)
-    assert again.returncode == 0, again.stderr[-3000:]
-    kinds = " ".join(skips(again.stderr))
-    assert "skip pretrain (exists:" in kinds and "skip evaluate (exists:" in kinds
+    again = run_script(script, tmp_path)  # dl1.pt exists: stops before pretrain/train
+    assert again.returncode != 0 and "already exists" in again.stderr and "start pretrain" not in again.stderr
+    only = stage_script(stages, "psdl1_train.py", tmp_path / "only", **train_values(work, PRETRAIN=True, EVALUATE_ONLY=True)) if (tmp_path / "only").mkdir() is None else None
+    done = run_script(only, tmp_path)
+    assert done.returncode == 0, done.stderr[-3000:]
+    assert "skip evaluate (exists:" in " ".join(skips(done.stderr)) and "start train" not in done.stderr and "start pretrain" not in done.stderr
+    evaluation = work / "train" / "evaluation.json"
+    document = json.loads(evaluation.read_text(encoding="utf-8"))
+    document["checkpoint_weights_hash"] = "0" * 64
+    evaluation.write_text(json.dumps(document))
+    stale = sha256(evaluation)
+    refused = run_script(only, tmp_path)
+    assert refused.returncode != 0 and "does not match" in refused.stderr and sha256(evaluation) == stale
+    evaluation.unlink()
+    fresh = run_script(only, tmp_path)  # EVALUATE_ONLY runs only evaluate
+    assert fresh.returncode == 0 and "start evaluate" in fresh.stderr and "start train" not in fresh.stderr and evaluation.is_file()
+
+
+def test_evaluate_only_needs_a_checkpoint(stages, tmp_path):
+    work = tmp_path / "work"
+    for rel in ("export/manifest.json", "inputs/split.json", "relations/relations.csv"):
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text("x")
+    script = stage_script(stages, "psdl1_train.py", tmp_path, **train_values(work, EVALUATE_ONLY=True))
+    result = run_script(script, tmp_path)
+    assert result.returncode != 0 and "EVALUATE_ONLY needs" in result.stderr
+
+
+@pytest.mark.parametrize("name,key,args", [("psdl1_train.py", "TRAIN_ARGS", ["--out", "x"]), ("psdl1_train.py", "PRETRAIN_ARGS", ["--manifest=x"]),
+                                          ("psdl1_train.py", "EVALUATE_ARGS", ["--ckpt", "x"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--partitions=train"])])
+def test_reserved_arguments_stop_before_anything_starts(stages, assets_done, tmp_path, name, key, args):
+    _, _, work = assets_done
+    values = assets_values(tmp_path / "no-png", tmp_path / "w") if name == "psdl1_assets.py" else train_values(work)
+    values[key] = args
+    result = run_script(stage_script(stages, name, tmp_path, **values), tmp_path)
+    assert result.returncode != 0 and "must not contain" in result.stderr and " start " not in result.stderr
+
+
+def test_checkpoint_present_stops_before_pretrain(stages, tmp_path):
+    work = tmp_path / "work"
+    for rel in ("export/manifest.json", "inputs/split.json", "relations/relations.csv", "train/dl1.pt"):
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text("x")
+    result = run_script(stage_script(stages, "psdl1_train.py", tmp_path, **train_values(work, PRETRAIN=True)), tmp_path)
+    assert result.returncode != 0 and "already exists" in result.stderr and not (work / "pretrain").exists() and "start pretrain" not in result.stderr
+
+
+def test_failed_inspect_is_kept_aside_and_the_next_run_starts_fresh(stages, png_source, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    work = tmp_path / "work"
+    failing = stage_script(stages, "psdl1_inspect.py", tmp_path / "a", PNG_ROOT=str(empty), WORK=str(work), GRID_CANDIDATES=[64], NO_PREVIEW=True) if (tmp_path / "a").mkdir() is None else None
+    assert run_script(failing, tmp_path).returncode != 0
+    kept = [p.name for p in work.iterdir() if p.name.startswith("inspect-g64.failed-")]
+    assert len(kept) == 1 and not (work / "inspect-g64").exists()
+    good = stage_script(stages, "psdl1_inspect.py", tmp_path / "b", PNG_ROOT=str(png_source), WORK=str(work), GRID_CANDIDATES=[64], NO_PREVIEW=True) if (tmp_path / "b").mkdir() is None else None
+    result = run_script(good, tmp_path)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert (work / "inspect-g64").is_dir() and "skip inspect" not in result.stderr
+
+
+def test_failed_export_is_kept_aside_and_stale_inputs_are_replaced_before_export(stages, png_source, tmp_path):
+    work = tmp_path / "work"
+    bad = {"metadata_schema_version": "dl1_png_metadata_v1", "models": {"NO-SUCH-MODEL": {"lineage_id": "L", "design_version": "V"}}}
+    failing = stage_script(stages, "psdl1_assets.py", tmp_path / "a", **assets_values(png_source, work, METADATA=bad)) if (tmp_path / "a").mkdir() is None else None
+    assert run_script(failing, tmp_path).returncode != 0
+    assert [p.name for p in work.iterdir() if p.name.startswith("export.failed-")] and not (work / "export").exists()
+    good = stage_script(stages, "psdl1_assets.py", tmp_path / "b", **assets_values(png_source, work, NO_PREVIEW=True)) if (tmp_path / "b").mkdir() is None else None
+    result = run_script(good, tmp_path)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "replaced (no export yet) METADATA" in result.stderr
+    assert json.loads((work / "inputs" / "metadata.json").read_text(encoding="utf-8")) == METADATA
+
+
+def test_relations_are_screened_per_partition_with_the_train_floor(stages, tmp_path):
+    png = tmp_path / "png"
+    names = ["W1", "W2", "W3", "W4"]
+    for name in names:
+        write_wide_import_fixture(png, model=name)
+    metadata = {"metadata_schema_version": "dl1_png_metadata_v1", "models": {
+        n: {"lineage_id": "F1" if n in ("W1", "W2") else "F2", "design_version": "V1"} for n in names}}
+    work = tmp_path / "work"
+    (work / "inputs").mkdir(parents=True)
+    split = {"schema_version": SPLIT_VERSION, "train": ["W1", "W2"], "validation": [], "test": ["W3", "W4"]}
+    (work / "inputs" / "split.json").write_text(json.dumps(split))
+    script = stage_script(stages, "psdl1_assets.py", tmp_path, **assets_values(png, work, METADATA=metadata, NO_PREVIEW=True, SCREEN_ARGS=[]))
+    result = run_script(script, tmp_path)
+    assert result.returncode == 0, result.stderr[-3000:]
+    train = json.loads((work / "relations" / "train" / "relations.csv.summary.json").read_text(encoding="utf-8"))
+    test = json.loads((work / "relations" / "test" / "relations.csv.summary.json").read_text(encoding="utf-8"))
+    assert test["floor"]["global"] == train["floor"]["global"]  # the held-out partition is judged by the train floor
+    rows = [line.split(",") for line in (work / "relations" / "relations.csv").read_text(encoding="utf-8").split()]
+    assert sorted(r[2] for r in rows) == ["similar", "similar"] and {frozenset(r[:2]) for r in rows} == {frozenset(("W1", "W2")), frozenset(("W3", "W4"))}
+    assert (work / "relations" / "test" / "relations.csv.review.html").is_file() and "relations/test/relations.csv.review.html" in result.stderr
