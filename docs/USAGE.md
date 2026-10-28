@@ -678,6 +678,68 @@ Windows (명령 프롬프트):
 - 작업 이름은 `train`, `pretrain`, `screen_relations`, `evaluate`, `embed_plot`, `search`, `import_png`, `data`, `relations_draft`이다. 인자는 명령줄에서 쓰던 그대로 문자열 리스트로 적고, 경로는 서버 기준 절대 경로를 권장한다.
 - 실행하면 패키지를 `.psdl1_pkg_<해시>/psdl1/`에 바이트 그대로 풀고(`code_hash`가 저장소와 같음) 그 복사본을 먼저 import한다. 서버에 다른 `psdl1`이 설치돼 있어도 묶음 쪽이 우선하고, 로그 첫 줄에 어느 `psdl1`을 쓰는지 적힌다. 서버에는 torch, numpy, Pillow(timm은 timm 백본을 쓸 때만)가 있어야 한다.
 - 데이터(manifest, NPY, `split.json`, `relations.csv`, `backbone.pt`)는 `.py`가 아니므로 서버에 이미 있어야 한다. 소스를 고치면 묶음을 다시 만들어서 올린다(같은 소스면 같은 파일이 나온다).
+- 실행기는 각 작업 `main()` 의 반환값을 검사한다. `None`·`0` 이 아니면 `[psdl1_job] … exited with <코드>` 를 로그에 남기고 같은 코드로 멈춘다(예: `import_png` 는 실패 시 `2` 를 반환한다). 뒤의 작업은 시작하지 않는다.
+
+#### 단계별 파일 (`--out-dir`)
+
+PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 각 파일은 같은 소스를 담은 자체 완결 파일이고, 모든 출력은 `WORK` 아래에 생긴다.
+
+```bash
+.venv/bin/python scripts/build_single_file.py --out-dir outputs/etx [--overwrite]
+# outputs/etx/psdl1_inspect.py, psdl1_assets.py, psdl1_train.py
+```
+
+- grid 를 모를 때: `psdl1_inspect.py` → (결과를 보고 grid 결정) → `psdl1_assets.py` → `psdl1_train.py`
+- grid 를 알 때: `psdl1_assets.py` → `psdl1_train.py`
+- 파일 맨 위 `EDIT BELOW` ~ `EDIT ABOVE` 블록만 고친다. 출력 폴더나 파일이 이미 있으면 덮어쓰지 않는다(`--overwrite` 는 빌드 결과 파일에만 해당).
+
+**psdl1_inspect.py** — `import_png --inspect-grids` 를 후보 grid 로 한 번 실행한다. 출력은 `WORK/inspect-g<g1>-<g2>…/`(미리보기는 `preview.html`)다.
+
+| 항목 | 뜻 |
+|---|---|
+| `PNG_ROOT` | 모델별 PNG 폴더가 든 입력 폴더 |
+| `WORK` | 모든 출력 폴더(쓸 수 있어야 한다) |
+| `GRID_CANDIDATES` | 비교할 grid 후보 리스트 |
+| `NO_PREVIEW` | `True` 면 미리보기 이미지·HTML 을 만들지 않는다 |
+
+**psdl1_assets.py** — 순서: (a) `WORK/inputs/metadata.json`(`stack-order.json`) 쓰기 → (b) `import_png --export` → `WORK/export/` → (c) `import_png --verify-bundle`(매번) → (d) `data` 격자 보고서 `WORK/reports/grid-report.json` → (e) 자동 split `WORK/inputs/split.json`(계보 단위, 구획별 제품·계보 수를 로그에 출력) → (f) `screen_relations` → `WORK/relations/relations.csv`(+ `.review.html`, `.scores.csv`, `.summary.json`) → (g) 사람이 확인할 파일 경로 출력.
+
+| 항목 | 뜻 |
+|---|---|
+| `PNG_ROOT`, `WORK`, `NO_PREVIEW` | inspect 와 같다 |
+| `GRID` | candidate grid |
+| `METADATA` | 모델별 `lineage_id`·`design_version`(metadata JSON 내용) |
+| `STACK_ORDER` | 층 순서 dict 또는 `None`(`None` 이면 CNT 는 이미지로만 내보낸다) |
+| `SPLIT_SEED`, `VALIDATION_FRACTION`, `TEST_FRACTION` | 자동 split 설정(기본 0, 0.2, 0.2) |
+| `SCREEN_PARTITIONS` | relations 를 만들 구획(기본 train·validation·test) |
+| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`) |
+
+**psdl1_train.py** — 시작할 때 `WORK/export/manifest.json`, `WORK/inputs/split.json`, `WORK/relations/relations.csv` 가 없으면 "psdl1_assets.py 를 먼저 실행" 오류로 멈춘다. 순서: (a) `PRETRAIN` 이면 `pretrain` → `WORK/pretrain/` → (b) `WORK/train/dl1.pt` 가 있으면 멈춤 → (c) `train` → `WORK/train/`(사전학습했으면 `--weights WORK/pretrain/backbone.pt` 자동) → (d) `EVALUATE` 이고 split 에 validation 또는 test 제품이 있으면 `evaluate` → `WORK/reports/evaluation.json`(없으면 이유를 로그에 남기고 건너뜀).
+
+| 항목 | 뜻 |
+|---|---|
+| `WORK` | assets 와 같은 폴더 |
+| `PRETRAIN`, `PRETRAIN_ARGS` | 사전학습 여부(기본 `False`)와 추가 인자 |
+| `TRAIN_ARGS` | 학습 옵션 리스트. 예: `["--backbone","tiny","--device","cuda","--batch-size","2","--epochs","100"]` |
+| `EVALUATE`, `EVALUATE_ARGS` | 평가 여부(기본 `True`)와 추가 인자 |
+
+`--manifest`·`--split`·`--relations`·`--out`·`--weights` 는 실행기가 채우므로 인자 리스트에 쓰지 않는다. `LOG_FILE` 기본값은 `WORK/logs/<단계>.log`, `WORK_DIR` 은 위와 같다(`None` 이면 패키지를 파일 옆에 푼다).
+
+**다시 실행하면**
+- 끝난 단계는 건너뛰고 로그에 `[psdl1_job] <시각> skip <단계> (exists: <경로>)` 를 남긴다. `import_png --verify-bundle` 은 매번 실행한다.
+- `METADATA`·`STACK_ORDER` 를 바꿨는데 저장된 JSON 과 다르면 덮어쓰지 않고 0 아닌 코드로 멈춘다. 바꾸려면 `WORK/inputs/` 의 해당 파일과 `WORK/export/` 를 직접 옮긴 뒤 다시 실행한다.
+- `WORK/export/` 가 `manifest.json` 없이 있으면(실패한 export) 멈춘다. 진단 보고서를 읽고 폴더를 옮긴 뒤 다시 실행한다. `relations/` 에 일부 파일만 있어도 멈춘다.
+- `split.json` 이 있으면 다시 만들지 않고 재사용한다(제품과 맞는지 검증한다). 직접 쓴 split 을 넣어 두어도 된다.
+- `WORK/pretrain/` 은 `pretrain.json` 과 가중치 해시가 맞을 때만 끝난 것으로 본다. 중단된 결과면 멈추고 JOBS 방식의 `pretrain --resume` 을 안내한다.
+- `WORK/train/dl1.pt` 가 있으면 **덮어쓰지 않고 멈춘다**(`psdl1.train` 은 출력 폴더가 있어도 덮어쓰기 때문이다). 이어서 하려면 `--out FILE` 방식(JOBS)으로 `train --resume <dl1.pt>` 를 쓰고 `--epochs` 를 더 크게 준다. 새로 학습하려면 `WORK/train/` 을 직접 옮긴다.
+
+**학습 전에 사람이 확인할 파일** (assets 가 마지막에 경로를 출력한다)
+- `WORK/export/preview.html` — export 미리보기(`NO_PREVIEW=False` 일 때)
+- `WORK/inputs/split.json` — 자동 split 결과
+- `WORK/relations/relations.csv.review.html` — 애매한 쌍 검토. 고친 `relations.csv` 를 쓰려면 그 파일을 직접 수정한 뒤 train 을 실행한다
+- `WORK/reports/grid-report.json` — 격자 보고서(얇은 선 경고)
+
+학습 파일은 CUDA 를 확인하지 않는다. 얇은 선 경고를 승인했다면 `TRAIN_ARGS` 에 `"--allow-grid-check-failure"` 를 넣는다.
 
 ## 7. 출력 형식
 
