@@ -187,5 +187,82 @@ def test_alignment_problems_put_a_pair_on_the_review_list(case, monkeypatch):
     assert result["summary"]["review"]["by_reason"]["low_overlap"] == len(result["pairs"])
 
 
+def incremental_inputs(root, split, *, rows=("BUS_R00,BUS_T00,similar\n", "BUS_R00,RING_R00,different\n"), floor=0.9):
+    """train: COMB_T00 is new (3 old); test: RING_T00 is new (1 old)."""
+    base_split = {**split, "train": ["BUS_R00", "BUS_T00", "COMB_R00"], "validation": [], "test": ["RING_R00"]}
+    base_split_path, base_relations, floor_json = root / "base-split.json", root / "base-relations.csv", root / "floor.json"
+    base_split_path.write_text(json.dumps(base_split))
+    base_relations.write_text("".join(rows))
+    floor_json.write_text(json.dumps({"floor": {"global": floor, "per_group": {"x": 0.8}}}))
+    return base_split, base_split_path, base_relations, floor_json
+
+
+def test_incremental_screens_only_pairs_with_a_new_product(case):
+    manifest, split, root, _ = case
+    base_split, _, base_relations, floor_json = incremental_inputs(root, split)
+    from psdl1.screen_relations import load_floor_spec
+    result = screen(manifest, split, partitions=("train", "test"), factor=FACTOR, base_split=base_split, base_relations=base_relations, floor_spec=load_floor_spec(floor_json))
+    keys = {(p["product_a"], p["product_b"]) for p in result["pairs"]}
+    assert keys == {("BUS_R00", "COMB_T00"), ("BUS_T00", "COMB_T00"), ("COMB_R00", "COMB_T00"), ("RING_R00", "RING_T00")}  # no old x old pair
+    summary = result["summary"]
+    assert summary["mode"] == "incremental" and summary["new_products"] == {"train": ["COMB_T00"], "test": ["RING_T00"]}
+    assert summary["delta_pairs"] == summary["expected_delta_pairs"] == {"train": 3, "test": 1}
+    assert summary["base"]["pairs"] == 1 and summary["base"]["relations"] == str(base_relations)  # the BUS_R00/RING_R00 row crosses partitions and is ignored
+    assert len(summary["base"]["sha256"]) == 64
+
+
+def test_incremental_uses_the_fixed_floor_from_summary_and_outputs_only_delta_rows(case, capsys):
+    manifest, split, root, _ = case
+    _, base_split_path, base_relations, floor_json = incremental_inputs(root, split)
+    split_path, out = root / "split.json", root / "relations.csv"
+    split_path.write_text(json.dumps(split))
+    args = ["--manifest", str(manifest), "--split", str(split_path), "--out", str(out), "--factor", str(FACTOR), "--partitions", "train", "test",
+            "--base-split", str(base_split_path), "--base-relations", str(base_relations), "--floor-json", str(floor_json)]
+    main(args)
+    printed = json.loads(capsys.readouterr().out)
+    summary = json.loads(open(str(out) + ".summary.json", encoding="utf-8").read())
+    assert summary["floor"]["global"] == 0.9 and summary["floor"]["per_group"] == {} and summary["floor"]["source"] == "base_summary" == printed["floor"]["source"]
+    delta_rows = [tuple(r) for r in csv.reader(open(out, encoding="utf-8"))]
+    assert all("COMB_T00" in r[:2] or "RING_T00" in r[:2] for r in delta_rows) and ("COMB_R00", "COMB_T00", "similar") in delta_rows
+    assert not (root / "relations.csv.delta.csv").exists()
+    assert len(list(csv.DictReader(open(str(out) + ".scores.csv", encoding="utf-8")))) == 4
+    assert open(base_relations, encoding="utf-8").read() == "BUS_R00,BUS_T00,similar\nBUS_R00,RING_R00,different\n"  # the base file is never touched
+    with pytest.raises(SystemExit):
+        main([*args, "--floor", "0.5"])
+    with pytest.raises(SystemExit):
+        main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(root / "o2.csv"), "--base-split", str(base_split_path)])
+    with pytest.raises(ValueError, match="floor and floor_spec"):
+        screen(manifest, split, factor=FACTOR, floor=0.5, floor_spec={"global": 0.9, "groups": {}})
+
+
+@pytest.mark.parametrize("rows,mismatch,message", [
+    (("BUS_R00,NOPE,similar\n",), None, "not in the manifest"),
+    (("BUS_R00,BUS_T00,similar\n", "BUS_T00,BUS_R00,different\n"), None, "conflicting"),
+    (("COMB_R00,COMB_T00,different\n",), None, "contradicts"),
+    (("COMB_T00,COMB_R00,similar\n",), None, "duplicates"),
+    ((), {"train": ["BUS_R00", "BUS_T00", "COMB_R00", "RING_R00"]}, "left the partition"),
+    ((), {"train": ["BUS_R00", "GHOST"]}, "not in the manifest"),
+])
+def test_incremental_rejects_conflicts(case, rows, mismatch, message):
+    manifest, split, root, _ = case
+    base_split, _, base_relations, _ = incremental_inputs(root, split, rows=rows)
+    with pytest.raises(ValueError, match=message):
+        screen(manifest, split, partitions=("train", "test"), factor=FACTOR, floor=0.9, base_relations=base_relations, base_split={**base_split, **(mismatch or {})})
+
+
+def test_incremental_ignores_rows_of_other_partitions_and_non_incremental_output_is_unchanged(case, tmp_path):
+    manifest, split, root, _ = case
+    base_split, _, with_noise, _ = incremental_inputs(root, split, rows=("RING_R00,RING_T00,similar\n", "BUS_R00,RING_R00,different\n", "BUS_R00,BUS_T00,similar\n"))
+    only_train = screen(manifest, split, partitions=("train",), factor=FACTOR, floor=0.9, base_split=base_split, base_relations=with_noise)
+    assert only_train["summary"]["base"]["pairs"] == 1 and len(only_train["pairs"]) == 3  # the test-partition row is not used when only train is screened
+    split_path = root / "split.json"
+    split_path.write_text(json.dumps(split))
+    runs = []
+    for name in ("a", "b"):
+        main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(tmp_path / f"{name}.csv"), "--factor", str(FACTOR), "--margin", "0.0"])
+        runs.append([(tmp_path / f"{name}.csv{suffix}").read_bytes() for suffix in ("", ".scores.csv", ".summary.json")])
+    assert runs[0] == runs[1] and "mode" not in json.loads(runs[0][2])
+
+
 def test_auc_basics():
     assert auc([0.9, 0.8], [0.1, 0.2]) == 1.0 and auc([0.1], [0.9]) == 0.0 and auc([0.5], [0.5]) == 0.5 and auc([], [1]) is None

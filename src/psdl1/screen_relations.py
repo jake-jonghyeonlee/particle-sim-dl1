@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import html
 import io
 import json
@@ -209,8 +210,56 @@ def load_groups(path, product_ids, needed):
     return groups
 
 
+def load_floor_spec(path):
+    """이전 라운드의 summary.json에서 고정할 기준(floor.global, floor.per_group)을 읽는다. summary는 per_group, screen() 결과는 groups라는 키를 쓴다."""
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    floor = document.get("floor") if isinstance(document, dict) else None
+    number = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if not isinstance(floor, dict) or not number(floor.get("global")) or not isinstance(floor.get("per_group"), dict) \
+            or any(not isinstance(k, str) or not number(v) for k, v in floor["per_group"].items()):
+        raise ValueError(f"{path} is not a screening summary with floor.global and floor.per_group")
+    return {"global": float(floor["global"]), "groups": {k: float(v) for k, v in floor["per_group"].items()}}
+
+
+def read_base_relations(path, product_ids):
+    """합친 relations.csv를 읽는다(사용자가 손으로 고친 파일). 매니페스트에 없는 ID가 있으면 거부한다."""
+    raw = Path(path).read_bytes()
+    known, rows = set(product_ids), []
+    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline="")):
+        if len(row) != 3:
+            raise ValueError("base relations CSV requires product_a,product_b,similar|different")
+        a, b, kind = (v.strip() for v in row)
+        if kind not in {"similar", "different"}:
+            raise ValueError("base relation must be similar or different")
+        if a not in known or b not in known:
+            raise ValueError(f"base relation references a product not in the manifest: {sorted({a, b} - known)}")
+        rows.append((a, b, kind))
+    return rows, hashlib.sha256(raw).hexdigest()
+
+
+def base_old_sets(base_split, split, product_ids):
+    """구획마다 이전 라운드 제품(old). 매니페스트에 없거나 현재 구획에서 빠진 제품이 있으면 거부한다."""
+    if not isinstance(base_split, dict):
+        raise ValueError("base split must be a split manifest")
+    known, old_of = set(product_ids), {}
+    for part in PARTITIONS:
+        old = set(base_split.get(part, []))
+        if old - known:
+            raise ValueError(f"base split product not in the manifest: {sorted(old - known)[:10]}")
+        if old - set(split[part]):
+            raise ValueError(f"base split product left the partition {part}: {sorted(old - set(split[part]))[:10]}")
+        old_of[part] = old
+    return old_of
+
+
 def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
-           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15):
+           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None):
+    """base_split과 base_relations를 함께 주면 증분 모드: 새 제품이 낀 쌍(새×새, 새×기존)만 계산한다. floor_spec은 load_floor_spec() 결과다."""
+    if (base_split is None) != (base_relations is None):
+        raise ValueError("base_split and base_relations go together")
+    if floor is not None and floor_spec is not None:
+        raise ValueError("floor and floor_spec are exclusive")
+    incremental = base_split is not None
     if type(factor) is not int or factor <= 0 or type(tolerance) is not int or tolerance < 0 or not 0 <= margin < 1 or not 0 <= cross_group_fraction <= 1:
         raise ValueError("factor > 0, tolerance >= 0, margin in [0,1) and cross_group_fraction in [0,1] required")
     if anchor not in {"auto", CNT, "ELECTRODES"} or not 0 < max_shift <= 1 or type(candidates) is not int or candidates < 1:
@@ -221,6 +270,9 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     ids = [p["product_id"] for p in document["products"]]
     check_split_ids(split, ids)
     wanted = {pid for part in partitions for pid in split[part]}
+    if incremental:
+        old_of = base_old_sets(base_split, split, ids)
+        base_rows, base_sha = read_base_relations(base_relations, ids)
     group_of = {pid: "-" for pid in wanted} if groups is None else load_groups(groups, ids, wanted)
     stubs, signatures, lineage = [], {}, {}
     for product in _iter_manifest_products(manifest, grid=CHECK_GRID):  # 끝까지 읽어 manifest 전체를 검증한다
@@ -234,6 +286,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         names = sorted(split[part])
         for i, a in enumerate(names):
             for b in names[i + 1:]:
+                if incremental and a in old_of[part] and b in old_of[part]:
+                    continue  # 기존×기존 쌍은 이전 라운드 결과를 쓴다
                 result = compare(signatures[a], signatures[b], anchor=anchor, max_shift=max_shift, candidates=candidates, tolerance=tolerance)
                 pairs.append({"product_a": a, "product_b": b, "partition": part, "group_a": group_of[a], "group_b": group_of[b],
                               "lineage_a": lineage[a], "lineage_b": lineage[b], "same_lineage": lineage[a] == lineage[b], "result": result,
@@ -243,13 +297,15 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                               "alignment_score": None if result["anchor_score"] is None else round(result["anchor_score"], 4), "roi_overlap": round(float(result["roi_overlap"]), 4),
                               "alignment_flag": ";".join(result["flags"])})
     same = [p for p in pairs if p["same_lineage"]]
-    global_floor = floor if floor is not None else (min(p["similarity"] for p in same) if same else None)
+    global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (min(p["similarity"] for p in same) if same else None)
     if global_floor is None:
         raise ValueError("no same-lineage pair to calibrate with; pass an explicit --floor")
     group_floor = {}
+    if floor_spec is not None:
+        group_floor = {g: v for g, v in floor_spec["groups"].items() if g in set(group_of.values())}
     for g in sorted(set(group_of.values())):
         within = [p["similarity"] for p in same if p["group_a"] == g and p["group_b"] == g]
-        if floor is None and len(within) >= min_group_pairs:
+        if floor is None and floor_spec is None and len(within) >= min_group_pairs:
             group_floor[g] = min(within)
     for p in pairs:
         p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
@@ -278,11 +334,32 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         if p["tier"] == "different" and p["similarity"] >= p["floor"] - margin - review_band:
             p["review"].append("different_near_boundary")
         p["review"] += [f for f in p["alignment_flag"].split(";") if f in {"ambiguous_alignment", "alignment_unreliable", "low_overlap", "no_anchor"}]
-    return {"pairs": pairs, "signatures": signatures, "floor": {"global": global_floor, "groups": group_floor, "margin": margin},
-            "summary": summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin)}
+    floor_info = {"global": global_floor, "groups": group_floor, "margin": margin}
+    if floor_spec is not None:
+        floor_info["source"] = "base_summary"
+    if not incremental:
+        summary = summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin)
+    else:
+        # 판정에는 두 ID가 모두 같은 구획의 기존 제품인 행만 쓴다. 다른 구획·구획을 넘는 행은 무시한다(거부하지 않는다).
+        used = [(a, b, k, part) for a, b, k in base_rows for part in partitions if a in old_of[part] and b in old_of[part]]
+        validate_relations({frozenset((a, b)) for a, b, k, _ in used if k == "similar"}, {frozenset((a, b)) for a, b, k, _ in used if k == "different"})
+        delta = {frozenset((p["product_a"], p["product_b"])): p["tier"] for p in pairs}
+        for a, b, kind in base_rows:  # 무시한 행도 delta 쌍과 겹치면 같은 쌍을 두 번 판정하게 된다
+            tier = delta.get(frozenset((a, b)))
+            if tier in {"similar", "different"}:
+                raise ValueError(f"base relation {kind} {sorted((a, b))} " + ("contradicts" if tier != kind else "duplicates") + f" a delta pair judged {tier}")
+        summary = summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin,
+                            extra_different={part: {pid for a, b, k, q in used if k == "different" and q == part for pid in (a, b)} for part in partitions})
+        new_of = {part: sorted(set(split[part]) - old_of[part]) for part in partitions}
+        summary.update({"mode": "incremental", "base": {"relations": str(base_relations), "sha256": base_sha, "pairs": len(used)},
+                        "new_products": new_of, "delta_pairs": {part: sum(p["partition"] == part for p in pairs) for part in partitions},
+                        "expected_delta_pairs": {part: len(new_of[part]) * (len(new_of[part]) - 1) // 2 + len(new_of[part]) * len(old_of[part]) for part in partitions}})
+    if floor_spec is not None:
+        summary["floor"]["source"] = "base_summary"
+    return {"pairs": pairs, "signatures": signatures, "floor": floor_info, "summary": summary}
 
 
-def summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin):
+def summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin, extra_different=None):
     cross = [p for p in pairs if not p["same_lineage"]]
     same = [p for p in pairs if p["same_lineage"]]
 
@@ -292,6 +369,7 @@ def summarize(pairs, split, partitions, group_of, global_floor, group_floor, mar
     uncovered = {}
     for part in partitions:
         have = {pid for p in pairs if p["partition"] == part and p["tier"] == "different" for pid in (p["product_a"], p["product_b"])}
+        have |= (extra_different or {}).get(part, set())
         uncovered[part] = sorted(set(split[part]) - have)
     return {"pairs_by_tier": tiers, "unknown_by_reason": {r: sum(p["reason"] == r and p["tier"] == "unknown" for p in pairs) for r in sorted({p["reason"] for p in pairs if p["tier"] == "unknown"})},
             "floor": {"global": global_floor, "per_group": group_floor, "margin": margin},
@@ -412,13 +490,23 @@ def main(argv=None):
     ap.add_argument("--margin", type=float, default=0.05, help="a cross-lineage pair is 'different' only this far below the weakest same-lineage similarity")
     ap.add_argument("--floor", type=float, help="explicit similarity floor instead of the weakest same-lineage pair")
     ap.add_argument("--cross-group-fraction", type=float, default=0.2, help="cross-group 'different' pairs kept, as a fraction of within-group ones")
+    ap.add_argument("--floor-json", help="summary.json of an earlier screening: reuse its floor.global and floor.per_group (exclusive with --floor)")
+    ap.add_argument("--base-split", help="split.json of the previous round; with --base-relations only pairs that include a new product are screened")
+    ap.add_argument("--base-relations", help="merged relations.csv of the previous round (hand edits kept); --out then holds the delta rows only")
     ap.add_argument("--review-pairs", type=int, default=60, help="pairs drawn as image cards; the table always lists every pair to review")
     ap.add_argument("--review-band", type=float, default=0.15, help="auto-different pairs within margin + band of the floor are listed for review")
     ap.add_argument("--review-bindings", type=int, default=6)
     a = ap.parse_args(argv)
+    if a.floor_json is not None and a.floor is not None:
+        ap.error("--floor and --floor-json are exclusive")
+    if (a.base_split is None) != (a.base_relations is None):
+        ap.error("--base-split and --base-relations go together")
     split = json.loads(Path(a.split).read_text(encoding="utf-8"))
+    extra = {} if a.base_split is None else {"base_split": json.loads(Path(a.base_split).read_text(encoding="utf-8")), "base_relations": a.base_relations}
+    if a.floor_json is not None:
+        extra["floor_spec"] = load_floor_spec(a.floor_json)
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
-                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band)
+                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band, **extra)
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     for path in (review, summary):
