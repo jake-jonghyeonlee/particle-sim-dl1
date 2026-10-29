@@ -145,7 +145,11 @@ DL1 설치/import/help·수치 smoke·실자료 처리의 Windows 성공 여부�
 |---|---|
 | 모델명 폴더 | 그대로 제품 이름(`product_id`)이 된다 |
 | 전극명 폴더 | 그대로 전극 이름이자 역할 이름(`role`)이 된다 |
-| `cno` 폴더 | CNT 전용. 소문자 `cno`여야 한다. `CNO`처럼 대소문자가 다르면 오류다 |
+| `cno` 폴더 | CNT 전용. 예전 구조에서는 소문자 `cno`여야 한다. `CNO`처럼 대소문자가 다르면 오류다 |
+| 새 구조 (`Merged_Layer`) | 모델 폴더에 `Merged_Layer`가 있으면 새 구조다. 전극은 `<모델>\Merged_Layer\<전극>\` 아래 폴더이고 CNT는 `CNO`(또는 `cno`) 폴더다. 구조 표시로 `layout_structure: merged_layer_v2` 경고가 1개 나온다. `Merged_Layer` 바로 아래 파일은 지원하지 않는 배치다 |
+| 새 구조의 `Layer` 폴더 | 원본 층 영상이라 DL1 입력이 아니다. 읽지 않고 `layer_folder_ignored` 경고를 낸다 |
+| 새 구조 오류 | `Merged_Layer`·`CNO`·`Layer` 밖에 PNG가 든 폴더가 있으면 `layout_structure_mixed`, `Merged_Layer`가 대소문자만 다르게 둘이면 `layout_structure_mixed`, `cno`와 `CNO`가 둘 다 있으면 `cnt_folder_duplicate` 오류다 |
+| 예전 구조 | `Merged_Layer`가 없으면 지금까지와 동작이 같다. `Layer`라는 이름의 폴더도 전극으로 읽는다. 같은 내용이면 두 구조의 asset id와 mask가 같다 |
 | 파일명 | `<번호>-<layer>.png` 또는 `<번호>_<layer>.png`. 숫자 뒤 첫 `-`/`_`가 구분자이고 나머지 전체가 layer 이름이다. 확장자는 대소문자 구분 없이 `.png`/`.PNG`/`.Png`를 받으며 원본 파일명은 보존한다 |
 | 파일명 숫자 | 전극·cno 모두 양의 정수와 파일명 문법만 검사한다. **기록용(provenance only)**이며 순서·identity에 쓰지 않는다. 원본 파일을 번호에 맞춰 **이름 변경하지 않는다** |
 | 번호 재사용 | 서로 다른 layer 이름에 같은 번호를 써도 된다. 다른 전극 폴더의 같은 layer가 다른 번호여도 된다 |

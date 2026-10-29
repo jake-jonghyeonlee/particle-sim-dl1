@@ -116,8 +116,12 @@ naming all files: one content asset keeps every decoded file in `provenance_file
 (relative_path, original_filename, filename_number, file_sha256, decoded_mode).
 No filename number/path enters identity. Components describe that one geometry, not
 failed contacts; cnt_file_count still counts all observed files. In relations the
-`ambiguous_cnt_asset_identity` error stays, with no merging or number/path tie-breaking. `cno` is reserved, case-sensitive folder spelling; its layer names
-are not limited to OCNT/GCNT/PCNT. Without an order file, source layer case variants warn with `layer_name_case_variants`
+`ambiguous_cnt_asset_identity` error stays, with no merging or number/path tie-breaking. `cno` is reserved, case-sensitive folder spelling in the legacy layout; its layer names
+are not limited to OCNT/GCNT/PCNT. If a model folder has `Merged_Layer` (layout
+`merged_layer_v2`), electrodes are the folders under `Merged_Layer/`, the CNT folder is `CNO`
+or `cno`, and `Layer/` is ignored with warning `layer_folder_ignored`. Errors:
+`layout_structure_mixed`, `cnt_folder_duplicate`. `relative_path` is the real path;
+asset_id and mask do not depend on it, so equal content gives equal ids in both layouts. Without an order file, source layer case variants warn with `layer_name_case_variants`
 per model and at inventory level across models, preserving separate exact-spelling
 vocabulary entries. With an order file, per-model casefold collisions still reject.
 The .png extension alone is case-insensitive (.PNG, .Png); other filename syntax and

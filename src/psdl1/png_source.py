@@ -403,6 +403,46 @@ def _scan_source(scanner):
         else:
             warning_list.append(SourceIssue(rel(path), "ignored unrelated non-PNG file"))
 
+    def merged_layer_entries(model_dir, top, issues, warning_list):
+        """New layout: Merged_Layer/<electrode>/, CNO or cno, Layer ignored. Returns (folder, is_cnt)."""
+        entries = []
+        merged = [f for f in top if f.name.casefold() == "merged_layer"]
+        if len(merged) > 1:
+            issues.append(SourceIssue(rel(model_dir), "layout_structure_mixed: multiple Merged_Layer case variants " +
+                                      json.dumps(sorted(f.name for f in merged), ensure_ascii=False)))
+        warning_list.append(SourceIssue(rel(model_dir), "layout_structure: merged_layer_v2"))
+        cnt_folders = []
+        for folder in top:
+            folded = folder.name.casefold()
+            if not safe(folder, issues):
+                continue
+            if not folder.is_dir():
+                unexpected(folder, issues, warning_list)
+            elif folded == "merged_layer":
+                if len(merged) > 1:
+                    continue
+                for electrode in sorted(folder.iterdir()):
+                    if not safe(electrode, issues):
+                        continue
+                    if not electrode.is_dir():
+                        unexpected(electrode, issues, warning_list)
+                    else:
+                        entries.append((electrode, False))
+            elif folded == "cno":
+                cnt_folders.append(folder)
+            elif folded == "layer":
+                warning_list.append(SourceIssue(rel(folder), "layer_folder_ignored: Layer folder is not a DL1 input"))
+            elif any(p.suffix.lower() == ".png" for p in folder.rglob("*") if p.is_file()):
+                issues.append(SourceIssue(rel(folder), "layout_structure_mixed: folder with PNG outside Merged_Layer/CNO in a Merged_Layer model"))
+            else:
+                warning_list.append(SourceIssue(rel(folder), "ignored folder outside Merged_Layer layout"))
+        if len(cnt_folders) > 1:
+            issues.append(SourceIssue(rel(model_dir), "cnt_folder_duplicate: both " +
+                                      json.dumps(sorted(f.name for f in cnt_folders), ensure_ascii=False)))
+        else:
+            entries.extend((f, True) for f in cnt_folders)
+        return entries
+
     def scan_model(model_dir, policy):
         scanner.progress(stage="reading", state="started", model_id=model_dir.name)
         model_errors, model_warnings, assets = [], [], []
@@ -414,21 +454,36 @@ def _scan_source(scanner):
         bindings = {}
         files_done = 0
         cno_present = False
-        for folder in sorted(model_dir.iterdir()):
-            if not safe(folder, model_errors):
-                continue
-            if not folder.is_dir():
-                unexpected(folder, model_errors, model_warnings)
-                continue
-            try:
-                identifier(folder.name, "electrode")
-            except ValueError as exc:
-                model_errors.append(SourceIssue(rel(folder), str(exc)))
-            warn_name(folder.name, folder, model_warnings)
-            if folder.name != "cno" and folder.name.casefold() == "cno":
-                model_errors.append(SourceIssue(rel(folder), "reserved CNT folder is exactly 'cno'; rename this case variant explicitly"))
-                continue
-            is_cnt = folder.name == "cno"
+        top = sorted(model_dir.iterdir())
+        v2 = any(f.name.casefold() == "merged_layer" for f in top)
+        if v2:
+            entries = merged_layer_entries(model_dir, top, model_errors, model_warnings)
+        else:
+            entries = [(f, None) for f in top]
+        for folder, v2_cnt in entries:
+            if v2_cnt is None:
+                if not safe(folder, model_errors):
+                    continue
+                if not folder.is_dir():
+                    unexpected(folder, model_errors, model_warnings)
+                    continue
+                try:
+                    identifier(folder.name, "electrode")
+                except ValueError as exc:
+                    model_errors.append(SourceIssue(rel(folder), str(exc)))
+                warn_name(folder.name, folder, model_warnings)
+                if folder.name != "cno" and folder.name.casefold() == "cno":
+                    model_errors.append(SourceIssue(rel(folder), "reserved CNT folder is exactly 'cno'; rename this case variant explicitly"))
+                    continue
+                is_cnt = folder.name == "cno"
+            else:
+                is_cnt = v2_cnt
+                if not is_cnt:
+                    try:
+                        identifier(folder.name, "electrode")
+                    except ValueError as exc:
+                        model_errors.append(SourceIssue(rel(folder), str(exc)))
+                warn_name(folder.name, folder, model_warnings)
             cno_present |= is_cnt
             png_count = 0
             for path in sorted(folder.iterdir()):
