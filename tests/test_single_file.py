@@ -56,6 +56,21 @@ def test_extraction_reuses_the_folder_and_repairs_a_modified_file(bundle, tmp_pa
     assert ns["_extract"]() == root and (root / "psdl1" / "train.py").read_bytes() == (ROOT / "src/psdl1/train.py").read_bytes()
 
 
+def test_console_encoding_that_cannot_represent_a_character_does_not_stop_the_job(bundle, tmp_path):
+    out, _ = bundle
+    code = (
+        "import runpy, sys\n"
+        "ns = runpy.run_path(sys.argv[1], run_name='psdl1_job')\n"
+        "ns['_safe_streams']()\n"
+        "print('17\\u201318 bytes', flush=True)\n"
+        "print('17\\u201318 bytes', file=sys.stderr, flush=True)\n"
+    )
+    env = {**os.environ, "PYTHONIOENCODING": "euc_kr:strict"}
+    result = subprocess.run([sys.executable, "-c", code, str(out)], capture_output=True, env=env, cwd=tmp_path)
+    assert result.returncode == 0, result.stderr.decode("ascii", "replace")
+    assert b"\\u2013" in result.stdout and b"\\u2013" in result.stderr
+
+
 def test_unknown_job_name_is_rejected_before_anything_runs(bundle, tmp_path):
     out, _ = bundle
     script = tmp_path / "job.py"

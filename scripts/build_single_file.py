@@ -280,7 +280,17 @@ def _stop(message):
     raise SystemExit(2)
 
 
+def _safe_streams():
+    """콘솔 인코딩(예: euc_kr)이 표현하지 못하는 문자(예: en dash)가 있어도 멈추지 않고 대체 표기로 출력한다."""
+    for stream in (sys.__stdout__, sys.__stderr__):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def _run_with_log(entry):
+    _safe_streams()
     log = None
     if LOG_FILE:
         Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
