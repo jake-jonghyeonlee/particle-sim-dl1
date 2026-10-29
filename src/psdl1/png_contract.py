@@ -3,6 +3,8 @@
 These public records describe source inventory, extraction and publication.
 None resource values mean unknown/not computed, never an estimated zero.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 import hashlib
