@@ -164,7 +164,76 @@ def test_merge_inputs_match_compares_hashes_and_round(bundles, tmp_path):
     assert "round" in mb.merge_inputs_match(out, bundles["a"], bundles["b"], 3)
     assert "base manifest_sha256" in mb.merge_inputs_match(out, bundles["c"], bundles["b"], 2)
     assert "add manifest_sha256" in mb.merge_inputs_match(out, bundles["a"], bundles["c"], 2)
-    assert "cannot be compared" in mb.merge_inputs_match(tmp_path / "missing", bundles["a"], bundles["b"], 2)
+    assert "incomplete" in mb.merge_inputs_match(tmp_path / "missing", bundles["a"], bundles["b"], 2)
+    assert "cannot be compared" in mb.merge_inputs_match(out, tmp_path / "missing", bundles["b"], 2)
+
+
+def test_merge_inputs_match_checks_base_round_and_rejects_failed_folders(bundles, tmp_path, monkeypatch):
+    out = merged(tmp_path, bundles)
+    assert mb.merge_inputs_match(out, bundles["a"], bundles["b"], 2, base_round=1) is None
+    assert "base round" in mb.merge_inputs_match(out, bundles["a"], bundles["b"], 2, base_round=2)
+    monkeypatch.setattr(mb, "_seal_bundle", lambda path: (_ for _ in ()).throw(RuntimeError("injected")))
+    failed = tmp_path / "failed"
+    with pytest.raises(RuntimeError):
+        mb.merge_bundles(bundles["a"], bundles["b"], failed, round_index=2, base_round=1)
+    assert (failed / "merge-report.json").exists() and (failed / "manifest.failed.json").exists()
+    assert "incomplete" in mb.merge_inputs_match(failed, bundles["a"], bundles["b"], 2, base_round=1)
+
+
+def reseal(root, manifest=None, report=None, *, relink=True):
+    """Rewrite manifest/report with a mutation, then seal again so only the content check can object."""
+    root = Path(root)
+    docs = {name: json.loads((root / name).read_text()) for name in ("manifest.json", "merge-report.json")}
+    if manifest:
+        manifest(docs["manifest.json"])
+    (root / "manifest.json").write_text(json.dumps(docs["manifest.json"]))
+    if relink:
+        docs["merge-report.json"]["generated_manifest_sha256"] = file_sha256(root / "manifest.json")
+    if report:
+        report(docs["merge-report.json"])
+    (root / "merge-report.json").write_text(json.dumps(docs["merge-report.json"]))
+    mb._seal_bundle(root)
+
+
+def swap_products(manifest):
+    manifest["products"].reverse()
+
+
+def point_at_unlisted_asset(manifest):
+    manifest["products"][0]["valid"] = "assets/r02/not-there.npy"
+
+
+def set_key(key, value):
+    return lambda doc: doc.__setitem__(key, value)
+
+
+def break_first_asset(key, value):
+    return lambda doc: doc["assets"][0].__setitem__(key, value)
+
+
+@pytest.mark.parametrize("manifest, report, relink, match", [
+    (swap_products, None, True, "product list differs"),
+    (None, set_key("generated_manifest_sha256", "0" * 64), True, "hash link mismatch"),
+    (None, set_key("round", 1), True, "not under assets/rNN"),
+    (point_at_unlisted_asset, None, True, "not listed in the bundle"),
+    (None, set_key("candidate_grid", 999), True, "grid/schema"),
+    (None, set_key("schema_version", "other"), True, "grid/schema"),
+    (None, set_key("asset_method", "copy"), True, "asset_method differs"),
+    (None, break_first_asset("source_bundle", "elsewhere"), True, "invalid merge report asset entry"),
+    (None, break_first_asset("source_path", "../escape.npy"), True, "invalid merge report asset entry"),
+    (None, break_first_asset("asset_method", "symlink"), True, "invalid merge report asset entry"),
+])
+def test_verify_rejects_resealed_tampering(bundles, tmp_path, manifest, report, relink, match):
+    out = merged(tmp_path, bundles)
+    reseal(out, manifest, report, relink=relink)
+    with pytest.raises(ValueError, match=match):
+        mb.verify_merged_bundle(out)
+
+
+def test_reseal_helper_without_mutation_still_verifies(bundles, tmp_path):
+    out = merged(tmp_path, bundles)
+    reseal(out)
+    assert mb.verify_merged_bundle(out)["status"] == "verified"
 
 
 def test_cli_merge_and_verify_exit_codes(bundles, tmp_path, capsys):

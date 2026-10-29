@@ -40,7 +40,7 @@ def extend_split(previous, products, *, seed=0, validation_fraction=0.2, test_fr
     old_ids = []
     for partition in PARTITIONS:
         ids = previous.get(partition)
-        if not isinstance(ids, list) or len(set(ids)) != len(ids):
+        if not isinstance(ids, list) or any(not isinstance(pid, str) for pid in ids) or len(set(ids)) != len(ids):
             raise ValueError("partition IDs must be unique lists")
         old_ids.extend(ids)
     if len(set(old_ids)) != len(old_ids):

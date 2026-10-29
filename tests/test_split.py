@@ -75,6 +75,9 @@ def test_extend_split_rejects_missing_previous_products_and_bad_schema():
         extend_split({**previous, "train": previous["train"] * 2}, old)
     with pytest.raises(ValueError, match="invalid split fractions"):
         extend_split(previous, old, validation_fraction=0.6, test_fraction=0.5)
+    for bad in ([["unhashable"]], [7], [None]):
+        with pytest.raises(ValueError, match="unique lists"):
+            extend_split({**previous, "validation": bad}, old)
 
 
 def test_vocab_only_uses_training_partition_and_unknown_role_rejected():

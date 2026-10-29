@@ -2,7 +2,9 @@
 
 The merged bundle is a new folder: manifest.json (assets under assets/rNN/),
 merge-report.json and bundle-integrity.json. Verification is hash integrity plus a
-full strict manifest read; it is not electrical verification.
+full strict manifest read; it is not electrical verification. A hard-linked asset shares
+content and permissions with its source file, so changing the source in place breaks the
+merged bundle's verification.
 """
 from __future__ import annotations
 
@@ -175,12 +177,22 @@ def merge_bundles(base_dir, add_dir, out_dir, *, round_index, base_round=None):
     return result
 
 
-def merge_inputs_match(out_dir, base_dir, add_dir, round_index):
-    """None when the merged folder was built from exactly these inputs, else the reason."""
+def merge_inputs_match(out_dir, base_dir, add_dir, round_index, base_round=None):
+    """None when the merged folder was built from exactly these inputs, else the reason.
+
+    Only the recorded input hashes (and rounds) are compared; callers must still run
+    verify_merged_bundle(out_dir) before skipping a merge. base_round is the round
+    given for an import base bundle; when set, it must equal the recorded base round.
+    """
     try:
+        for name in ("manifest.json", "bundle-integrity.json"):
+            if not (Path(out_dir) / name).is_file():
+                return f"merged folder is incomplete: {name} is missing"
         report = _read_json(Path(out_dir) / "merge-report.json")
         if report["round"] != round_index:
             return f"merge-report round {report['round']} differs from {round_index}"
+        if base_round is not None and report["base"]["round"] != base_round:
+            return f"merge-report base round {report['base']['round']} differs from {base_round}"
         for label, folder in (("base", base_dir), ("add", add_dir)):
             folder = Path(folder)
             for key, name in (("manifest_sha256", "manifest.json"), ("integrity_sha256", "bundle-integrity.json")):
@@ -225,11 +237,22 @@ def _verify_merged_bundle(bundle):
     manifest = _read_json(bundle_path(root, "manifest.json"))
     if set(manifest) != {"schema_version", "candidate_grid", "products"} or manifest["schema_version"] != SCHEMA_VERSION:
         raise ValueError("invalid merged manifest contract")
-    listed = {}
+    if report["candidate_grid"] != manifest["candidate_grid"] or report["schema_version"] != manifest["schema_version"]:
+        raise ValueError("merge report grid/schema differs from the manifest")
+    listed, methods = {}, set()
     for item in report["assets"]:
+        source = item["source_path"]
+        if (set(item) != {"path", "source_bundle", "source_path", "sha256", "asset_method"} or
+                item["source_bundle"] not in {"base", "add"} or item["asset_method"] not in {"hardlink", "copy"} or
+                not isinstance(source, str) or not source or "\\" in source or source.startswith("/") or
+                any(part in {"", ".", ".."} for part in source.split("/"))):
+            raise ValueError("invalid merge report asset entry")
         if item["path"] in listed:
             raise ValueError("duplicate reported merged asset")
         listed[item["path"]] = item["sha256"]
+        methods.add(item["asset_method"])
+    if report["asset_method"] != (next(iter(methods)) if len(methods) == 1 else "mixed"):
+        raise ValueError("merge report asset_method differs from its asset entries")
     required = set()
     for product in manifest["products"]:
         for relative in _asset_paths(product):
@@ -237,7 +260,9 @@ def _verify_merged_bundle(bundle):
             match = _ASSET_ROUND.fullmatch(relative)
             if not match or int(match.group(1)) > report["round"]:
                 raise ValueError(f"merged asset is not under assets/rNN/: {relative}")
-            if files.get(relative) != listed.get(relative):
+            if relative not in files or relative not in listed:
+                raise ValueError(f"manifest asset is not listed in the bundle: {relative}")
+            if files[relative] != listed[relative]:
                 raise ValueError("manifest asset/report hash link mismatch")
             mask = np.load(bundle_path(root, relative), mmap_mode="r", allow_pickle=False)
             if mask.dtype != np.bool_ or tuple(mask.shape) != tuple(product["frame"]["shape_yx"]):
