@@ -115,10 +115,16 @@ def test_init_from_is_exclusive_and_checks_parent_compatibility(families, tmp_pa
     path = fit(tmp_path, "parent", old)
     extra = {"resume": {"resume": str(path)}, "weights": {"weights_file": str(path)}, "backbone": {"backbone": "other"},
              "use_unit_size": {"use_unit_size": True}, "model_kwargs": {"model_kwargs": {**SMALL, "dim": 64}}, "grid": {"grid": 96}}[case]
-    out = tmp_path / "child"
-    with pytest.raises(ValueError, match="exclusive|differs"):
-        train(new, out, epochs=1, **{"grid": GRID, "batch_size": 3, "relations": relations_for(new), "model_kwargs": SMALL, "init_from": path, **extra})
+    message = {"resume": "--init-from and --resume are exclusive", "weights": "--init-from and --weights are exclusive",
+               "backbone": "init-from parent differs: backbone", "use_unit_size": "init-from parent differs: use_unit_size",
+               "model_kwargs": "init-from parent differs: model_kwargs", "grid": "init-from parent differs: grid"}[case]
+    out, events = tmp_path / "child", []
+    with pytest.raises(ValueError) as error:
+        train(new, out, epochs=1, progress_sink=events.append,
+              **{"grid": GRID, "batch_size": 3, "relations": relations_for(new), "model_kwargs": SMALL, "init_from": path, **extra})
+    assert str(error.value) == message
     assert not (out / "dl1.pt").exists()
+    assert not any(e["phase"] == "prepare" for e in events)  # 제품 준비 전에 거부된다
 
 
 def test_warm_started_run_resumes_with_the_same_arguments(families, tmp_path):

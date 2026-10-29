@@ -65,10 +65,10 @@ class RelationBatchSampler:
 
     def batches(self, generator):
         schedule = [e for e in self.edges for _ in range(self._repeat.get(e, 1))]
-        order = torch.randperm(len(schedule), generator=generator).tolist()
-        remaining = Counter(schedule[i] for i in order)  # 다중집합: 0 이 된 edge 는 지운다
+        schedule_order = torch.randperm(len(schedule), generator=generator).tolist()
+        remaining = Counter(schedule[i] for i in schedule_order)  # 다중집합: 0 이 된 edge 는 지운다
         result = []
-        for i in order:
+        for i in schedule_order:
             edge = schedule[i]
             if edge not in remaining:
                 continue
@@ -247,6 +247,9 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     parent = saved_resume = None  # parent: --init-from 체크포인트, saved_resume: --resume 체크포인트
     if init_from:
         parent = read_checkpoint(init_from)
+        # 제품 준비(느림) 전에 어휘와 무관한 항목부터 거른다. 전체 검사는 config 를 만든 뒤 다시 한다.
+        check_parent_compatible(parent["config"], {**parent["config"], "backbone": backbone, "use_unit_size": use_unit_size,
+                                                    "model_kwargs": model_kwargs or {}, "grid": grid})
     elif resume:
         saved_resume = read_checkpoint(resume)
         if not saved_resume["metadata"].get("parent") and new_edge_repeat != 1:
