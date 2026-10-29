@@ -675,7 +675,7 @@ Windows (명령 프롬프트):
 ```
 
 - 만들어진 파일 맨 위 `EDIT BELOW` ~ `EDIT ABOVE` 블록만 고친다: `JOBS`(작업 이름과 명령줄 인자 리스트, 위에서부터 차례로 실행하고 하나가 실패하면 멈춤), `LOG_FILE`(stdout/stderr 진행 줄을 이 파일에도 기록), `WORK_DIR`(패키지를 풀 폴더, `None`이면 파일 옆 또는 임시 폴더).
-- 작업 이름은 `train`, `pretrain`, `screen_relations`, `evaluate`, `embed_plot`, `search`, `import_png`, `data`, `relations_draft`이다. 인자는 명령줄에서 쓰던 그대로 문자열 리스트로 적고, 경로는 서버 기준 절대 경로를 권장한다.
+- 작업 이름은 `train`, `pretrain`, `screen_relations`, `evaluate`, `embed_plot`, `search`, `import_png`, `data`, `relations_draft`, `merge_bundles`, `compare_rounds`이다. 인자는 명령줄에서 쓰던 그대로 문자열 리스트로 적고, 경로는 서버 기준 절대 경로를 권장한다.
 - 실행하면 패키지를 `.psdl1_pkg_<해시>/psdl1/`에 바이트 그대로 풀고(`code_hash`가 저장소와 같음) 그 복사본을 먼저 import한다. 서버에 다른 `psdl1`이 설치돼 있어도 묶음 쪽이 우선하고, 로그 첫 줄에 어느 `psdl1`을 쓰는지 적힌다. 서버에는 torch, numpy, Pillow(timm은 timm 백본을 쓸 때만)가 있어야 한다.
 - 데이터(manifest, NPY, `split.json`, `relations.csv`, `backbone.pt`)는 `.py`가 아니므로 서버에 이미 있어야 한다. 소스를 고치면 묶음을 다시 만들어서 올린다(같은 소스면 같은 파일이 나온다).
 - 실행기는 각 작업 `main()` 의 반환값을 검사한다. `None`·`0` 이 아니면 `[psdl1_job] … exited with <코드>` 를 로그에 남기고 같은 코드로 멈춘다(예: `import_png` 는 실패 시 `2` 를 반환한다). 뒤의 작업은 시작하지 않는다.
@@ -797,7 +797,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 
 - 덮어쓸 때 로그에 `round override: --epochs 30 --lr 0.0001 (replaces the --epochs/--lr in TRAIN_ARGS)` 와 같은 줄이 남는다.
 - 라운드 ≥ 2 에서는 `PRETRAIN` 을 `False` 로 둔다. 사전학습은 r01 에서만 한다(`True` 이면 `STOP: warm-start replaces pretraining in round >= 2; set PRETRAIN = False`).
-- 실행기가 채우는 인자가 하나 늘었다. 라운드 ≥ 2 는 `--init-from`·`--round`·`--new-edge-repeat`, `ROUND = 1` 은 `--round` 를 `PRETRAIN_ARGS`·`TRAIN_ARGS`·`EVALUATE_ARGS` 에 쓰지 않는다. 약어도 시작 전에 멈춘다.
+- 실행기가 채우는 인자가 늘었다. 라운드 ≥ 2 는 `--init-from`·`--round`·`--new-edge-repeat`, `ROUND = 1` 은 `--round` 를 `PRETRAIN_ARGS`·`TRAIN_ARGS`·`EVALUATE_ARGS` 에 쓰지 않는다. 약어도 시작 전에 멈춘다.
 - `JOBS` 방식 파일에서도 `merge_bundles`, `compare_rounds` 작업 이름을 쓸 수 있다.
 
 라운드 ≥ 2 의 assets 순서는 이렇다.
@@ -877,7 +877,7 @@ JOBS = [
 ]
 ```
 
-- `--epochs`·`--lr`·`--new-edge-repeat` 는 중단된 실행과 **같은 값**을 준다. 달라지면 계약 불일치로 거부된다.
+- 의도한 총 epoch 를 유지하려면 `--epochs` 에 중단된 실행과 같은 값을 준다(`--epochs` 는 새 총 목표이며 저장된 epoch 보다 커야 한다). `--lr`·`--new-edge-repeat` 와 그 밖의 계약 항목(batch size 등)이 다르면 거부된다.
 - `--init-from` 은 다시 주지 않는다(`--resume` 과 함께 쓸 수 없다). 앞 라운드 `dl1.pt` 가 없어도 재개할 수 있다. 필요한 부모 정보는 체크포인트 안에 있다.
 - `--round` 를 주면 저장된 값과 같아야 한다. 생략해도 된다.
 - 그 밖의 `--batch-size`·`--backbone`·분할·relations 는 중단된 실행과 같아야 한다(`docs/training.md` 의 Checkpoints and resume).
@@ -915,7 +915,7 @@ R1=$WORK/rounds/r01; R2=$WORK/rounds/r02
 
 - 라운드 ≥ 2 에서는 `--floor` 를 어떤 형태로도 쓸 수 없다. floor 는 항상 r01 train 구획 값이다. 라운드마다 다시 계산하지 않는다.
 - 앞 라운드에서 `unknown` 으로 남은 기존×기존 쌍은 다시 판정하지 않는다. 새×기존 쌍만 새로 판정한다.
-- 증분 스크리닝의 구획 간 `different` 쌍 상한(`--cross-group-fraction`)은 **delta 쌍만으로** 계산한다. 앞 라운드의 쌍 수는 세지 않는다.
+- 증분 스크리닝의 그룹(`--groups`) 간 `different` 쌍 상한(`--cross-group-fraction`)은 **delta 쌍만으로** 계산한다. 앞 라운드의 쌍 수는 세지 않는다.
 - 라운드 비교는 쿼리별로 두 `evaluation.json` 을 맞춘다. 이전 체크포인트를 새 데이터로 다시 평가하지 않는다. 라운드마다 후보 풀이 커지므로 recall 하락이 모두 망각은 아니다. 쿼리마다 후보 수가 같이 기록되고, 경고(`possible_forgetting`, `candidate_pool_grew`, `same_input_hash`, `queries_lost_metric`, `queries_missing_from_current`)를 먼저 읽는다.
 - 모델 설정(`GRID`, backbone, `use_unit_size`, `model_kwargs`)은 부모와 같아야 한다. 다르면 학습이 optimizer 전에 거부한다.
 - `screen_relations` 의 `--flo` 는 `--floor` 와 `--floor-json` 에 모두 맞아 argparse 가 모호하다며 거부한다. 전체 이름을 쓴다.

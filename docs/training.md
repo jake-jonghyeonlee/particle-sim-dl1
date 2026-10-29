@@ -78,27 +78,6 @@ Resume uses the same total target epoch count semantics: `--epochs 150` continue
 
 Recovery is at the last completed epoch. Work from an interrupted partial epoch is repeated using the saved RNG/optimizer; no partial-step resume is claimed. Checkpoint reads use `weights_only=True`, reject incompatible versions/fingerprints, and verify state contents. Defaults use CPU; CUDA training is supported with its RNG states. Bitwise equality across different hardware/backends is not promised.
 
-### Warm start (`--init-from`)
-
-`--init-from <parent dl1.pt>` starts a new run from a parent checkpoint's weights, for [incremental rounds](USAGE.md#68-증분-라운드-새-제품만-더하는-학습). It is exclusive with `--resume` and `--weights`; the combination is rejected before any training step. `--round N` records the round number in metadata. `--new-edge-repeat k` (default 1) needs a parent: with neither `--init-from` nor a resumed warm-start checkpoint it is rejected.
-
-- The parent must match the new run in `backbone`, `use_unit_size`, `grid`, `model_kwargs` and `unknown_vocabulary`. A difference is rejected (`init-from parent differs: <field>`) before the optimizer is created.
-- The vocabulary is extended, not rebuilt. Every parent role/layer keeps its ID. Names that are new in the current training split are sorted and appended with the next IDs. Parent names that are no longer used stay and are listed as `unused_parent_names`.
-- Only the `role.weight` and `layer.weight` embeddings grow. Parent rows are copied. New rows keep the current model's seeded initialisation, and the helper consumes no RNG. Every other tensor is the parent's.
-- Optimizer, grad scaler and RNG start fresh, and epochs count from 0. `--epochs` is the total for the new run, not an extension of the parent.
-- Metadata adds `parent` (path, `weights_hash`, `contract_hash`, `input_hash`, `fingerprint`, `code_hash`, `code_hash_matches`, `epoch`, `round`), `round`, `warm_start` (parent/total counts and `new_names` per vocabulary) and `delta_negative_pairs`. A parent `code_hash` that differs from the current code is recorded as `code_hash_matches: false`; it is not rejected.
-- Delta negative pairs are the current training negative edges the parent never trained. They are rebuilt from the parent's metadata (its split, relations, `unlabelled_negatives` and lineage). `--new-edge-repeat k` schedules each delta edge `k` times per epoch. Every negative edge is still covered at least once per epoch, and the loss is unchanged. Per-epoch statistics add `delta_negative_pairs`, `new_edge_repeat` and `delta_coverage_min`.
-- The contract hash covers `new_edge_repeat`, `init_from` (parent `weights_hash`, `contract_hash`, `input_hash`, `fingerprint`) and `delta_negative_pairs_hash`. Runs without a parent store `init_from: null` and `new_edge_repeat: 1`, so their `contract_hash` differs from checkpoints made by older code. Resume already requires an identical code hash, so such old checkpoints cannot be resumed anyway.
-- Resume of a warm-start run uses `--resume` with the same `--epochs`, `--lr`, `--new-edge-repeat` and other training arguments, without `--init-from`. The vocabulary, parent record and delta pairs come from the saved checkpoint. The parent file is not read again and may be deleted. A changed `--new-edge-repeat` fails with the contract mismatch. A `--round` value, if given, must equal the saved one.
-
-```bash
-.venv/bin/python -m psdl1.train --config configs/train.example.json \
-  --init-from runs/r01/dl1.pt --round 2 --epochs 30 --lr 1e-4 --new-edge-repeat 2 --out runs/r02
-# interrupted: same arguments, --resume instead of --init-from
-.venv/bin/python -m psdl1.train --config configs/train.example.json \
-  --resume runs/r02/dl1.pt --round 2 --epochs 30 --lr 1e-4 --new-edge-repeat 2 --out runs/r02
-```
-
 Default tests include bounded synthetic forward/loss/optimizer fixtures and a one-step PNG training-driver integration with explicit synthetic metadata, labels and split. The existing 40-epoch synthetic dataset smoke is explicit `--run-training`; its size-variant assertions are not lineage-held-out evidence. Real training and closed-network acceptance remain user-owned.
 
 The checkpoint loader (`--ckpt` / `--resume`) accepts this project's own versioned checkpoints. Optional `--weights` accepts compatible backbone-only project/timm-format states with four input channels and no classifier head. **Loading public ConvNeXt V2 weight files has not been verified**; no stem expansion or classifier conversion is performed, and pretrained remains off by default. The optional `local-weights` dependency group explicitly declares safetensors; use approved local wheels without online fallback.
@@ -110,6 +89,27 @@ Preparation caching removes repeated validation/hash/resize for both views and s
 Search and evaluation report the numeric checkpoint `grid` and `grid_selection` with manifest candidate grids. Any mismatch requires `--allow-grid-override`; inference keeps the checkpoint grid and records the exception. Their default grid gate blocks thin-line/vanishing-bridge queries and excludes failing candidates, including held-out evaluation products and the baseline. Only `--allow-grid-check-failure` bypasses it, with per-product evidence in JSON. Both flags are separate, default off, and do not approve a real grid or minimum linewidth.
 
 Canonical single-product forwards preserve order/chunk-size reproducibility. `batch_size` controls candidate chunks rather than forward batch size; evaluation caches each product embedding once per command to avoid repeated forwards across queries, trading O(N × embedding dimension) memory for fewer forwards. Multi-product forward acceleration remains deferred because it changes arithmetic. The opt-in 40-epoch synthetic CNN smoke now uses an explicitly chosen synthetic grid 64, passes the strict grid gate with no bypass, and retains all loss/ranking/separation assertions; this fixture choice is not a real-data grid recommendation.
+
+### Warm start (`--init-from`)
+
+`--init-from <parent dl1.pt>` starts a new run from a parent checkpoint's weights, for [incremental rounds](USAGE.md#68-증분-라운드-새-제품만-더하는-학습). It is exclusive with `--resume` and `--weights`; the combination is rejected before any training step. `--round N` records the round number in metadata. `--new-edge-repeat k` (default 1) needs a parent: with neither `--init-from` nor a resumed warm-start checkpoint it is rejected.
+
+- The parent must match the new run in `backbone`, `use_unit_size`, `grid`, `model_kwargs` and `unknown_vocabulary`. A difference is rejected (`init-from parent differs: <field>`) before the optimizer is created.
+- The vocabulary is extended, not rebuilt. Every parent role/layer keeps its ID. Names that are new in the current training split are sorted and appended with the next IDs. Parent names that are no longer used stay and are listed as `unused_parent_names`.
+- Only the `role.weight` and `layer.weight` embeddings grow. Parent rows are copied. New rows keep the current model's seeded initialisation, and the helper consumes no RNG. Every other tensor is the parent's.
+- Optimizer, grad scaler and RNG start fresh, and epochs count from 0. `--epochs` is the total for the new run, not an extension of the parent.
+- Metadata adds `parent` (path, `weights_hash`, `contract_hash`, `input_hash`, `fingerprint`, `code_hash`, `code_hash_matches`, `epoch`, `round`), `round`, `warm_start` (parent/total counts and `new_names` per vocabulary) and `delta_negative_pairs`. A parent `code_hash` that differs from the current code is recorded as `code_hash_matches: false`; it is not rejected.
+- Delta negative pairs are the current training negative edges the parent never trained. They are rebuilt from the parent's metadata (its split, relations, `unlabelled_negatives` and lineage). `--new-edge-repeat k` schedules each delta edge `k` times per epoch. Every negative edge is still covered at least once per epoch, and the loss is unchanged. Per-epoch statistics add `delta_negative_pairs`, `new_edge_repeat` and `delta_coverage_min`.
+- The contract hash covers `new_edge_repeat`, `init_from` (parent `weights_hash`, `contract_hash`, `input_hash`, `fingerprint`) and `delta_negative_pairs_hash`. Runs without a parent store `init_from: null` and `new_edge_repeat: 1`, so their `contract_hash` differs from checkpoints made by older code. Resume already requires an identical code hash, so such old checkpoints cannot be resumed anyway.
+- Resume of a warm-start run uses `--resume` without `--init-from`. Give the same `--epochs` to keep the intended total (as in any resume, `--epochs` is the new total target and must exceed the saved epoch). Give the same `--lr`, `--new-edge-repeat` and other contract fields; a mismatch is rejected. The vocabulary, parent record and delta pairs come from the saved checkpoint. The parent file is not read again and may be deleted. A `--round` value, if given, must equal the saved one.
+
+```bash
+.venv/bin/python -m psdl1.train --config configs/train.example.json \
+  --init-from runs/r01/dl1.pt --round 2 --epochs 30 --lr 1e-4 --new-edge-repeat 2 --out runs/r02
+# interrupted: same arguments, --resume instead of --init-from
+.venv/bin/python -m psdl1.train --config configs/train.example.json \
+  --resume runs/r02/dl1.pt --round 2 --epochs 30 --lr 1e-4 --new-edge-repeat 2 --out runs/r02
+```
 
 
 ## Imported PNG bundles
