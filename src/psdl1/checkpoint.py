@@ -119,6 +119,55 @@ def read_checkpoint(path):
     return saved
 
 
+VOCAB_KEYS = {"roles": "role.weight", "layers": "layer.weight"}
+
+
+def extend_vocab(parent, names):
+    """부모 번호는 그대로 두고 부모에 없는 이름만 정렬해 뒤에 붙인다. 부모에만 있는 이름도 남긴다."""
+    vocab = dict(parent)
+    for name in sorted(set(names) - vocab.keys()):
+        vocab[name] = len(vocab) + 1
+    return vocab
+
+
+def check_parent_compatible(parent_config, config):
+    for field in ("backbone", "use_unit_size", "grid", "model_kwargs", "unknown_vocabulary"):
+        if parent_config[field] != config[field]:
+            raise ValueError(f"init-from parent differs: {field}")
+    for field in VOCAB_KEYS:
+        if any(config[field].get(name) != number for name, number in parent_config[field].items()):
+            raise ValueError(f"init-from parent differs: {field}")
+
+
+def warm_start_state(parent_state, parent_config, config, current_state):
+    """부모 state 사본에서 어휘 임베딩만 확장한다. 새 행은 current_state(현재 모델)의 행 그대로이고 RNG 는 쓰지 않는다."""
+    check_parent_compatible(parent_config, config)
+    if parent_state.keys() != current_state.keys():
+        raise ValueError("init-from parent differs: state keys")
+    state = {key: value.clone() for key, value in parent_state.items()}
+    for field, key in VOCAB_KEYS.items():
+        old, new = parent_state[key], current_state[key]
+        if old.shape[0] != len(parent_config[field]) + 1 or new.shape[0] != len(config[field]) + 1 or old.shape[1:] != new.shape[1:]:
+            raise ValueError(f"init-from parent differs: {field}")
+        grown = new.detach().clone()
+        grown[:old.shape[0]] = old
+        state[key] = grown
+    return state
+
+
+def init_from_checkpoint(path, model, *, expected_config, saved=None):
+    """부모 가중치만 싣는다(optimizer·RNG 는 건드리지 않는다). saved 가 있으면 이미 읽은 부모를 쓴다."""
+    saved = read_checkpoint(path) if saved is None else saved
+    state = warm_start_state(saved["state_dict"], saved["config"], expected_config, model.state_dict())
+    model.load_state_dict(state, strict=True)
+    warm = {}
+    for field in VOCAB_KEYS:
+        parent_names = saved["config"][field]
+        warm[field] = {"parent": len(parent_names), "total": len(expected_config[field]),
+                       "new_names": sorted(set(expected_config[field]) - parent_names.keys())}
+    return {"saved": saved, "warm_start": warm}
+
+
 def resume_checkpoint(path, model, optimizer, generator, *, expected_config=None, expected_input_hash=None, expected_contract_hash=None, expected_code_hash=None):
     saved = read_checkpoint(path)
     if expected_config is not None and saved["fingerprint"] != validate_config(expected_config):

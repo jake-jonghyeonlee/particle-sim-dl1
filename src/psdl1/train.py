@@ -8,11 +8,13 @@ import json
 import math
 from pathlib import Path
 import random
+from collections import Counter
 
 import numpy as np
 import torch
 
-from .checkpoint import code_hash, file_hash, json_hash, resume_checkpoint, save_checkpoint, validate_config
+from .checkpoint import (check_parent_compatible, code_hash, extend_vocab, file_hash, init_from_checkpoint, json_hash, read_checkpoint,
+                         resume_checkpoint, save_checkpoint, validate_config)
 from .data import Product, build_vocab, collate, frame_transform, grid_check, input_identity, load_manifest, prepare_product, unit_feature
 from .losses import NEGATIVE, masked_contrastive_loss, relation_coverage, relation_matrix, validate_relations
 from .model import ProductEncoder
@@ -36,7 +38,7 @@ def load_relations(path):
 
 class RelationBatchSampler:
     """Every labelled negative edge is scheduled each epoch, including sparse edges."""
-    def __init__(self, product_ids, batch_size, similar=None, different=None, *, unlabelled_negatives=False, lineage_ids=None):
+    def __init__(self, product_ids, batch_size, similar=None, different=None, *, unlabelled_negatives=False, lineage_ids=None, repeat=None):
         if type(batch_size) is not int or batch_size < 2:
             raise ValueError("batch_size must be at least two")
         self.ids = list(product_ids)
@@ -46,12 +48,28 @@ class RelationBatchSampler:
         self.edges = [(i, j) for i in range(len(self.ids)) for j in range(i + 1, len(self.ids)) if self.relation[i, j] == NEGATIVE]
         if not self.edges:
             raise ValueError("구분할 쌍이 없다: provide different labels or explicitly opt into unlabelled negatives")
+        self.repeat = repeat
+
+    @property
+    def repeat(self):
+        return self._repeat
+
+    @repeat.setter
+    def repeat(self, repeat):
+        """edge -> epoch 당 최소 포함 횟수(기본 1). edges 집합은 바뀌지 않는다."""
+        repeat = dict(repeat or {})
+        known = set(self.edges)
+        if any(e not in known or type(k) is not int or k < 1 for e, k in repeat.items()):
+            raise ValueError("repeat requires positive integers for existing negative edges")
+        self._repeat = repeat
 
     def batches(self, generator):
-        edges = [self.edges[i] for i in torch.randperm(len(self.edges), generator=generator).tolist()]
-        remaining = set(edges)
+        schedule = [e for e in self.edges for _ in range(self._repeat.get(e, 1))]
+        order = torch.randperm(len(schedule), generator=generator).tolist()
+        remaining = Counter(schedule[i] for i in order)  # 다중집합: 0 이 된 edge 는 지운다
         result = []
-        for edge in edges:
+        for i in order:
+            edge = schedule[i]
             if edge not in remaining:
                 continue
             batch = list(edge)
@@ -60,7 +78,10 @@ class RelationBatchSampler:
             positives = [i for i in order if i not in batch and any(frozenset((self.ids[i], self.ids[j])) in self.similar for j in batch)]
             batch.extend((positives + [i for i in order if i not in batch and i not in positives])[:self.batch_size - len(batch)])
             members = set(batch)
-            remaining = {e for e in remaining if not set(e) <= members}
+            for e in [e for e in remaining if e[0] in members and e[1] in members]:
+                remaining[e] -= 1
+                if not remaining[e]:
+                    del remaining[e]
             result.append(batch)
         return result
 
@@ -142,12 +163,59 @@ def resolve_training_grid(products, grid=None, *, allow_grid_override=False):
                   "source": "manifest_candidate" if candidate is not None and not override else "explicit_override" if override else "api_explicit",
                   "override": override, "override_requested": allow_grid_override}
 
+def parent_delta_pairs(sampler, parent_metadata):
+    """현재 negative edge 중 부모가 학습하지 않은 쌍 → 정렬된 제품 ID 쌍 목록. 부모 metadata 로 부모 negative 를 재구성한다."""
+    try:
+        contract, train_ids = parent_metadata["contract"], parent_metadata["split"]["train"]
+        lineage = [parent_metadata["input_records"][pid]["lineage"] for pid in train_ids]
+        keep = set(train_ids)
+        similar = {frozenset(x) for x in contract["similar"] if set(x) <= keep}
+        different = {frozenset(x) for x in contract["different"] if set(x) <= keep}
+        relation = relation_matrix(train_ids, similar, different, unlabelled_negatives=contract["unlabelled_negatives"], lineage_ids=lineage)
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"init-from parent metadata incomplete: {error!r}") from error
+    old = {frozenset((train_ids[i], train_ids[j])) for i, j in (relation == NEGATIVE).nonzero().tolist() if i < j}
+    return sorted(sorted(pair) for pair in ({sampler.ids[i], sampler.ids[j]} for i, j in sampler.edges) if frozenset(pair) not in old)
+
+
+def delta_edges(sampler, pairs):
+    """저장된 delta 쌍(제품 ID) → 현재 sampler 인덱스 edge 집합. 형식·중복·미등록 ID·negative 아닌 쌍은 거부한다."""
+    index, edges, result = {pid: i for i, pid in enumerate(sampler.ids)}, set(sampler.edges), set()
+    if not isinstance(pairs, list):
+        raise ValueError("delta_negative_pairs must be a list")
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or any(not isinstance(v, str) for v in pair):
+            raise ValueError("delta_negative_pairs requires product ID pairs")
+        if any(v not in index for v in pair):
+            raise ValueError(f"delta_negative_pairs references unknown product: {list(pair)}")
+        edge = tuple(sorted((index[pair[0]], index[pair[1]])))
+        if edge[0] == edge[1] or edge not in edges:
+            raise ValueError(f"delta_negative_pairs is not a current negative edge: {list(pair)}")
+        if edge in result:
+            raise ValueError(f"delta_negative_pairs has duplicates: {list(pair)}")
+        result.add(edge)
+    return result
+
+
+PARENT_CONTRACT_KEYS = ("weights_hash", "contract_hash", "input_hash", "fingerprint")
+
+
 def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backbone="tiny", weights_file=None,
           use_unit_size=False, relations=None, seed=0, *, split_manifest=None, unlabelled_negatives=False,
           augmentation="none", resume=None, device="cpu", temperature=0.1, model_kwargs=None,
           allow_grid_override=False, allow_grid_check_failure=False, progress_sink=None, progress_interval=10.0,
-          amp=False, grad_checkpoint=False):
+          amp=False, grad_checkpoint=False, init_from=None, new_edge_repeat=1, round_index=None):
     progress = Progress(progress_sink, progress_interval)
+    if init_from and resume:
+        raise ValueError("--init-from and --resume are exclusive")
+    if init_from and weights_file:
+        raise ValueError("--init-from and --weights are exclusive")
+    if type(new_edge_repeat) is not int or new_edge_repeat < 1:
+        raise ValueError("new_edge_repeat must be a positive integer")
+    if round_index is not None and (type(round_index) is not int or round_index < 1):
+        raise ValueError("round must be a positive integer")
+    if new_edge_repeat != 1 and not init_from and not resume:
+        raise ValueError("new-edge-repeat needs a parent")
     if len(products) < 2:
         raise ValueError("제품이 둘 이상 있어야 학습할 수 있다")
     grid, grid_selection = resolve_training_grid(products, grid, allow_grid_override=allow_grid_override)
@@ -176,7 +244,19 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     similar = {pair for pair in all_similar if pair <= train_ids}
     different = {pair for pair in all_different if pair <= train_ids}
     sampler = RelationBatchSampler([p.product_id for p in training], batch_size, similar, different, unlabelled_negatives=unlabelled_negatives, lineage_ids=[p.lineage_id for p in training])
+    parent = saved_resume = None  # parent: --init-from 체크포인트, saved_resume: --resume 체크포인트
+    if init_from:
+        parent = read_checkpoint(init_from)
+    elif resume:
+        saved_resume = read_checkpoint(resume)
+        if not saved_resume["metadata"].get("parent") and new_edge_repeat != 1:
+            raise ValueError("new-edge-repeat needs a parent")
+        if round_index is not None and round_index != saved_resume["metadata"].get("round"):
+            raise ValueError("resume round differs")
+    reference = parent["config"] if parent else saved_resume["config"] if saved_resume and saved_resume["metadata"].get("parent") else None
     roles, layers = build_vocab(training)
+    if reference:  # warm start 어휘: 부모 번호 유지 + 새 이름 정렬 추가
+        roles, layers = extend_vocab(reference["roles"], roles), extend_vocab(reference["layers"], layers)
     prepared_training, prepare_started = [], time.monotonic()
     progress.emit("prepare", state="started", products=len(training), grid=grid)
     for index, p in enumerate(training, 1):
@@ -191,12 +271,35 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
                  "status": "bypassed" if failures else "passed", "failures": failures}
     config = model_config(grid, roles, layers, backbone, use_unit_size, model_kwargs)
     validate_config(config)
+    if parent:
+        check_parent_compatible(parent["config"], config)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(seed)
     model = ProductEncoder(len(roles), len(layers), backbone, weights_file, use_unit_size=use_unit_size, **config["model_kwargs"]).to(device)
     model.grad_checkpoint = grad_checkpoint
+    warm = parent_record = delta_pairs = None
+    if parent:  # optimizer 를 만들기 전에 가중치만 싣는다. optimizer·scaler·RNG·epoch 는 새로 시작한다.
+        warm = init_from_checkpoint(init_from, model, expected_config=config, saved=parent)["warm_start"]
+        names = build_vocab(training)
+        for field, used in zip(("roles", "layers"), names):
+            warm[field]["unused_parent_names"] = sorted(parent["config"][field].keys() - used.keys())
+        pm = parent["metadata"]
+        parent_record = {"path": str(init_from), **{k: parent.get(k) if k in ("weights_hash", "fingerprint") else pm.get(k) for k in PARENT_CONTRACT_KEYS},
+                         "code_hash": pm.get("code_hash"), "code_hash_matches": pm.get("code_hash") == code_hash(),
+                         "epoch": parent["epoch"], "round": pm.get("round")}
+        delta_pairs = parent_delta_pairs(sampler, pm)
+    elif saved_resume and saved_resume["metadata"].get("parent"):
+        parent_record = saved_resume["metadata"]["parent"]
+        delta_pairs = saved_resume["metadata"].get("delta_negative_pairs")
+        if not isinstance(parent_record, dict) or any(k not in parent_record for k in PARENT_CONTRACT_KEYS):
+            raise ValueError("resume parent record incomplete")
+    delta = None
+    if delta_pairs is not None:
+        delta = delta_edges(sampler, delta_pairs)
+        delta_pairs = sorted(sorted(sampler_pair) for sampler_pair in delta_pairs)
+        sampler.repeat = {e: new_edge_repeat for e in delta}
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scaler = torch.cuda.amp.GradScaler(enabled=amp)  # 재개 시 스케일은 기본값에서 다시 적응한다
     records = {p.product_id: {"identity": input_identity(p), "lineage": p.lineage_id, "design": p.design_version} for p in products}
@@ -204,8 +307,11 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     contract = {"split": split_manifest, "similar": sorted(map(sorted, all_similar)), "different": sorted(map(sorted, all_different)),
                 "augmentation": augmentation, "unlabelled_negatives": unlabelled_negatives, "batch_size": batch_size,
                 "lr": lr, "temperature": temperature, "seed": seed, "grid_selection": grid_selection,
-                "allow_grid_check_failure": allow_grid_check_failure}
+                "allow_grid_check_failure": allow_grid_check_failure, "new_edge_repeat": new_edge_repeat,
+                "init_from": None if parent_record is None else {k: parent_record[k] for k in PARENT_CONTRACT_KEYS},
+                "delta_negative_pairs_hash": None if delta_pairs is None else json_hash(delta_pairs)}
     metadata = {"input_hash": input_hash, "code_hash": code_hash(), "initial_weights_hash": file_hash(weights_file) if weights_file else None,
+                "round": round_index, "parent": parent_record, "warm_start": warm, "delta_negative_pairs": delta_pairs,
                 "seed": seed, "split": split_manifest, "input_records": records,
                 "grid_selection": grid_selection, "grid_gate": grid_gate,
                 "grid_checks": [item.grid_check for item in prepared_training], "contract": contract, "contract_hash": json_hash(contract),
@@ -214,6 +320,7 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
                 "relation_coverage": relation_coverage(sampler.relation), "epochs": [], "approval": approval_status()}
     start, history = 0, []
     if resume:
+        # 저장된 metadata.parent·delta 쌍으로 만든 contract 가 저장 contract_hash 와 같아야 한다(부모 파일은 다시 읽지 않는다).
         saved = resume_checkpoint(resume, model, optimizer, gen, expected_config=config, expected_input_hash=input_hash,
                                   expected_contract_hash=metadata["contract_hash"], expected_code_hash=metadata["code_hash"])
         metadata, start, history = saved["metadata"], saved["epoch"], saved["history"]
@@ -228,6 +335,7 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
     for epoch in range(start, epochs):
         total, steps, effective, excluded = 0.0, 0, 0, 0
         seen_negative, seen_positive, seen_products = set(), set(), set()
+        delta_count = Counter()
         epoch_started = time.monotonic()
         epoch_batches = sampler.batches(gen)
         for position, indices in enumerate(epoch_batches, 1):
@@ -258,6 +366,8 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
                               elapsed_s=round(elapsed, 1), epoch_eta_s=round(elapsed / position * (len(epoch_batches) - position), 1))
             seen_positive.update(tuple(sorted((batch[i].product_id, batch[j].product_id))) for i in range(len(batch)) for j in range(i + 1, len(batch)) if rel[i, j] == 1)
             seen_negative.update(tuple(sorted((batch[i].product_id, batch[j].product_id))) for i in range(len(batch)) for j in range(i + 1, len(batch)) if rel[i, j] == NEGATIVE)
+            if delta:
+                delta_count.update(e for e in (tuple(sorted((a, b))) for a in indices for b in indices if a < b) if e in delta)
         if not steps:
             raise ValueError("no usable contrastive rows")
         history.append(total / steps)
@@ -265,7 +375,9 @@ def train(products, out_dir, epochs=100, grid=None, batch_size=8, lr=3e-4, backb
         metadata["epochs"].append({"epoch": epoch + 1, "steps": steps, "effective_pairs": effective,
                                     "excluded_positive_only_rows": excluded, "covered_negative_pairs": len(seen_negative),
                                     "required_negative_pairs": len(sampler.edges), "covered_positive_pairs": len(seen_positive),
-                                    "unsampled_products": sorted(train_ids - seen_products)})
+                                    "unsampled_products": sorted(train_ids - seen_products)}
+                                   | ({} if delta is None else {"delta_negative_pairs": len(delta), "new_edge_repeat": new_edge_repeat,
+                                                                "delta_coverage_min": min(delta_count[e] for e in delta) if delta else None}))
         save_checkpoint(out / "dl1.pt", model, config, optimizer=optimizer, generator=gen, epoch=epoch + 1, history=history, metadata=metadata)
         (out / "history.json").write_text(json.dumps(history) + "\n")
     return history
@@ -294,6 +406,9 @@ def main(argv=None):
     ap.add_argument("--unlabelled-negatives", action="store_true")
     ap.add_argument("--augmentation", choices=("none", "intensity"), default="none")
     ap.add_argument("--resume")
+    ap.add_argument("--init-from", help="warm start: load a parent dl1.pt's weights and extend its vocabulary (exclusive with --resume/--weights)")
+    ap.add_argument("--new-edge-repeat", type=int, default=1, help="schedule negative edges the parent never trained this many times per epoch")
+    ap.add_argument("--round", type=int, default=None, help="round number recorded in metadata")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--amp", action="store_true", help="CUDA fp16 autocast + GradScaler to cut activation memory")
@@ -317,7 +432,7 @@ def main(argv=None):
                     augmentation=a.augmentation, resume=a.resume, device=a.device, temperature=a.temperature, allow_grid_override=a.allow_grid_override,
                     allow_grid_check_failure=a.allow_grid_check_failure,
                     progress_sink=None if a.no_progress else stderr_sink, progress_interval=a.progress_interval,
-                    amp=a.amp, grad_checkpoint=a.grad_checkpoint)
+                    amp=a.amp, grad_checkpoint=a.grad_checkpoint, init_from=a.init_from, new_edge_repeat=a.new_edge_repeat, round_index=a.round)
     print(json.dumps({"last_loss": history[-1], "checkpoint": str(Path(a.out) / "dl1.pt"), "approval": approval_status()}))
 
 
