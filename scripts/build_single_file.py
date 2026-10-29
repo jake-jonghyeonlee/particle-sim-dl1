@@ -416,6 +416,17 @@ def _floor_arg(args):
     return None
 
 
+def _user_floor_source(args):
+    """사용자가 기준(floor)을 직접 정했는가: --floor 이거나 --floor-json(약어 포함)이면 True. 이때 실행기는 test 구획에 train 기준을 따로 넣지 않는다."""
+    if _floor_arg(args) is not None:
+        return True
+    for arg in args:
+        name = str(arg).split("=", 1)[0]
+        if name.startswith("--floor-") and "--floor-json".startswith(name):
+            return True
+    return False
+
+
 def _screen(manifest, split_path, part, out_dir, extra):
     """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다."""
     csv = out_dir / "relations.csv"
@@ -555,6 +566,8 @@ def _merge_step(prev, export, export_new):
     else:
         _call("import_png", ["--verify-bundle", prev / "export"])
     existed = manifest.is_file()
+    if existed and not (export / "bundle-integrity.json").is_file():
+        _stop(f"{export} has manifest.json but no bundle-integrity.json (killed or partial merge). Move the folder away and run again")
     if existed:
         reason = merge_inputs_match(export, prev / "export", export_new, ROUND, base_round)
         if reason:
@@ -659,7 +672,7 @@ def stage():
         parts = [train_dir / "relations.csv"]
         review.append(train_dir / "relations.csv.review.html")
         if split.get("test"):
-            floor = [] if _floor_arg(SCREEN_ARGS) is not None else ["--floor", repr(train_summary["floor"]["global"])]
+            floor = [] if _user_floor_source(SCREEN_ARGS) else ["--floor", repr(train_summary["floor"]["global"])]
             _screen(manifest, split_path, "test", test_dir, floor)
             parts.append(test_dir / "relations.csv")
             review.append(test_dir / "relations.csv.review.html")
@@ -672,7 +685,7 @@ def stage():
 
     # g. 사람이 확인할 파일
     _say("check these files before training:" + (" (the review pages list the new pairs only)" if incremental else ""))
-    for path in (export / "preview.html", export / "merge-report.json", split_path, *review, grid_report):
+    for path in (export / "preview.html", export_new / "preview.html", export / "merge-report.json", split_path, *review, grid_report):
         if path.exists():
             _say(f"  {path}")
     _say("after checking, run psdl1_train.py")
@@ -780,7 +793,7 @@ def stage():
     if missing:
         _stop("missing " + ", ".join(missing) + ". Run psdl1_assets.py first (same WORK" + (", same ROUND)" if ROUND is not None else ")"))
     reserved = ("--manifest", "--split", "--relations", "--out", "--weights", "--resume", "--ckpt")
-    warm = ("--init-from", "--round", "--new-edge-repeat") if incremental else ()  # 증분 라운드에서는 이 파일이 채운다
+    warm = ("--init-from", "--round", "--new-edge-repeat") if incremental else ("--round",) if ROUND == 1 else ()  # 이 파일이 채운다
     _check_reserved("PRETRAIN_ARGS", PRETRAIN_ARGS, reserved + warm)
     _check_reserved("TRAIN_ARGS", TRAIN_ARGS, reserved + warm + ("--config",))  # psdl1.train --config JSON 은 resume/weights 를 줄 수 있다
     _check_reserved("EVALUATE_ARGS", EVALUATE_ARGS, reserved + warm)
@@ -801,6 +814,8 @@ def stage():
                  f"without --init-from" if incremental else ""))
     _boot()
     train_args = [*TRAIN_ARGS]
+    if ROUND == 1:
+        train_args += ["--round", 1]
     if incremental:
         if not EVALUATE_ONLY:
             _previous_checkpoint(prev / "train" / "dl1.pt")
@@ -835,7 +850,13 @@ def stage():
             else:
                 _call("evaluate", ["--ckpt", checkpoint, "--manifest", manifest, "--split", split_path, "--relations", csv, "--out", evaluation, *EVALUATE_ARGS])
     if incremental:
-        _compare_rounds(prev / "train" / "evaluation.json", evaluation, tdir / "round-comparison.json")
+        problem = _evaluation_problem(evaluation, checkpoint) if evaluation.exists() else None
+        if not (EVALUATE or EVALUATE_ONLY):
+            _say("skip compare (evaluation was not requested; EVALUATE = False)")
+        elif problem:
+            _say(f"skip compare ({evaluation} does not belong to {checkpoint}: {problem})")
+        else:
+            _compare_rounds(prev / "train" / "evaluation.json", evaluation, tdir / "round-comparison.json")
     _say(f"checkpoint: {checkpoint}")
 
 

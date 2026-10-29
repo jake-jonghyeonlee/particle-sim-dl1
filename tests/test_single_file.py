@@ -992,6 +992,75 @@ def test_round_comparison_is_reused_only_for_the_same_evaluation_files(stages, r
     assert stopped.value.code == 2 and "does not match the current evaluations" in capsys.readouterr().err and sha256(out) == made
 
 
+def test_round_one_checkpoint_records_round_one_and_round_two_checks_it(stages, rounds_env, tmp_path, monkeypatch, capsys):
+    import torch
+    assert torch.load(rounds_env.r1 / "train" / "dl1.pt", map_location="cpu", weights_only=True)["metadata"]["round"] == 1
+    g = stage_globals(stages, "psdl1_train.py")  # --round is filled by the runner in ROUND = 1 as well
+    g.update(WORK=str(rounds_env.work), ROUND=1, TRAIN_ARGS=["--round", "1"])
+    with pytest.raises(SystemExit) as stopped:
+        g["stage"]()
+    assert stopped.value.code == 2 and "must not contain" in capsys.readouterr().err
+    work = tmp_path / "work"  # a parent trained as round 2 cannot be the parent of round 2
+    clone_tree(rounds_env.r2 / "train", work / "rounds" / "r01" / "train")
+    for rel in ("rounds/r02/export/manifest.json", "rounds/r02/inputs/split.json", "rounds/r02/relations/relations.csv"):
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text("x")
+    assert run_inprocess(stages, "psdl1_train.py", tmp_path / "a", monkeypatch, **round_two_train_values(work)) == 2
+    assert "was trained as round 2, but ROUND = 2 needs round 1" in capsys.readouterr().err
+
+
+def test_compare_is_skipped_when_the_evaluation_belongs_to_an_older_checkpoint(stages, rounds_env, tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    clone_tree(rounds_env.r2, work / "rounds" / "r02")
+    train = work / "rounds" / "r02" / "train"
+    (train / "dl1.pt").unlink()
+    (train / "round-comparison.json").unlink()  # the older checkpoint's evaluation.json stays
+    assert run_inprocess(stages, "psdl1_train.py", tmp_path / "a", monkeypatch, **round_two_train_values(work, EVALUATE=False, ROUND_EPOCHS=1)) == 0
+    err = capsys.readouterr().err
+    assert (train / "dl1.pt").is_file() and not (train / "round-comparison.json").exists()
+    assert "skip compare (evaluation was not requested" in err and "start compare_rounds" not in err
+    none = run_inprocess(stages, "psdl1_train.py", tmp_path / "b", monkeypatch, **round_two_train_values(work, EVALUATE=False, EVALUATE_ONLY=False))
+    assert none == 2  # the checkpoint exists now, training stops as always
+    (train / "evaluation.json").unlink()
+    assert run_inprocess(stages, "psdl1_train.py", tmp_path / "c", monkeypatch, **round_two_train_values(work, EVALUATE=False, EVALUATE_ONLY=True)) == 0
+    assert (train / "round-comparison.json").is_file() and "start compare_rounds" in capsys.readouterr().err  # a fresh evaluation of the current checkpoint is compared
+
+
+def test_floor_json_counts_as_a_user_floor_source(stages):
+    g = stage_globals(stages, "psdl1_assets.py")
+    for args in (["--floor", "2"], ["--floor=2"], ["--floor-json", "s.json"], ["--floor-j=s.json"]):
+        assert g["_user_floor_source"](args) is True
+    for args in ([], ["--factor", "8"], ["--groups", "g.json"]):
+        assert g["_user_floor_source"](args) is False
+
+
+def test_merged_folder_without_bundle_integrity_stops_as_a_partial_merge(stages, pngs, rounds_env, tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    clone_tree(rounds_env.r2 / "export", work / "rounds" / "r02" / "export")
+    clone_tree(rounds_env.r2 / "export-new", work / "rounds" / "r02" / "export-new")
+    (work / "rounds" / "r02" / "export" / "bundle-integrity.json").unlink()
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "a", monkeypatch, **round_two_values(pngs["two"], work, ROUND_MODELS_2)) == 2
+    err = capsys.readouterr().err
+    assert "no bundle-integrity.json" in err and "partial merge" in err and "start merge_bundles" not in err
+
+
+def test_round_two_lists_the_export_new_preview(stages, pngs, rounds_env, tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    clone_tree(rounds_env.r2, work / "rounds" / "r02")
+    preview = work / "rounds" / "r02" / "export-new" / "preview.html"
+    assert not preview.exists()  # the shared run used NO_PREVIEW
+    preview.write_text("<html>")
+
+    def skip_bundle_verify(g):  # a hand-added file would fail the real hash verification; only the listing is under test
+        real = g["_call"]
+        g["_call"] = lambda name, args: None if name == "import_png" and "--verify-bundle" in [str(a) for a in args] else real(name, args)
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "a", monkeypatch, patch=skip_bundle_verify, **round_two_values(pngs["two"], work, ROUND_MODELS_2)) == 0
+    assert f"  {preview}" in capsys.readouterr().err
+
+
 def test_merge_and_compare_jobs_run_from_the_single_file(bundle, rounds_env, tmp_path):
     out, _ = bundle
     namespace = __import__("runpy").run_path(str(out), run_name="psdl1_job")
