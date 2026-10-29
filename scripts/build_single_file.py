@@ -71,6 +71,9 @@ PNG_ROOT = "/data/png"                  # 모델별 PNG 폴더가 들어 있는 
 WORK = "/data/work"                     # 모든 출력이 생기는 폴더(쓸 수 있어야 한다)
 GRID = 256                              # candidate grid (psdl1_inspect.py 결과를 보고 정한다)
 NO_PREVIEW = False                      # True 면 export 미리보기를 만들지 않는다
+# ROUND: None = 지금까지와 같은 평면 WORK. 1 = 같은 단계를 WORK/rounds/r01 아래에서 한다. 2 이상 = 증분 라운드: WORK/rounds/r{k-1:02d} 의 결과가 있어야 하고,
+# PNG_ROOT 와 METADATA 에는 새 모델만 적는다. 새 묶음을 앞 라운드 묶음에 합치고, split 은 앞 배정을 유지한 채 넓히며, 새 제품이 낀 쌍만 스크리닝한다.
+ROUND = None
 # 모델별 계보(lineage)와 설계 버전. WORK/inputs/metadata.json 으로 저장된다.
 METADATA = {
     "metadata_schema_version": "dl1_png_metadata_v1",
@@ -86,6 +89,7 @@ VALIDATION_FRACTION = 0.2
 TEST_FRACTION = 0.2
 # screen_relations 추가 인자. 예: ["--groups", "/data/groups.json", "--margin", "0.05"]. --out/--manifest/--split/--partitions 는 쓰지 않는다.
 # train 구획에 같은 계보 쌍이 없으면 ["--floor", "<값>"] 이 필요하다. 있으면 두 구획(train, test)에 같은 값을 쓴다.
+# ROUND 2 이상에서는 --floor 를 쓸 수 없다. 항상 WORK/rounds/r01 의 floor 를 고정해 쓴다.
 SCREEN_ARGS = []
 LOG_FILE = WORK + "/logs/assets.log"    # stdout/stderr(진행 줄)를 이 파일에도 남긴다. 필요 없으면 None
 WORK_DIR = None                         # 패키지를 풀 폴더. None이면 이 파일 옆, 쓸 수 없으면 임시 폴더
@@ -102,7 +106,13 @@ TRAIN_ARGS = ["--backbone", "tiny", "--device", "cuda", "--batch-size", "2", "--
 EVALUATE = True                         # split 에 test 제품이 있을 때만 평가한다
 EVALUATE_ARGS = ["--topk", "5"]         # TRAIN_ARGS 에 --allow-grid-check-failure 를 넣었다면 여기에도 넣는다
 EVALUATE_ONLY = False                   # True 면 학습하지 않고 WORK/train/dl1.pt 를 평가만 한다(dl1.pt 가 있어야 한다)
-LOG_FILE = WORK + "/logs/train.log"     # stdout/stderr(진행 줄)를 이 파일에도 남긴다. 필요 없으면 None
+# ROUND 는 psdl1_assets.py 와 같은 값으로 맞춘다. None = 평면 WORK, 1 = WORK/rounds/r01, 2 이상 = 앞 라운드 dl1.pt 에서 이어 배우는 warm start(PRETRAIN 은 False).
+# 아래 세 값은 ROUND 2 이상에서만 쓴다. ROUND_EPOCHS/WARM_START_LR 이 None 이면 TRAIN_ARGS 의 --epochs/--lr 를 그대로 쓴다.
+ROUND = None
+ROUND_EPOCHS = 30                       # 증분 라운드의 epoch 수(TRAIN_ARGS 의 --epochs 를 덮어쓴다)
+WARM_START_LR = 1e-4                    # 증분 라운드의 학습률(TRAIN_ARGS 의 --lr 를 덮어쓴다)
+NEW_EDGE_REPEAT = 1                     # 앞 라운드가 학습하지 않은 negative 쌍을 epoch 마다 이 횟수만큼 일정에 넣는다
+LOG_FILE = WORK + "/logs/train.log"    # stdout/stderr(진행 줄)를 이 파일에도 남긴다. 필요 없으면 None
 WORK_DIR = None                         # 패키지를 풀 폴더. None이면 이 파일 옆, 쓸 수 없으면 임시 폴더
 # ============================== EDIT ABOVE ==============================================
 '''
@@ -122,7 +132,7 @@ import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
-ALLOWED = ("train", "pretrain", "screen_relations", "evaluate", "embed_plot", "search", "import_png", "data", "relations_draft")
+ALLOWED = ("train", "pretrain", "screen_relations", "evaluate", "embed_plot", "search", "import_png", "data", "relations_draft", "merge_bundles", "compare_rounds")
 PAYLOAD_SHA256 = "@@SHA@@"
 PAYLOAD = (
 @@PAYLOAD@@
@@ -280,6 +290,23 @@ def _stop(message):
     raise SystemExit(2)
 
 
+def _check_round(value):
+    """ROUND 는 None 이거나 1 이상의 정수여야 한다."""
+    if value is not None and (type(value) is not int or value < 1):
+        _stop(f"ROUND must be None or an integer >= 1, got {value!r}")
+
+
+def _round_dir(work, number):
+    """라운드 number 의 폴더: WORK/rounds/rNN."""
+    return Path(work) / "rounds" / f"r{number:02d}"
+
+
+def _require(paths, what):
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        _stop(what + ": missing " + ", ".join(missing))
+
+
 def _safe_streams():
     """콘솔 인코딩(예: euc_kr)이 표현하지 못하는 문자(예: en dash)가 있어도 멈추지 않고 대체 표기로 출력한다."""
     for stream in (sys.__stdout__, sys.__stderr__):
@@ -352,7 +379,7 @@ if __name__ == "__main__":
 '''
 
 TAIL_ASSETS = r'''
-def _write_json_once(path, obj, what, replace=False):
+def _write_json_once(path, obj, what, replace=False, away="the dependent WORK/export folder"):
     """파일이 없으면 쓴다. 같으면 재사용한다. 다르면 replace(export 전)일 때만 덮어쓰고 로그에 남기고, 아니면 멈춘다."""
     new = json.loads(json.dumps(obj))
     replaced = False
@@ -366,7 +393,7 @@ def _write_json_once(path, obj, what, replace=False):
             return
         if not replace:
             _stop(f"{path} differs from {what} in the EDIT block; not overwriting. Restore the EDIT value, or move {path} "
-                  f"and the dependent WORK/export folder away to start over.")
+                  f"and {away} away to start over.")
         replaced = True
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -393,8 +420,8 @@ def _screen(manifest, split_path, part, out_dir, extra):
     """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다."""
     csv = out_dir / "relations.csv"
     outputs = [csv, csv.with_name(csv.name + ".review.html"), csv.with_name(csv.name + ".summary.json")]
-    found = [p for p in outputs if p.exists()]
-    if len(found) == len(outputs):
+    found = [p for p in outputs + [csv.with_name(csv.name + ".scores.csv")] if p.exists()]
+    if all(p.exists() for p in outputs):
         _skip(f"screen_relations {part}", csv)
     elif found:
         _stop("screen_relations left partial output: " + ", ".join(str(p) for p in found) + f". Move {out_dir} away and run again")
@@ -437,17 +464,58 @@ def _write_rows(path, rows):
     os.replace(tmp, path)
 
 
-def _split(manifest, split_path):
+def _merge_incremental(base, deltas, product_ids):
+    """앞 라운드의 합친 relations.csv(base) 바이트 + 구획별 delta 행. 전체를 검사한다. (바이트, 행 수)를 돌려준다.
+    base 바이트는 그대로 두고 마지막 개행만 보장한다. 같은 쌍이 두 번 나오거나 모순·미등록 ID 가 있으면 멈춘다."""
+    import csv as csv_module
+    import io
+    from psdl1.losses import validate_relations
+    raw = Path(base).read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        raw += b"\n"
+    base_rows = _rows(base)
+    rows = list(base_rows)
+    for delta in deltas:
+        rows += _rows(delta)
+    seen, similar, different = set(), set(), set()
+    for row in rows:
+        if len(row) != 3 or row[2].strip() not in ("similar", "different"):
+            _stop(f"relation row {row} is not product_a,product_b,similar|different; not merging")
+        key = frozenset(v.strip() for v in row[:2])
+        if key in seen:
+            _stop(f"pair {sorted(key)} appears more than once in the previous round's relations and the new delta rows; not merging")
+        seen.add(key)
+        (similar if row[2].strip() == "similar" else different).add(key)
+    try:
+        validate_relations(similar, different, product_ids=product_ids)
+    except ValueError as exc:
+        _stop(f"merged relations are invalid ({exc}); not merging")
+    buffer = io.StringIO()
+    csv_module.writer(buffer, lineterminator="\n").writerows(rows[len(base_rows):])
+    return raw + buffer.getvalue().encode("utf-8"), len(rows)
+
+
+def _write_bytes(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _split(manifest, split_path, previous=None):
     from psdl1.data import _iter_manifest_products
     from psdl1.screen_relations import CHECK_GRID
-    from psdl1.split import PARTITIONS, lineage_split, validate_split
+    from psdl1.split import PARTITIONS, extend_split, lineage_split, validate_split
     products = [SimpleNamespace(product_id=p.product_id, lineage_id=p.lineage_id) for p in _iter_manifest_products(manifest, grid=CHECK_GRID)]
     if split_path.is_file():
         split = json.loads(split_path.read_text(encoding="utf-8"))
         validate_split(products, split)
         _skip("split", split_path)
     else:
-        split = lineage_split(products, seed=SPLIT_SEED, validation_fraction=VALIDATION_FRACTION, test_fraction=TEST_FRACTION)
+        if previous is None:
+            split = lineage_split(products, seed=SPLIT_SEED, validation_fraction=VALIDATION_FRACTION, test_fraction=TEST_FRACTION)
+        else:
+            split = extend_split(json.loads(previous.read_text(encoding="utf-8")), products, seed=SPLIT_SEED,
+                                 validation_fraction=VALIDATION_FRACTION, test_fraction=TEST_FRACTION)
         tmp = split_path.with_name(split_path.name + ".tmp")
         tmp.write_text(json.dumps(split, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, split_path)
@@ -455,25 +523,78 @@ def _split(manifest, split_path):
     lineage = {p.product_id: p.lineage_id for p in products}
     for part in PARTITIONS:
         _say(f"split {part}: {len(split[part])} products, {len({lineage[pid] for pid in split[part]})} lineages")
+    if previous is not None:
+        before = json.loads(previous.read_text(encoding="utf-8"))
+        old = {lineage[pid] for part in PARTITIONS for pid in before[part] if pid in lineage}
+        _say(f"split extends {previous}: {len(set(lineage.values()) - old)} new lineages, {sum(len(split[p]) for p in PARTITIONS) - sum(len(before[p]) for p in PARTITIONS)} new products")
     return split
 
 
+def _check_screen_args():
+    """SCREEN_ARGS 의 예약 인자를 시작 전에 검사한다. ROUND 2 이상은 --floor 를 받지 않고(r01 floor 를 고정한다) 증분 인자도 예약한다."""
+    reserved = ("--out", "--manifest", "--split", "--partitions")
+    if ROUND is not None and ROUND >= 2:
+        for arg in SCREEN_ARGS:
+            name = str(arg).split("=", 1)[0]
+            if name.startswith("--") and len(name) > 2 and "--floor".startswith(name):
+                _stop(f"SCREEN_ARGS must not contain {name}: ROUND >= 2 always uses the round-1 floor (--floor-json from WORK/rounds/r01). Remove it")
+        _check_reserved("SCREEN_ARGS", SCREEN_ARGS, reserved + ("--base-split", "--base-relations", "--floor-json"))
+    else:
+        _check_reserved("SCREEN_ARGS", SCREEN_ARGS, reserved)
+        _floor_arg(SCREEN_ARGS)  # --floor 약어는 시작 전에 멈춘다
+
+
+def _merge_step(prev, export, export_new):
+    """증분 라운드: 앞 라운드 묶음에 새 묶음을 합친다(검증은 매번). 입력이 다른 병합본이나 부분 출력은 멈춘다."""
+    from psdl1.merge_bundles import merge_inputs_match
+    merged_base = (prev / "export" / "merge-report.json").is_file()
+    base_round = None if merged_base else ROUND - 1
+    manifest = export / "manifest.json"
+    if merged_base:
+        _call("merge_bundles", ["--verify", prev / "export"])
+    else:
+        _call("import_png", ["--verify-bundle", prev / "export"])
+    existed = manifest.is_file()
+    if existed:
+        reason = merge_inputs_match(export, prev / "export", export_new, ROUND, base_round)
+        if reason:
+            _stop(f"{export} was not made from the current {prev / 'export'} and {export_new} ({reason}); not reusing it. "
+                  f"Restore the inputs, or move {export} away and run again")
+    elif export.exists():
+        _stop(f"{export} exists without manifest.json (killed or partial merge). Read its *.failed.json files, fix the cause, move the folder away, and run again")
+    else:
+        _call_keeping_failed("merge_bundles", ["--base", prev / "export", "--add", export_new, "--out", export, "--round", ROUND,
+                                               *([] if base_round is None else ["--base-round", base_round])], export)
+    _call("merge_bundles", ["--verify", export])
+    if existed:
+        _skip("merge", manifest)
+
+
 def stage():
-    _check_reserved("SCREEN_ARGS", SCREEN_ARGS, ("--out", "--manifest", "--split", "--partitions"))
-    _floor_arg(SCREEN_ARGS)  # --floor 약어는 시작 전에 멈춘다
+    _check_round(ROUND)
+    _check_screen_args()
+    incremental = ROUND is not None and ROUND >= 2
+    top = Path(WORK)
+    work = top if ROUND is None else _round_dir(top, ROUND)
+    prev, first = (_round_dir(top, ROUND - 1), _round_dir(top, 1)) if incremental else (None, None)
+    if incremental:
+        _require([prev / "export" / "manifest.json", prev / "export" / "bundle-integrity.json", prev / "inputs" / "split.json",
+                  prev / "relations" / "relations.csv", first / "relations" / "train" / "relations.csv.summary.json"],
+                 f"ROUND = {ROUND} needs the finished round {ROUND - 1} (and round 1's floor)")
     _boot()
-    work = Path(WORK)
     work.mkdir(parents=True, exist_ok=True)
     inputs, export, reports, relations = work / "inputs", work / "export", work / "reports", work / "relations"
+    export_new = work / "export-new"
     meta_path, order_path = inputs / "metadata.json", inputs / "stack-order.json"
     manifest, split_path, grid_report = export / "manifest.json", inputs / "split.json", reports / "grid-report.json"
     csv = relations / "relations.csv"
 
-    # a. 입력 파일. export 가 끝나기 전에는 EDIT 값으로 바꿔 쓰고, 끝난 뒤에는 다르면 멈춘다.
-    exported = manifest.is_file()
-    _write_json_once(meta_path, METADATA, "METADATA", replace=not exported)
+    # a. 입력 파일. export 가 끝나기 전에는 EDIT 값으로 바꿔 쓰고, 끝난 뒤에는 다르면 멈춘다. 증분 라운드는 export-new 가 끝난 뒤부터 고정한다.
+    exported = (export_new / "manifest.json").is_file() if incremental else manifest.is_file()
+    away = f"the export-new folder {export_new} (and the merged {export} if it exists)" if incremental else "the dependent WORK/export folder"
+    _write_json_once(meta_path, METADATA, "METADATA", replace=not exported, away=away)
     if STACK_ORDER is not None:
-        _write_json_once(order_path, STACK_ORDER, "STACK_ORDER", replace=not exported)
+        _write_json_once(order_path, STACK_ORDER, "STACK_ORDER", replace=not exported, away=away)
     elif order_path.exists():
         if exported:
             _stop(f"STACK_ORDER is None but {order_path} exists; set STACK_ORDER to its content or move the file away")
@@ -481,17 +602,20 @@ def stage():
         os.replace(order_path, moved)
         _say(f"moved {order_path} to {moved} (STACK_ORDER is None and there is no export yet)")
 
-    # b. export. 실패하면 출력 폴더를 .failed-* 로 보존한다.
-    if exported:
-        _skip("export", manifest)
-    elif export.exists():
-        _stop(f"{export} exists without manifest.json (killed or partial export). Read its diagnostic report, fix the cause, move the folder away, and run again")
+    # b. export. 실패하면 출력 폴더를 .failed-* 로 보존한다. 증분 라운드는 새 모델만 export-new 로 내보낸 뒤 앞 묶음과 합친다.
+    out = export_new if incremental else export
+    if out.joinpath("manifest.json").is_file():
+        _skip("export-new" if incremental else "export", out / "manifest.json")
+    elif out.exists():
+        _stop(f"{out} exists without manifest.json (killed or partial export). Read its diagnostic report, fix the cause, move the folder away, and run again")
     else:
-        _call_keeping_failed("import_png", ["--root", PNG_ROOT, "--out", export, "--export", "--metadata", meta_path, "--candidate-grid", GRID,
-                                            *(["--stack-order", order_path] if STACK_ORDER is not None else []), *(["--no-preview"] if NO_PREVIEW else [])], export)
+        _call_keeping_failed("import_png", ["--root", PNG_ROOT, "--out", out, "--export", "--metadata", meta_path, "--candidate-grid", GRID,
+                                            *(["--stack-order", order_path] if STACK_ORDER is not None else []), *(["--no-preview"] if NO_PREVIEW else [])], out)
 
-    # c. 묶음 검증(매번)
-    _call("import_png", ["--verify-bundle", export])
+    # c. 묶음 검증(매번). 증분 라운드는 합친 묶음까지 검증한다.
+    _call("import_png", ["--verify-bundle", out])
+    if incremental:
+        _merge_step(prev, export, export_new)
 
     # d. 격자 보고서
     reports.mkdir(parents=True, exist_ok=True)
@@ -506,12 +630,29 @@ def stage():
 
     # e. 자동 split
     inputs.mkdir(parents=True, exist_ok=True)
-    split = _split(manifest, split_path)
+    split = _split(manifest, split_path, prev / "inputs" / "split.json" if incremental else None)
 
     # f. relations. held-out 이 train 기준값(floor)에 섞이지 않도록 train 과 test 를 따로 만들어 합친다.
     review = []
     if csv.is_file():
         _skip("relations", csv)
+    elif incremental:
+        # 새 제품이 낀 쌍만 스크리닝한다. 기준(floor)은 r01 train 요약에서 고정한다. 앞 라운드의 합친 파일(사용자 수정 포함)이 바이트 그대로 앞부분이 된다.
+        train_dir, test_dir = relations / "train", relations / "test"
+        carried = ["--base-split", prev / "inputs" / "split.json", "--base-relations", prev / "relations" / "relations.csv",
+                   "--floor-json", first / "relations" / "train" / "relations.csv.summary.json"]
+        _screen(manifest, split_path, "train", train_dir, carried)
+        deltas = [train_dir / "relations.csv"]
+        review.append(train_dir / "relations.csv.review.html")
+        if split.get("test"):
+            _screen(manifest, split_path, "test", test_dir, carried)
+            deltas.append(test_dir / "relations.csv")
+            review.append(test_dir / "relations.csv.review.html")
+        else:
+            _say("no test products in the split; relations come from train only")
+        data, count = _merge_incremental(prev / "relations" / "relations.csv", deltas, [pid for part in ("train", "validation", "test") for pid in split[part]])
+        _write_bytes(csv, data)
+        _say(f"wrote merged relations: {csv} ({count} pairs; the previous round's file is its first bytes)")
     else:
         train_dir, test_dir = relations / "train", relations / "test"
         train_summary = _screen(manifest, split_path, "train", train_dir, [])
@@ -530,8 +671,8 @@ def stage():
     review = review or [p for p in (relations / "train" / "relations.csv.review.html", relations / "test" / "relations.csv.review.html")]
 
     # g. 사람이 확인할 파일
-    _say("check these files before training:")
-    for path in (export / "preview.html", split_path, *review, grid_report):
+    _say("check these files before training:" + (" (the review pages list the new pairs only)" if incremental else ""))
+    for path in (export / "preview.html", export / "merge-report.json", split_path, *review, grid_report):
         if path.exists():
             _say(f"  {path}")
     _say("after checking, run psdl1_train.py")
@@ -587,39 +728,86 @@ def _target_epochs(args):
     return value
 
 
-def _report_epochs(checkpoint):
-    """평가 전에 체크포인트가 몇 epoch 까지 학습됐는지 남긴다. 목표(TRAIN_ARGS --epochs)보다 작으면 경고만 하고 멈추지 않는다."""
+def _report_epochs(checkpoint, args=None):
+    """평가 전에 체크포인트가 몇 epoch 까지 학습됐는지 남긴다. 목표(TRAIN_ARGS --epochs, 증분 라운드는 덮어쓴 값)보다 작으면 경고만 하고 멈추지 않는다."""
     from psdl1.checkpoint import read_checkpoint
     try:
         done = int(read_checkpoint(checkpoint)["epoch"])
     except Exception as exc:
         _say(f"cannot read the epoch of {checkpoint}: {type(exc).__name__}: {exc}")
         return
-    target = _target_epochs(TRAIN_ARGS)
-    _say(f"checkpoint {checkpoint} was trained for {done} epochs" + (f" (TRAIN_ARGS --epochs: {target})" if target is not None else ""))
+    target = _target_epochs(TRAIN_ARGS if args is None else args)
+    _say(f"checkpoint {checkpoint} was trained for {done} epochs" + (f" ({'TRAIN_ARGS ' if args is None else 'target '}--epochs: {target})" if target is not None else ""))
     if target is not None and done < target:
         _say(f"WARNING: the checkpoint has {done} of {target} epochs (training may have stopped early); evaluating it anyway")
 
 
+def _previous_checkpoint(path):
+    """증분 라운드의 부모 dl1.pt 를 열어 보고, 기록된 round 가 있으면 ROUND-1 과 같은지 본다."""
+    from psdl1.checkpoint import read_checkpoint
+    try:
+        recorded = read_checkpoint(path)["metadata"].get("round")
+    except Exception as exc:
+        _stop(f"cannot read the previous round's checkpoint {path}: {type(exc).__name__}: {exc}")
+    if recorded is not None and recorded != ROUND - 1:
+        _stop(f"{path} was trained as round {recorded}, but ROUND = {ROUND} needs round {ROUND - 1}")
+
+
+def _compare_rounds(previous, evaluation, comparison):
+    """이전 라운드 평가가 있으면 쿼리 단위로 비교한다. 이미 있는 결과는 두 평가 파일이 같을 때만 재사용하고, 다르면 덮어쓰지 않고 멈춘다."""
+    from psdl1.compare_rounds import comparison_inputs_match
+    if not previous.is_file():
+        _say(f"skip compare (no previous evaluation: {previous})")
+    elif not evaluation.is_file():
+        _say(f"skip compare (no evaluation in this round: {evaluation})")
+    elif comparison.exists():
+        reason = comparison_inputs_match(comparison, previous, evaluation)
+        if reason:
+            _stop(f"{comparison} does not match the current evaluations ({reason}); not overwriting. Move it away and run again")
+        _skip("compare", comparison)
+    else:
+        _call("compare_rounds", ["--previous", previous, "--current", evaluation, "--out", comparison])
+
+
 def stage():
-    work = Path(WORK)
+    _check_round(ROUND)
+    incremental = ROUND is not None and ROUND >= 2
+    top = Path(WORK)
+    work = top if ROUND is None else _round_dir(top, ROUND)
+    prev = _round_dir(top, ROUND - 1) if incremental else None
     manifest, split_path, csv = work / "export" / "manifest.json", work / "inputs" / "split.json", work / "relations" / "relations.csv"
     missing = [str(p) for p in (manifest, split_path, csv) if not p.is_file()]
     if missing:
-        _stop("missing " + ", ".join(missing) + ". Run psdl1_assets.py first (same WORK)")
+        _stop("missing " + ", ".join(missing) + ". Run psdl1_assets.py first (same WORK" + (", same ROUND)" if ROUND is not None else ")"))
     reserved = ("--manifest", "--split", "--relations", "--out", "--weights", "--resume", "--ckpt")
-    _check_reserved("PRETRAIN_ARGS", PRETRAIN_ARGS, reserved)
-    _check_reserved("TRAIN_ARGS", TRAIN_ARGS, reserved + ("--config",))  # psdl1.train --config JSON 은 resume/weights 를 줄 수 있다
-    _check_reserved("EVALUATE_ARGS", EVALUATE_ARGS, reserved)
+    warm = ("--init-from", "--round", "--new-edge-repeat") if incremental else ()  # 증분 라운드에서는 이 파일이 채운다
+    _check_reserved("PRETRAIN_ARGS", PRETRAIN_ARGS, reserved + warm)
+    _check_reserved("TRAIN_ARGS", TRAIN_ARGS, reserved + warm + ("--config",))  # psdl1.train --config JSON 은 resume/weights 를 줄 수 있다
+    _check_reserved("EVALUATE_ARGS", EVALUATE_ARGS, reserved + warm)
     pdir, tdir = work / "pretrain", work / "train"
     checkpoint, evaluation = tdir / "dl1.pt", tdir / "evaluation.json"
+    if incremental:
+        if PRETRAIN:
+            _stop("warm-start replaces pretraining in round >= 2; set PRETRAIN = False")
+        if not EVALUATE_ONLY and not (prev / "train" / "dl1.pt").is_file():
+            _stop(f"ROUND = {ROUND} needs the previous round's checkpoint {prev / 'train' / 'dl1.pt'}; train round {ROUND - 1} first")
     if EVALUATE_ONLY:
         if not checkpoint.is_file():
             _stop(f"EVALUATE_ONLY needs {checkpoint}; train first (EVALUATE_ONLY = False)")
     elif checkpoint.exists():
         _stop(f"{checkpoint} already exists; psdl1.train would overwrite it, so this file stops. To train again, move {tdir} to another name. "
-              f"To only evaluate this checkpoint, set EVALUATE_ONLY = True")
+              f"To only evaluate this checkpoint, set EVALUATE_ONLY = True"
+              + (f". An interrupted warm-start run is resumed from a JOBS-style file: train --resume {checkpoint} with the same --epochs/--lr/--new-edge-repeat, "
+                 f"without --init-from" if incremental else ""))
     _boot()
+    train_args = [*TRAIN_ARGS]
+    if incremental:
+        if not EVALUATE_ONLY:
+            _previous_checkpoint(prev / "train" / "dl1.pt")
+        override = (["--epochs", ROUND_EPOCHS] if ROUND_EPOCHS is not None else []) + (["--lr", WARM_START_LR] if WARM_START_LR is not None else [])
+        train_args += ["--init-from", prev / "train" / "dl1.pt", "--round", ROUND, "--new-edge-repeat", NEW_EDGE_REPEAT, *override]
+        if override and not EVALUATE_ONLY:
+            _say("round override: " + " ".join(str(v) for v in override) + " (replaces the --epochs/--lr in TRAIN_ARGS)")
     if not EVALUATE_ONLY:
         weights = []
         if PRETRAIN:
@@ -632,13 +820,13 @@ def stage():
             else:
                 _call("pretrain", ["--manifest", manifest, "--split", split_path, "--out", pdir, *PRETRAIN_ARGS])
             weights = ["--weights", pdir / "backbone.pt"]
-        _call("train", ["--manifest", manifest, "--split", split_path, "--relations", csv, "--out", tdir, *weights, *TRAIN_ARGS])
+        _call("train", ["--manifest", manifest, "--split", split_path, "--relations", csv, "--out", tdir, *weights, *train_args])
     if EVALUATE or EVALUATE_ONLY:
         split = json.loads(split_path.read_text(encoding="utf-8"))
         if not split.get("test"):
             _say("skip evaluate (no test products in the split; evaluate uses only the test partition)")
         else:
-            _report_epochs(checkpoint)
+            _report_epochs(checkpoint, train_args if incremental else None)
             if evaluation.exists():
                 problem = _evaluation_problem(evaluation, checkpoint)
                 if problem:
@@ -646,6 +834,8 @@ def stage():
                 _skip("evaluate", evaluation)
             else:
                 _call("evaluate", ["--ckpt", checkpoint, "--manifest", manifest, "--split", split_path, "--relations", csv, "--out", evaluation, *EVALUATE_ARGS])
+    if incremental:
+        _compare_rounds(prev / "train" / "evaluation.json", evaluation, tdir / "round-comparison.json")
     _say(f"checkpoint: {checkpoint}")
 
 

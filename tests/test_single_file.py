@@ -2,9 +2,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -145,14 +147,14 @@ def run_script(script, cwd):
 
 
 def assets_values(png, work, **overrides):
-    values = dict(PNG_ROOT=str(png), WORK=str(work), GRID=128, NO_PREVIEW=False, METADATA=METADATA, STACK_ORDER=STACK_ORDER, SPLIT_SEED=0,
+    values = dict(PNG_ROOT=str(png), WORK=str(work), GRID=128, NO_PREVIEW=False, ROUND=None, METADATA=METADATA, STACK_ORDER=STACK_ORDER, SPLIT_SEED=0,
                   VALIDATION_FRACTION=0.2, TEST_FRACTION=0.2, SCREEN_ARGS=["--floor", "2"])
     return {**values, **overrides}
 
 
 def train_values(work, **overrides):
     values = dict(WORK=str(work), PRETRAIN=False, PRETRAIN_ARGS=[], TRAIN_ARGS=["--backbone", "tiny", "--epochs", "1", "--batch-size", "2", "--allow-grid-check-failure"],
-                  EVALUATE=True, EVALUATE_ARGS=[], EVALUATE_ONLY=False)
+                  EVALUATE=True, EVALUATE_ARGS=[], EVALUATE_ONLY=False, ROUND=None, ROUND_EPOCHS=30, WARM_START_LR=1e-4, NEW_EDGE_REPEAT=1)
     return {**values, **overrides}
 
 
@@ -572,3 +574,433 @@ def test_target_epochs_reads_train_args(stages):
     g = stage_globals(stages, "psdl1_train.py")
     assert g["_target_epochs"](["--backbone", "tiny"]) == 100 and g["_target_epochs"](["--epochs", "7"]) == 7
     assert g["_target_epochs"](["--epochs=9"]) == 9 and g["_target_epochs"](["--epoch", "4"]) == 4 and g["_target_epochs"](["--epochs", "x"]) is None
+
+
+# ---- 증분 라운드 (ROUND) ----
+# X6 fixture: r01 = 계보 FA(A1,A2) FB(B1,B2) FC(C1,C2). split 은 손으로 정한다: train = FA+FB(서로 다른 계보라 negative 가 생긴다, --floor 2 로 동일 이미지도 different),
+# test = FC(C1-C2 similar 쌍이 평가 가능한 positive). r02 = D1(FA) E1,E2(새 계보 FE). 계보 4개이므로 extend_split 의 목표 수 int(4*0.2)-기존 = 0 이라 새 계보는 train 으로 간다.
+# 그래서 r02 train 에는 새 제품이 낀 negative 쌍이 있고 test 의 C1-C2 쌍이 평가된다.
+
+ROUND_MODELS_1 = {"A1": "FA", "A2": "FA", "B1": "FB", "B2": "FB", "C1": "FC", "C2": "FC"}
+ROUND_MODELS_2 = {"D1": "FA", "E1": "FE", "E2": "FE"}
+ROUND_SPLIT_1 = {"schema_version": SPLIT_VERSION, "train": ["A1", "A2", "B1", "B2"], "validation": [], "test": ["C1", "C2"]}
+ROUND_EVALUATE_ARGS = ["--allow-grid-check-failure"]
+
+
+def lineage_metadata(models):
+    return {"metadata_schema_version": "dl1_png_metadata_v1", "models": {name: {"lineage_id": lineage, "design_version": "V1"} for name, lineage in models.items()}}
+
+
+def script_in(stages, name, folder, **values):
+    folder.mkdir(parents=True, exist_ok=True)
+    return stage_script(stages, name, folder, **values)
+
+
+def clone_tree(source, destination):
+    """폴더를 복사한다. 큰 마스크(.npy)는 hard link 로 걸어 시간을 줄이고, 나머지는 복사해 사본을 고쳐도 원본이 변하지 않게 한다."""
+    shutil.copytree(source, destination, copy_function=lambda s, d: os.link(s, d) if s.endswith(".npy") else shutil.copy2(s, d))
+
+
+def run_inprocess(stages, name, folder, monkeypatch, patch=None, **values):
+    """실행기의 stage() 를 이 프로세스에서 돌린다(_boot 는 건너뛴다). 종료 코드를 돌려준다."""
+    g = __import__("runpy").run_path(str(script_in(stages, name, folder, **values)), run_name="psdl1_stage")["_say"].__globals__  # the live module globals
+    g["_boot"] = lambda: None
+    if patch:
+        patch(g)
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    try:
+        g["stage"]()
+    except SystemExit as exc:
+        return exc.code
+    return 0
+
+
+def fail_first_merge(g):
+    """첫 merge_bundles 호출이 출력 폴더를 만든 뒤 실패하게 한다(나머지 호출은 그대로)."""
+    real = g["_call"]
+
+    def flaky(name, args):
+        argv = [str(a) for a in args]
+        if name == "merge_bundles" and "--out" in argv and not flaky.done:
+            flaky.done = True
+            out = Path(argv[argv.index("--out") + 1])
+            out.mkdir()
+            (out / "merge-report.json").write_text("{}")
+            raise SystemExit(2)
+        return real(name, args)
+    flaky.done = False
+    g["_call"] = flaky
+
+
+@pytest.fixture(scope="module")
+def pngs(tmp_path_factory):
+    roots = {}
+    for key, models in (("one", ROUND_MODELS_1), ("two", ROUND_MODELS_2), ("alt", {"G1": "FG", "G2": "FG"}), ("three", {"F1": "FF"})):
+        roots[key] = tmp_path_factory.mktemp(f"png-{key}")
+        for model in models:
+            write_wide_import_fixture(roots[key], model=model)
+    return roots
+
+
+def build_round_one(stages, pngs, base, rounds):
+    """r01 을 만든다(assets + train + evaluate). rounds=False 면 평면 WORK(ROUND=None), True 면 WORK/rounds/r01(ROUND=1)."""
+    work = base / "work"
+    round_value = 1 if rounds else None
+    folder = (work / "rounds" / "r01" if rounds else work) / "inputs"
+    folder.mkdir(parents=True)
+    (folder / "split.json").write_text(json.dumps(ROUND_SPLIT_1))
+    assets = script_in(stages, "psdl1_assets.py", base / "s-assets-1", **assets_values(pngs["one"], work, ROUND=round_value, METADATA=lineage_metadata(ROUND_MODELS_1), NO_PREVIEW=True))
+    result = run_script(assets, base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    train = script_in(stages, "psdl1_train.py", base / "s-train-1", **train_values(work, ROUND=round_value, EVALUATE_ARGS=ROUND_EVALUATE_ARGS))
+    result = run_script(train, base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    return work
+
+
+def round_two_values(png, work, models, **overrides):
+    return assets_values(png, work, ROUND=2, METADATA=lineage_metadata(models), SCREEN_ARGS=[], NO_PREVIEW=True, **overrides)
+
+
+def round_two_train_values(work, **overrides):
+    return train_values(work, **{**dict(ROUND=2, ROUND_EPOCHS=2, WARM_START_LR=5e-4, NEW_EDGE_REPEAT=2, EVALUATE_ARGS=ROUND_EVALUATE_ARGS), **overrides})
+
+
+@pytest.fixture(scope="module")
+def rounds_env(stages, pngs, tmp_path_factory):
+    """r01(ROUND=1) 와 r02(ROUND=2) 를 assets·train 까지 한 번 돌린 WORK. 읽기만 하는 테스트가 공유한다."""
+    base = tmp_path_factory.mktemp("rounds-run")
+    work = build_round_one(stages, pngs, base, rounds=True)
+    assets = script_in(stages, "psdl1_assets.py", base / "s-assets-2", **round_two_values(pngs["two"], work, ROUND_MODELS_2))
+    result = run_script(assets, base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    train = script_in(stages, "psdl1_train.py", base / "s-train-2", **round_two_train_values(work))
+    result = run_script(train, base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    return SimpleNamespace(base=base, work=work, assets=assets, train=train, r1=work / "rounds" / "r01", r2=work / "rounds" / "r02", log=work / "logs" / "stage.log")
+
+
+@pytest.fixture(scope="module")
+def flat_env(stages, pngs, tmp_path_factory):
+    base = tmp_path_factory.mktemp("flat-run")
+    return SimpleNamespace(base=base, work=build_round_one(stages, pngs, base, rounds=False))
+
+
+@pytest.fixture(scope="module")
+def alt_env(stages, pngs, rounds_env, tmp_path_factory):
+    """r01 의 합친 relations.csv 를 손으로 고친(마지막 개행 제거, 한 행의 쌍 순서 바꿈) 사본에서 다른 모델(G1, G2)로 r02 assets 를 돌린다."""
+    base = tmp_path_factory.mktemp("alt-run")
+    work = base / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    path = work / "rounds" / "r01" / "relations" / "relations.csv"
+    original = path.read_bytes()
+    lines = original.decode().splitlines()
+    index = next(i for i, line in enumerate(lines) if line.endswith(",different"))
+    a, b, kind = lines[index].split(",")
+    lines[index] = f"{b},{a},{kind}"
+    edited = "\n".join(lines).encode()  # no trailing newline
+    assert edited != original.rstrip(b"\n")
+    path.write_bytes(edited)
+    script = script_in(stages, "psdl1_assets.py", base / "s-assets-2", **round_two_values(pngs["alt"], work, {"G1": "FG", "G2": "FG"}))
+    result = run_script(script, base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    return SimpleNamespace(base=base, work=work, r2=work / "rounds" / "r02", edited=edited)
+
+
+def test_round_one_in_rounds_layout_matches_the_flat_layout(rounds_env, flat_env):
+    def files(root):
+        return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    flat = [f for f in files(flat_env.work) if not f.startswith("logs/")]
+    assert not (flat_env.work / "rounds").exists()  # ROUND = None keeps the flat WORK
+    assert flat == files(rounds_env.r1)
+    assert {p.name for p in rounds_env.r1.iterdir()} == {"inputs", "export", "reports", "relations", "train"}
+    for rel in ("relations/relations.csv", "inputs/split.json", "inputs/metadata.json"):
+        assert (flat_env.work / rel).read_bytes() == (rounds_env.r1 / rel).read_bytes()
+
+
+def test_round_two_assets_merges_extends_split_and_screens_only_delta(rounds_env):
+    import psdl1.data as data
+    from psdl1.merge_bundles import verify_merged_bundle
+    ids = sorted(p.product_id for p in data.load_manifest(rounds_env.r2 / "export" / "manifest.json"))
+    assert ids == sorted({**ROUND_MODELS_1, **ROUND_MODELS_2})
+    assert verify_merged_bundle(rounds_env.r2 / "export")["product_count"] == 9
+    old, new = (json.loads((r / "inputs" / "split.json").read_text(encoding="utf-8")) for r in (rounds_env.r1, rounds_env.r2))
+    for part in ("train", "validation", "test"):
+        assert set(old[part]) <= set(new[part])
+    assert {"D1", "E1", "E2"} <= set(new["train"])  # D1 joins its lineage FA; the new lineage FE goes to train (int(4 * 0.2) - 0 = 0 validation/test lineages)
+    read = lambda r, part: json.loads((r / "relations" / part / "relations.csv.summary.json").read_text(encoding="utf-8"))
+    train, test, first = read(rounds_env.r2, "train"), read(rounds_env.r2, "test"), read(rounds_env.r1, "train")
+    assert train["mode"] == "incremental" and train["delta_pairs"] == train["expected_delta_pairs"] == {"train": 15}  # 3 new * 4 old + 3 new pairs
+    assert test["delta_pairs"] == {"test": 0}
+    assert train["floor"]["global"] == test["floor"]["global"] == first["floor"]["global"] == 2.0 and train["floor"]["source"] == "base_summary"
+    before, after = (r / "relations" / "relations.csv" for r in (rounds_env.r1, rounds_env.r2))
+    assert after.read_bytes().startswith(before.read_bytes())
+    assert len(_rows(after)) == len(_rows(before)) + 15
+    text = rounds_env.log.read_text(encoding="utf-8")
+    assert "relations/train/relations.csv.review.html" in text and "export/merge-report.json" in text and "start merge_bundles --base" in text
+
+
+def _rows(path):
+    import csv
+    with open(path, newline="", encoding="utf-8") as handle:
+        return [row for row in csv.reader(handle) if row]
+
+
+def test_round_two_train_warm_starts_and_compares_rounds(rounds_env):
+    import torch
+    from psdl1.checkpoint import read_checkpoint
+    saved = torch.load(rounds_env.r2 / "train" / "dl1.pt", map_location="cpu", weights_only=True)
+    meta = saved["metadata"]
+    assert meta["parent"]["weights_hash"] == read_checkpoint(rounds_env.r1 / "train" / "dl1.pt")["weights_hash"]
+    assert meta["round"] == 2 and meta["contract"]["lr"] == 5e-4 and meta["contract"]["new_edge_repeat"] == 2 and saved["epoch"] == 2
+    comparison = json.loads((rounds_env.r2 / "train" / "round-comparison.json").read_text(encoding="utf-8"))
+    assert [q["query_id"] for q in comparison["common_queries"]] == ["C1", "C2"]
+    text = rounds_env.log.read_text(encoding="utf-8")
+    assert "round override: --epochs 2 --lr 0.0005" in text and "start compare_rounds" in text and "start train" in text and "--init-from" in text
+
+
+def test_round_two_second_run_skips_everything_except_verify(rounds_env):
+    work, log = rounds_env.work, rounds_env.log
+    snapshot = lambda: {p: sha256(p) for p in work.rglob("*") if p.is_file() and p.parent.name != "logs"}
+    before, taken = log.read_text(encoding="utf-8"), snapshot()
+    result = run_script(rounds_env.assets, rounds_env.base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    second = log.read_text(encoding="utf-8")[len(before):]
+    starts = [line.split("start ", 1)[1].split()[0:2] for line in second.splitlines() if "] " in line and " start " in line]
+    assert starts == [["import_png", "--verify-bundle"], ["import_png", "--verify-bundle"], ["merge_bundles", "--verify"]]  # the only jobs that run again
+    kinds = " ".join(skips(second))
+    for step in ("METADATA", "STACK_ORDER", "export-new", "merge", "grid report", "split", "relations"):
+        assert f"skip {step} (exists:" in kinds
+    assert snapshot() == taken
+    again = run_script(rounds_env.train, rounds_env.base)  # train stops on the existing checkpoint and points at --resume without --init-from
+    assert again.returncode != 0 and "already exists" in again.stderr and "train --resume" in again.stderr and "without --init-from" in again.stderr and " start " not in again.stderr
+    assert snapshot() == taken
+
+
+def test_round_two_evaluate_only_reuses_evaluation_and_comparison(stages, rounds_env):
+    work = rounds_env.work
+    snapshot = lambda: {p: sha256(p) for p in work.rglob("*") if p.is_file() and p.parent.name != "logs"}
+    taken = snapshot()
+    only = script_in(stages, "psdl1_train.py", rounds_env.base / "s-train-only", **round_two_train_values(work, EVALUATE_ONLY=True))
+    result = run_script(only, rounds_env.base)
+    assert result.returncode == 0, result.stderr[-3000:]
+    kinds = " ".join(skips(result.stderr))
+    assert "skip evaluate (exists:" in kinds and "skip compare (exists:" in kinds
+    assert " start train" not in result.stderr and " start evaluate" not in result.stderr and " start compare_rounds" not in result.stderr
+    assert "was trained for 2 epochs (target --epochs: 2)" in result.stderr and "WARNING" not in result.stderr
+    assert snapshot() == taken
+
+
+def test_round_two_requires_the_previous_round_and_refuses_pretrain(stages, rounds_env, tmp_path):
+    empty = run_script(script_in(stages, "psdl1_assets.py", tmp_path / "a", **round_two_values(tmp_path / "no-png", tmp_path / "w", ROUND_MODELS_2)), tmp_path)
+    assert empty.returncode != 0 and "STOP:" in empty.stderr and "needs the finished round 1" in empty.stderr and " start " not in empty.stderr and "psdl1 from" not in empty.stderr
+    pretrain = run_script(script_in(stages, "psdl1_train.py", tmp_path / "b", **round_two_train_values(rounds_env.work, PRETRAIN=True)), tmp_path)
+    assert pretrain.returncode != 0 and "STOP:" in pretrain.stderr and "replaces pretraining" in pretrain.stderr and " start " not in pretrain.stderr and "psdl1 from" not in pretrain.stderr
+    work = tmp_path / "work"
+    for rel in ("rounds/r02/export/manifest.json", "rounds/r02/inputs/split.json", "rounds/r02/relations/relations.csv"):
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text("x")
+    nothing = run_script(script_in(stages, "psdl1_train.py", tmp_path / "c", **round_two_train_values(work)), tmp_path)
+    assert nothing.returncode != 0 and "STOP:" in nothing.stderr and "previous round's checkpoint" in nothing.stderr and " start " not in nothing.stderr and "psdl1 from" not in nothing.stderr
+
+
+def test_previous_checkpoint_round_must_match_when_recorded(stages, monkeypatch, capsys):
+    import psdl1.checkpoint as checkpoint
+    g = stage_globals(stages, "psdl1_train.py")
+    g["ROUND"] = 3
+    for saved in ({"metadata": {}}, {"metadata": {"round": 2}}):
+        monkeypatch.setattr(checkpoint, "read_checkpoint", lambda path, saved=saved: saved)
+        g["_previous_checkpoint"](Path("dl1.pt"))
+    for saved in ({"metadata": {"round": 5}}, {"metadata": {"round": 3}}):
+        monkeypatch.setattr(checkpoint, "read_checkpoint", lambda path, saved=saved: saved)
+        with pytest.raises(SystemExit) as stopped:
+            g["_previous_checkpoint"](Path("dl1.pt"))
+        assert stopped.value.code == 2 and "needs round 2" in capsys.readouterr().err
+    monkeypatch.setattr(checkpoint, "read_checkpoint", lambda path: (_ for _ in ()).throw(ValueError("broken")))
+    with pytest.raises(SystemExit):
+        g["_previous_checkpoint"](Path("dl1.pt"))
+    assert "cannot read the previous round's checkpoint" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "1", 1.0])
+def test_round_must_be_none_or_a_positive_integer(stages, value, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    with pytest.raises(SystemExit) as stopped:
+        g["_check_round"](value)
+    assert stopped.value.code == 2 and "ROUND must be None or an integer >= 1" in capsys.readouterr().err
+    for fine in (None, 1, 7):
+        g["_check_round"](fine)
+
+
+@pytest.mark.parametrize("key", ["TRAIN_ARGS", "PRETRAIN_ARGS", "EVALUATE_ARGS"])
+@pytest.mark.parametrize("flag", ["--init-from", "--init", "--round", "--new-edge"])
+def test_round_reserved_train_arguments_stop_before_anything_starts(stages, rounds_env, key, flag, capsys):
+    g = stage_globals(stages, "psdl1_train.py")
+    g.update(WORK=str(rounds_env.work), ROUND=2, PRETRAIN=False, **{key: [flag, "x"]})
+    with pytest.raises(SystemExit) as stopped:
+        g["stage"]()
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and "must not contain" in err and " start " not in err
+
+
+@pytest.mark.parametrize("arg", ["--base-sp", "--base-split", "--base-relations=x", "--floor-j", "--floor-json", "--floor-json=x"])
+def test_round_reserved_screen_arguments_stop_before_anything_starts(stages, tmp_path, arg, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    g.update(WORK=str(tmp_path / "w"), ROUND=2, SCREEN_ARGS=[arg, "x"])
+    with pytest.raises(SystemExit) as stopped:
+        g["stage"]()
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and "must not contain" in err and " start " not in err and not (tmp_path / "w").exists()
+    g.update(ROUND=1)  # the incremental flags are not reserved before round 2 (only the exact --floor family keeps today's rules)
+    g["_check_screen_args"]()
+
+
+@pytest.mark.parametrize("round_value", [None, 1, 2])
+@pytest.mark.parametrize("args,flat_stops", [(["--floor", "2"], False), (["--floor=2"], False), (["--flo", "2"], True), (["--floor-j", "x"], False)])
+def test_floor_arguments_follow_the_round_mode(stages, round_value, args, flat_stops, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    g.update(ROUND=round_value, SCREEN_ARGS=args)
+    if round_value == 2 or flat_stops:
+        with pytest.raises(SystemExit) as stopped:
+            g["_check_screen_args"]()
+        err = capsys.readouterr().err
+        assert stopped.value.code == 2
+        if round_value == 2:  # an exact --floor (and its abbreviations) is refused; --floor-j is an abbreviation of the reserved --floor-json
+            assert ("abbreviation of --floor-json" in err) == (args[0] == "--floor-j") and ("round-1 floor" in err) == (args[0] != "--floor-j")
+    else:
+        g["_check_screen_args"]()  # ROUND None/1 keep today's behaviour
+
+
+def test_incremental_relations_keep_base_bytes_and_stop_on_bad_rows(stages, tmp_path, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    base, train, test = tmp_path / "base.csv", tmp_path / "train.csv", tmp_path / "test.csv"
+    base.write_bytes(b"A,B,similar\r\nA,C,different")  # hand-edited bytes: CRLF and no trailing newline
+    train.write_text("D,A,different\n")
+    test.write_text("")
+    data, count = g["_merge_incremental"](base, [train, test], ["A", "B", "C", "D"])
+    assert data == b"A,B,similar\r\nA,C,different\nD,A,different\n" and count == 3
+    for rows, ids, message in (("C,A,similar\n", ["A", "B", "C", "D"], "more than once"), ("D,Z,different\n", ["A", "B", "C", "D"], "invalid"), ("D,A,maybe\n", ["A", "B", "C", "D"], "not product_a")):
+        train.write_text(rows)
+        with pytest.raises(SystemExit) as stopped:
+            g["_merge_incremental"](base, [train, test], ids)
+        assert stopped.value.code == 2 and message in capsys.readouterr().err
+
+
+def test_hand_edited_round_one_relations_are_the_byte_prefix_of_round_two(alt_env):
+    after = (alt_env.r2 / "relations" / "relations.csv").read_bytes()
+    assert after.startswith(alt_env.edited) and after[len(alt_env.edited):len(alt_env.edited) + 1] == b"\n"  # the missing last newline was added, nothing else changed
+    summary = json.loads((alt_env.r2 / "relations" / "train" / "relations.csv.summary.json").read_text(encoding="utf-8"))
+    assert summary["delta_pairs"] == {"train": 9} and len(_rows(alt_env.r2 / "relations" / "relations.csv")) == 7 + 9
+
+
+def test_flat_work_moved_into_r01_supports_round_two(stages, pngs, flat_env, tmp_path):
+    work = tmp_path / "work"
+    for name in ("inputs", "export", "reports", "relations", "train"):
+        clone_tree(flat_env.work / name, work / "rounds" / "r01" / name)
+    assets = run_script(script_in(stages, "psdl1_assets.py", tmp_path / "a", **round_two_values(pngs["two"], work, ROUND_MODELS_2)), tmp_path)
+    assert assets.returncode == 0, assets.stderr[-3000:]
+    train = run_script(script_in(stages, "psdl1_train.py", tmp_path / "b", **round_two_train_values(work, ROUND_EPOCHS=1)), tmp_path)
+    assert train.returncode == 0, train.stderr[-3000:]
+    import torch
+    from psdl1.checkpoint import read_checkpoint
+    meta = torch.load(work / "rounds" / "r02" / "train" / "dl1.pt", map_location="cpu", weights_only=True)["metadata"]
+    assert meta["parent"]["weights_hash"] == read_checkpoint(flat_env.work / "train" / "dl1.pt")["weights_hash"] and meta["round"] == 2
+    assert (work / "rounds" / "r02" / "train" / "round-comparison.json").is_file()
+
+
+def test_failed_merge_is_kept_aside_and_the_next_run_merges_again(stages, pngs, rounds_env, tmp_path, monkeypatch, capsys):
+    from psdl1.merge_bundles import verify_merged_bundle
+    work = tmp_path / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    values = round_two_values(pngs["two"], work, ROUND_MODELS_2)
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "a", monkeypatch, patch=fail_first_merge, **values) == 2
+    r2 = work / "rounds" / "r02"
+    kept = [p for p in r2.iterdir() if p.name.startswith("export.failed-")]
+    assert len(kept) == 1 and (kept[0] / "merge-report.json").read_text() == "{}" and not (r2 / "export").exists() and (r2 / "export-new" / "manifest.json").is_file()
+    assert "merge_bundles failed" in capsys.readouterr().err
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "b", monkeypatch, **values) == 0
+    assert verify_merged_bundle(r2 / "export")["product_count"] == 9 and kept[0].is_dir()
+    assert "skip export-new (exists:" in capsys.readouterr().err
+
+
+def test_round_two_metadata_is_frozen_once_export_new_exists(stages, pngs, rounds_env, tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    values = round_two_values(pngs["two"], work, ROUND_MODELS_2)
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "a", monkeypatch, patch=fail_first_merge, **values) == 2  # export-new succeeded, the merge failed
+    capsys.readouterr()
+    r2 = work / "rounds" / "r02"
+    meta, before = r2 / "inputs" / "metadata.json", sha256(r2 / "inputs" / "metadata.json")
+    changed = lineage_metadata({**ROUND_MODELS_2, "D1": "FZ"})
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "b", monkeypatch, **{**values, "METADATA": changed}) == 2
+    err = capsys.readouterr().err
+    assert "STOP:" in err and "differs from METADATA" in err and "export-new" in err and "start import_png" not in err and "start merge_bundles" not in err
+    assert sha256(meta) == before and (r2 / "export-new" / "manifest.json").is_file() and any(p.name.startswith("export.failed-") for p in r2.iterdir())
+    stack = dict(values, STACK_ORDER={**STACK_ORDER, "order": ["U", "N", "C4", "U5", "C6"]})  # STACK_ORDER is frozen the same way
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "c", monkeypatch, **stack) == 2
+    assert "differs from STACK_ORDER" in capsys.readouterr().err
+
+
+def test_merge_is_not_reused_when_it_was_made_from_other_inputs(stages, pngs, rounds_env, alt_env, tmp_path, monkeypatch, capsys):
+    work = tmp_path / "work"
+    clone_tree(rounds_env.r1, work / "rounds" / "r01")
+    clone_tree(rounds_env.r2 / "export", work / "rounds" / "r02" / "export")  # a valid merged bundle of r01 + (D1, E1, E2)
+    clone_tree(alt_env.r2 / "export-new", work / "rounds" / "r02" / "export-new")  # a valid, different new bundle (G1, G2)
+    snapshot = lambda: {p: sha256(p) for p in (work / "rounds" / "r02" / "export").rglob("*") if p.is_file()}
+    taken = snapshot()
+    values = round_two_values(pngs["alt"], work, {"G1": "FG", "G2": "FG"})
+    assert run_inprocess(stages, "psdl1_assets.py", tmp_path / "a", monkeypatch, **values) == 2
+    err = capsys.readouterr().err
+    assert "STOP:" in err and "was not made from the current" in err and "manifest_sha256 differs" in err and " start merge_bundles" not in err
+    assert snapshot() == taken
+
+
+def test_round_three_merges_onto_a_merged_base(stages, pngs, rounds_env, tmp_path):
+    work = tmp_path / "work"
+    clone_tree(rounds_env.work / "rounds", work / "rounds")
+    values = assets_values(pngs["three"], work, ROUND=3, METADATA=lineage_metadata({"F1": "FF"}), SCREEN_ARGS=[], NO_PREVIEW=True, VALIDATION_FRACTION=0.0)
+    result = run_script(script_in(stages, "psdl1_assets.py", tmp_path / "a", **values), tmp_path)
+    assert result.returncode == 0, result.stderr[-3000:]
+    report = json.loads((work / "rounds" / "r03" / "export" / "merge-report.json").read_text(encoding="utf-8"))
+    assert report["round"] == 3 and report["base"]["kind"] == "merge" and report["product_count"] == 10 and "start merge_bundles --verify" in result.stderr
+    assert "--base-round" not in result.stderr  # only an import base bundle needs it
+    summary = json.loads((work / "rounds" / "r03" / "relations" / "train" / "relations.csv.summary.json").read_text(encoding="utf-8"))
+    assert summary["delta_pairs"] == {"train": 7} and summary["floor"]["global"] == 2.0
+
+
+def test_round_comparison_is_reused_only_for_the_same_evaluation_files(stages, rounds_env, tmp_path, monkeypatch, capsys):
+    g = stage_globals(stages, "psdl1_train.py")
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    previous, current, out = tmp_path / "previous.json", tmp_path / "current.json", tmp_path / "round-comparison.json"
+    shutil.copy(rounds_env.r1 / "train" / "evaluation.json", previous)
+    shutil.copy(rounds_env.r2 / "train" / "evaluation.json", current)
+    g["_compare_rounds"](tmp_path / "missing.json", current, out)
+    assert not out.exists() and "skip compare (no previous evaluation" in capsys.readouterr().err
+    g["_compare_rounds"](previous, current, out)
+    assert out.is_file()
+    capsys.readouterr()
+    made = sha256(out)
+    g["_compare_rounds"](previous, current, out)
+    assert "skip compare (exists:" in capsys.readouterr().err and sha256(out) == made
+    document = json.loads(current.read_text(encoding="utf-8"))  # same checkpoint weights, different results
+    document["recall_at_k"] = 0.0
+    for query in document["queries"]:
+        query["recall_at_k"] = 0.0
+    current.write_text(json.dumps(document))
+    with pytest.raises(SystemExit) as stopped:
+        g["_compare_rounds"](previous, current, out)
+    assert stopped.value.code == 2 and "does not match the current evaluations" in capsys.readouterr().err and sha256(out) == made
+
+
+def test_merge_and_compare_jobs_run_from_the_single_file(bundle, rounds_env, tmp_path):
+    out, _ = bundle
+    namespace = __import__("runpy").run_path(str(out), run_name="psdl1_job")
+    assert "merge_bundles" in namespace["ALLOWED"] and "compare_rounds" in namespace["ALLOWED"]
+    comparison = tmp_path / "comparison.json"
+    jobs = [("merge_bundles", ["--verify", str(rounds_env.r2 / "export")]),
+            ("compare_rounds", ["--previous", str(rounds_env.r1 / "train" / "evaluation.json"), "--current", str(rounds_env.r2 / "train" / "evaluation.json"), "--out", str(comparison)])]
+    script = tmp_path / "job.py"
+    script.write_text(with_jobs(out.read_text(encoding="utf-8"), jobs, tmp_path / "job.log", tmp_path / "pkg"), encoding="utf-8")
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, cwd=tmp_path, env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"})
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert json.loads(comparison.read_text(encoding="utf-8"))["schema_version"] == "dl1_round_comparison_v1"
