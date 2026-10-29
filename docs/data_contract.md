@@ -603,6 +603,23 @@ file changes were explicitly authorized by the coordinator's T3 scope addition; 
 schema/model/NPY-loader/lock change or installation occurred.
 
 
+## Merged round bundles
+
+`python -m psdl1.merge_bundles --base <dir> --add <dir> --out <new dir> --round N [--base-round M]` joins an earlier bundle with a newly exported one for [incremental rounds](USAGE.md#68-증분-라운드-새-제품만-더하는-학습). `--base` is an import bundle (then `--base-round` is required) or an earlier merged bundle. `--add` must be an exported import bundle. Both inputs are verified first. The merge stops on duplicate product IDs or a difference in `candidate_grid`, `cnt_mode` or `schema_version`, and `N` must exceed the base round. `--out` must be a new path. Unchanged `dl1_shape_v1_draft` manifest and `dl1_png_bundle_v3` integrity versions are used; the new report has its own `merge_schema_version: dl1_merge_bundle_v1`.
+
+Layout of the output folder:
+
+- `manifest.json` — the merged manifest. Every mask path is under `assets/rNN/` (base assets of an import bundle go to `assets/r<base round>/`, added assets to `assets/r<N>/`; earlier merged paths do not change).
+- `assets/rNN/*.npy` — the bool masks, byte-identical to their sources.
+- `merge-report.json` — `merge_schema_version`, `round`, `candidate_grid`, `cnt_mode`, `schema_version`, `base` and `add` (`path`, `kind`, `manifest_sha256`, `integrity_sha256`, `product_ids`; `base` also has `round`), `assets`, `asset_method`, `generated_manifest_sha256`, `product_count`. Each `assets` entry has `path`, `source_bundle` (`base`|`add`), `source_path`, `sha256` and its own `asset_method` (`hardlink`|`copy`). The top-level `asset_method` is `hardlink`, `copy` or `mixed`.
+- `bundle-integrity.json` — hashes of every file, as in an import bundle. There is no `import-report.json`, preview or diagnostic evidence.
+
+`merge_bundles --verify <dir>` (used alone) checks hash integrity of every listed file, exact file listing, report/manifest/asset hash links, bool mask headers and shapes, and then reads the whole manifest with the strict manifest iterator. It prints `verification_meaning: bundle_hash_integrity_not_electrical_verification`. It does not repeat the import diagnostic evidence checks of `import_png --verify-bundle`, and it is not electrical verification.
+
+Assets are hard-linked when the file system allows it and copied otherwise (for example across devices). A hard link shares content **and permissions** with its source file. Never edit a source bundle's asset in place: the merged bundle then fails verification. A permission change on either path changes both. Deleting a whole source bundle is safe, because the merged bundle keeps its own link or copy. The single-file runner still needs both source folders when it reruns a merge, to compare their hashes with `merge-report.json`.
+
+A failed merge never deletes anything. The output folder stays, and `manifest.json`, `manifest.pending.json` and `bundle-integrity.json` are renamed `*.failed*.json`. A folder without `manifest.json` or `bundle-integrity.json` is a partial output; start again with a new `--out`.
+
 ## Shared full-frame transform and T4 integration — 2026-10-12
 
 `data.frame_transform` centralizes the existing rounded area resize and central pad:

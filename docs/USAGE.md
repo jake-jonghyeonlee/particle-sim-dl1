@@ -746,6 +746,183 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 
 학습 파일은 CUDA 를 확인하지 않는다. 얇은 선 경고를 승인했다면 `TRAIN_ARGS` 에 `"--allow-grid-check-failure"` 를 넣는다.
 
+### 6.8 증분 라운드 (새 제품만 더하는 학습)
+
+모델이 많으면 한 번에 모두 넣고 모든 관계를 판정하기 어렵다. 증분 라운드는 일부로 먼저 학습하고, 이후 라운드마다 **새 제품만** 내보내 앞 결과에 더한다. 단일 파일 실행기(6.7)의 `ROUND` 값으로 쓴다.
+
+#### 라운드의 규칙
+
+- 새 제품만 내보낸다(`export-new`). 앞 라운드 묶음에 합쳐 새 묶음(`export`)을 만든다. 합친 묶음은 `merge_bundles` 가 만든다.
+- 앞 라운드의 split 배정은 바뀌지 않는다. 새 제품만 배정한다. 같은 계보(lineage)의 옛 제품이 있으면 그 구획으로 간다. 새 계보는 목표 비율에 맞춰 validation/test/train 에 나눈다.
+- 새 제품이 낀 쌍(새×새, 새×기존)만 스크리닝한다. 기존×기존 쌍은 앞 라운드 결과를 쓴다.
+- 판정 기준(floor)은 r01 train 구획의 `relations.csv.summary.json` 값으로 고정한다. 라운드마다 다시 계산하지 않는다.
+- 학습은 앞 라운드 `dl1.pt` 에서 이어 배운다(warm start). epoch 는 짧게, 학습률은 낮게 준다. 옛 관계는 모두 다시 학습한다(full replay). `NEW_EDGE_REPEAT` 로 새 negative 쌍을 더 자주 보게 할 수 있다.
+- 라운드 k 의 `relations.csv` 는 라운드 k-1 의 합친 `relations.csv`(사용자 수정 포함)를 **바이트 그대로 앞에** 두고 이번 라운드 delta 행을 뒤에 붙인 파일이다.
+
+#### 실행기 설정
+
+`psdl1_assets.py` 와 `psdl1_train.py` 의 `ROUND` 를 같은 값으로 맞춘다.
+
+| `ROUND` | 뜻 |
+|---|---|
+| `None` | 지금까지와 같은 평면 `WORK`(`WORK/inputs`, `WORK/export` …) |
+| `1` | 같은 단계를 `WORK/rounds/r01/` 아래에서 한다. 학습에는 `--round 1` 이 붙는다 |
+| `2` 이상 | 증분 라운드. `WORK/rounds/r{k-1}/` 의 결과가 있어야 한다 |
+
+`ROUND` 는 `None` 이거나 1 이상의 정수여야 한다(아니면 `STOP: ROUND must be None or an integer >= 1`).
+
+라운드 폴더 구조(`WORK/rounds/rNN/`):
+
+| 폴더·파일 | 내용 |
+|---|---|
+| `inputs/` | `metadata.json`(그 라운드 PNG 의 모델만), `stack-order.json`, `split.json` |
+| `export-new/` | 라운드 ≥ 2 에서만. 새 모델만 `import_png --export` 한 묶음 |
+| `export/` | r01 은 그 라운드 묶음. 라운드 ≥ 2 는 앞 묶음 + `export-new` 병합본(`assets/r01/`, `assets/r02/` …, `merge-report.json`) |
+| `reports/` | `grid-report.json`(병합 manifest 기준) |
+| `relations/train/`, `relations/test/` | 구획별 스크리닝 결과. 라운드 ≥ 2 에서는 **delta 쌍만** 담는다(`relations.csv`, `.scores.csv`, `.review.html`, `.summary.json`). test 구획은 split 에 test 제품이 있을 때만 생긴다 |
+| `relations/relations.csv` | 합친 전체 파일. 학습에 쓰인다 |
+| `train/` | `dl1.pt`, `history.json`, `evaluation.json`, 라운드 ≥ 2 는 `round-comparison.json` |
+
+라운드 ≥ 2 에서 입력과 값은 이렇게 쓴다.
+
+- `psdl1_assets.py`: `PNG_ROOT` 와 `METADATA` 에 **새 모델만** 적는다. 옛 모델 ID 를 다시 적으면 병합이 중복 ID 로 거부한다. `GRID`·`STACK_ORDER` 는 앞 라운드와 같아야 한다(병합은 `candidate_grid`·`cnt_mode`·`schema_version` 이 다르면 거부한다). `SPLIT_SEED`·`VALIDATION_FRACTION`·`TEST_FRACTION` 은 새 계보의 배정에만 쓰인다.
+- `SCREEN_ARGS`: `--floor`(전체·`=` 형태·약어 모두)를 쓸 수 없다(`--floor-json` 을 실행기가 r01 summary 로 채운다). `--base-split`·`--base-relations`·`--floor-json` 도 쓰지 않는다. 라운드 1 이하(`None`, `1`)는 지금과 같이 `--floor` 를 쓸 수 있다.
+- `psdl1_train.py`: 아래 세 값은 라운드 ≥ 2 에서만 쓴다. `ROUND_EPOCHS`·`WARM_START_LR` 가 `None` 이면 `TRAIN_ARGS` 의 `--epochs`·`--lr` 를 그대로 쓴다.
+
+| 항목 | 기본 | 뜻 |
+|---|---|---|
+| `ROUND_EPOCHS` | `30` | 이번 라운드의 총 epoch. `TRAIN_ARGS` 의 `--epochs` 를 덮어쓴다 |
+| `WARM_START_LR` | `1e-4` | 이번 라운드 학습률. `TRAIN_ARGS` 의 `--lr` 를 덮어쓴다 |
+| `NEW_EDGE_REPEAT` | `1` | 앞 라운드가 학습하지 않은 negative 쌍을 epoch 마다 이 횟수만큼 일정에 넣는다 |
+
+- 덮어쓸 때 로그에 `round override: --epochs 30 --lr 0.0001 (replaces the --epochs/--lr in TRAIN_ARGS)` 와 같은 줄이 남는다.
+- 라운드 ≥ 2 에서는 `PRETRAIN` 을 `False` 로 둔다. 사전학습은 r01 에서만 한다(`True` 이면 `STOP: warm-start replaces pretraining in round >= 2; set PRETRAIN = False`).
+- 실행기가 채우는 인자가 하나 늘었다. 라운드 ≥ 2 는 `--init-from`·`--round`·`--new-edge-repeat`, `ROUND = 1` 은 `--round` 를 `PRETRAIN_ARGS`·`TRAIN_ARGS`·`EVALUATE_ARGS` 에 쓰지 않는다. 약어도 시작 전에 멈춘다.
+- `JOBS` 방식 파일에서도 `merge_bundles`, `compare_rounds` 작업 이름을 쓸 수 있다.
+
+라운드 ≥ 2 의 assets 순서는 이렇다.
+
+1. 시작 전 검사: `rounds/r{k-1}` 의 `export/manifest.json`, `export/bundle-integrity.json`, `inputs/split.json`, `relations/relations.csv` 와 r01 의 `relations/train/relations.csv.summary.json` 이 없으면 멈춘다.
+2. `inputs/` 쓰기 → `export-new/` 내보내기 → `import_png --verify-bundle`(매번).
+3. 병합: 앞 묶음을 검증(`merge_bundles --verify` 또는 `import_png --verify-bundle`)하고 `export/` 를 만든 뒤 `merge_bundles --verify export`(매번).
+4. 격자 보고서 → split 확장(앞 배정 유지, 로그에 구획별 제품·계보 수와 새 계보 수) → delta 스크리닝 → 합친 `relations.csv` 쓰기.
+
+라운드 ≥ 2 의 train 순서는 앞 라운드 `train/dl1.pt` 를 `--init-from` 으로 주고 학습한 뒤, 평가하고(split 에 test 제품이 있을 때), 앞 라운드 `train/evaluation.json` 이 있으면 `compare_rounds` 로 두 평가를 비교하는 것이다.
+
+#### 학습 전에 사람이 확인할 파일
+
+- `rNN/relations/train/relations.csv.review.html`, `rNN/relations/test/relations.csv.review.html` — **delta 쌍만** 나온다. 앞 라운드 쌍은 이미 확인한 것으로 본다.
+- `rNN/export/merge-report.json` — 어느 묶음의 어느 제품·asset 이 들어갔는지, asset 을 hard link 로 놓았는지 복사했는지.
+- `rNN/export-new/preview.html` — 새 제품의 내보내기 미리보기(`NO_PREVIEW=False` 일 때).
+- `rNN/inputs/split.json`, `rNN/reports/grid-report.json`.
+
+relations 를 손으로 고치려면 합친 `rNN/relations/relations.csv` 를 고친다. 다음 라운드가 이 파일을 바이트 그대로 앞에 쓴다. `rNN/relations/train/relations.csv` 같은 구획 파일을 고쳐도 합친 파일에는 반영되지 않는다. 다음 라운드의 `relations/` 를 만든 뒤에 앞 라운드 파일을 고치면 이미 만든 `relations/relations.csv` 는 건너뛰므로 반영되지 않는다. 그때는 다음 라운드의 `relations/` 를 다른 이름으로 옮기고 assets 를 다시 실행한다.
+
+#### 평면 WORK 를 r01 로 쓰기
+
+이미 `ROUND = None` 으로 돌린 `WORK` 가 있으면 실행기가 자동으로 옮기지 않는다. 직접 옮긴다.
+
+```bash
+mkdir -p "$WORK/rounds/r01"
+mv "$WORK/inputs" "$WORK/export" "$WORK/reports" "$WORK/relations" "$WORK/train" "$WORK/rounds/r01/"
+# 사전학습을 했다면 같이 옮긴다: mv "$WORK/pretrain" "$WORK/rounds/r01/"
+```
+
+- 옮긴 뒤 `ROUND = 2` 로 두고 `PNG_ROOT`·`METADATA` 를 새 모델만으로 바꿔 `psdl1_assets.py` 를 실행한다.
+- `evaluation.json` 은 경로가 아니라 체크포인트 해시(`checkpoint_weights_hash`)로 `dl1.pt` 와 맞춘다. 같이 옮겨도 계속 유효하다.
+- 평면 WORK 로 학습한 `dl1.pt` 에는 `round` 기록이 없다. 실행기는 `round` 기록이 없는 부모를 받아 준다. 기록이 있는데 `k-1` 이 아니면 멈춘다.
+- `WORK/logs/` 는 옮기지 않아도 된다.
+
+#### 중단과 복구
+
+중단된 흔적마다 다음 실행이 하는 일이 다르다. 모든 `STOP:` 은 종료 코드 2 이며 산출물을 지우지 않는다.
+
+| 단계 | 중단 흔적 | 다음 실행 |
+|---|---|---|
+| export-new | `export-new.failed-<시각>`(내보내기 실패) | 새로 내보낸다 |
+| export-new | `manifest.json` 없는 `export-new/`(강제 종료) | `STOP: <폴더> exists without manifest.json (killed or partial export). Read its diagnostic report, fix the cause, move the folder away, and run again` |
+| `METADATA` 변경 | `export-new/manifest.json` 이 생긴 뒤 `inputs/metadata.json` 과 EDIT 값이 다름 | `STOP: <파일> differs from METADATA in the EDIT block; not overwriting. Restore the EDIT value, or move <파일> and the export-new folder … away to start over.` |
+| merge | `export.failed-<시각>`(병합 실패) | 새로 병합한다 |
+| merge | `manifest.json` 없는 `export/` | `STOP: <폴더> exists without manifest.json (killed or partial merge). Read its *.failed.json files, fix the cause, move the folder away, and run again` |
+| merge | `manifest.json` 은 있고 `bundle-integrity.json` 이 없음 | `STOP: <폴더> has manifest.json but no bundle-integrity.json (killed or partial merge). Move the folder away and run again` |
+| merge | 다른 입력으로 만든 병합본 | `STOP: <폴더> was not made from the current <앞 export> and <export-new> (<이유>); not reusing it. Restore the inputs, or move <폴더> away and run again` |
+| split | `split.json.tmp` 만 있음 | 무시하고 새로 쓴다(`os.replace` 로 바꾸므로 반쪽 파일이 남지 않는다) |
+| screen | 산출물 일부만 있음 | `STOP: screen_relations left partial output: <파일들>. Move <폴더> away and run again` |
+| screen | `relations.csv.summary.json` 이 깨짐 | `STOP: 부분 출력: <폴더> 를 옮긴 뒤 다시 실행 (…)` |
+| relations 합치기 | 같은 쌍이 두 번, 모순, 미등록 ID | `STOP: … not merging`(`pair … appears more than once …`, `merged relations are invalid (…); not merging`) |
+| train | `train/dl1.pt` 가 있음 | `STOP: <dl1.pt> already exists; psdl1.train would overwrite it, so this file stops. …` 뒤에 아래 resume 안내가 붙는다 |
+| compare | `round-comparison.json` 이 지금 두 평가와 다름 | `STOP: <파일> does not match the current evaluations (<이유>); not overwriting. Move it away and run again` |
+| 앞 라운드 없음 | 필수 파일 없음 | `STOP: ROUND = 2 needs the finished round 1 (and round 1's floor): missing <경로들>` |
+| 앞 체크포인트 | `dl1.pt` 없음 / 열 수 없음 / `round` 불일치 | `STOP: ROUND = 2 needs the previous round's checkpoint <경로>; train round 1 first`, `STOP: cannot read the previous round's checkpoint …`, `STOP: <경로> was trained as round 3, but ROUND = 2 needs round 1` |
+
+- 병합은 입력 폴더(`rounds/r{k-1}/export`, `rNN/export-new`)가 그대로 있어야 다시 실행할 때 확인할 수 있다. 병합이 끝난 뒤에도 이 두 폴더를 지우지 않는다.
+- 끝난 단계는 건너뛴다. 로그에 `skip export-new`, `skip merge`, `skip split`, `skip relations`, `skip evaluate`, `skip compare` 가 남는다. 묶음 검증은 매번 한다.
+- 평가가 `train` 의 `dl1.pt` 와 맞지 않으면 비교는 건너뛴다(`skip compare (… does not belong to …)`).
+
+#### 중단된 warm start 이어서 학습하기
+
+`train/dl1.pt` 가 있으면 실행기는 멈춘다. 학습이 중간에 끊겼다면 JOBS 방식 파일(`--out` 으로 만든 것)에서 `train --resume` 을 쓴다.
+
+```python
+JOBS = [
+    ("train", [
+        "--manifest", "/data/work/rounds/r02/export/manifest.json",
+        "--split", "/data/work/rounds/r02/inputs/split.json",
+        "--relations", "/data/work/rounds/r02/relations/relations.csv",
+        "--out", "/data/work/rounds/r02/train",
+        "--resume", "/data/work/rounds/r02/train/dl1.pt",
+        "--backbone", "tiny", "--device", "cuda", "--batch-size", "2",
+        "--epochs", "30", "--lr", "0.0001", "--new-edge-repeat", "1",
+    ]),
+]
+```
+
+- `--epochs`·`--lr`·`--new-edge-repeat` 는 중단된 실행과 **같은 값**을 준다. 달라지면 계약 불일치로 거부된다.
+- `--init-from` 은 다시 주지 않는다(`--resume` 과 함께 쓸 수 없다). 앞 라운드 `dl1.pt` 가 없어도 재개할 수 있다. 필요한 부모 정보는 체크포인트 안에 있다.
+- `--round` 를 주면 저장된 값과 같아야 한다. 생략해도 된다.
+- 그 밖의 `--batch-size`·`--backbone`·분할·relations 는 중단된 실행과 같아야 한다(`docs/training.md` 의 Checkpoints and resume).
+- 끝난 뒤 `ROUND = 2` 로 `psdl1_train.py` 를 `EVALUATE_ONLY = True` 로 실행하면 평가와 비교만 한다.
+
+#### 손으로 같은 일을 하기
+
+```bash
+R1=$WORK/rounds/r01; R2=$WORK/rounds/r02
+# 1) 새 제품만 내보낸 묶음(R2/export-new)은 import_png --export 로 만든다(5장). 그 뒤 병합한다.
+.venv/bin/python -m psdl1.merge_bundles --base "$R1/export" --add "$R2/export-new" --out "$R2/export" --round 2 --base-round 1
+.venv/bin/python -m psdl1.merge_bundles --verify "$R2/export"
+# 2) split 확장은 Python 함수다: psdl1.split.extend_split(이전 split dict, 현재 제품 목록, seed=0, validation_fraction=0.2, test_fraction=0.2)
+# 3) delta 스크리닝(--out 에는 delta 행만 쓰인다)
+.venv/bin/python -m psdl1.screen_relations --manifest "$R2/export/manifest.json" --split "$R2/inputs/split.json" \
+  --partitions train --out "$R2/relations/train/relations.csv" \
+  --base-split "$R1/inputs/split.json" --base-relations "$R1/relations/relations.csv" \
+  --floor-json "$R1/relations/train/relations.csv.summary.json"
+# 4) warm start 학습
+.venv/bin/python -m psdl1.train --manifest "$R2/export/manifest.json" --split "$R2/inputs/split.json" \
+  --relations "$R2/relations/relations.csv" --out "$R2/train" --init-from "$R1/train/dl1.pt" \
+  --round 2 --epochs 30 --lr 1e-4 --new-edge-repeat 2 --backbone tiny --device cuda --batch-size 2
+# 5) 라운드 비교(두 evaluation.json 이 있을 때)
+.venv/bin/python -m psdl1.compare_rounds --previous "$R1/train/evaluation.json" --current "$R2/train/evaluation.json" \
+  --out "$R2/train/round-comparison.json"
+```
+
+- `merge_bundles`: `--base` 가 import 묶음이면 `--base-round` 가 필요하고, 병합 묶음이면 쓰지 않는다. `--round` 는 base 의 라운드보다 커야 한다. `--out` 은 새 경로여야 한다. 실패하면 종료 코드 2 와 `merge_bundles: <이유>` 를 stderr 에 낸다.
+- `screen_relations` 증분 모드는 `--base-split` 과 `--base-relations` 를 함께 주고, `--floor` 또는 `--floor-json` 중 정확히 하나를 준다. 이때 `--out` 파일은 delta 행만 담는다. 합친 `relations.csv` 는 앞 라운드 합친 파일 바이트 뒤에 (끝 개행을 보장하고) delta 행을 붙여 직접 만든다. 같은 쌍이 두 번 나오면 안 된다.
+- `--base-relations` 에는 앞 라운드의 **합친** 파일을 준다. 두 ID 가 모두 같은 구획의 옛 제품인 행만 판정에 쓰고, 나머지 행은 무시한다. 매니페스트에 없는 ID 가 있으면 거부한다.
+- `train --init-from`: 부모 모델 설정(`--backbone`, `--use-unit-size`, 격자)이 같아야 한다. 규칙은 `docs/training.md` 에 있다.
+- `compare_rounds`: 이미 있는 `--out` 은 덮어쓰지 않는다. `topk` 가 다르거나 같은 체크포인트의 평가 두 개면 거부한다.
+
+#### 알아 둘 한계
+
+- 라운드 ≥ 2 에서는 `--floor` 를 어떤 형태로도 쓸 수 없다. floor 는 항상 r01 train 구획 값이다. 라운드마다 다시 계산하지 않는다.
+- 앞 라운드에서 `unknown` 으로 남은 기존×기존 쌍은 다시 판정하지 않는다. 새×기존 쌍만 새로 판정한다.
+- 증분 스크리닝의 구획 간 `different` 쌍 상한(`--cross-group-fraction`)은 **delta 쌍만으로** 계산한다. 앞 라운드의 쌍 수는 세지 않는다.
+- 라운드 비교는 쿼리별로 두 `evaluation.json` 을 맞춘다. 이전 체크포인트를 새 데이터로 다시 평가하지 않는다. 라운드마다 후보 풀이 커지므로 recall 하락이 모두 망각은 아니다. 쿼리마다 후보 수가 같이 기록되고, 경고(`possible_forgetting`, `candidate_pool_grew`, `same_input_hash`, `queries_lost_metric`, `queries_missing_from_current`)를 먼저 읽는다.
+- 모델 설정(`GRID`, backbone, `use_unit_size`, `model_kwargs`)은 부모와 같아야 한다. 다르면 학습이 optimizer 전에 거부한다.
+- `screen_relations` 의 `--flo` 는 `--floor` 와 `--floor-json` 에 모두 맞아 argparse 가 모호하다며 거부한다. 전체 이름을 쓴다.
+- 병합 묶음의 `--verify` 는 hash 무결성과 manifest 전체 검증이다. `import_png` 의 진단 증거(`import-report.json`)는 병합본에 없다. 자세한 뜻은 `docs/data_contract.md` 의 Merged round bundles 에 있다.
+
+코드를 바꾼 뒤에는 ETX 단일 파일을 다시 만들어 올린다(`.venv/bin/python scripts/build_single_file.py --out-dir outputs/etx --overwrite`; `outputs/` 는 git 에 없다).
+
 ## 7. 출력 형식
 
 ### 7.1 격자 보고서 (`psdl1.data --report`)
