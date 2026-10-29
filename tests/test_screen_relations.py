@@ -231,6 +231,10 @@ def test_incremental_uses_the_fixed_floor_from_summary_and_outputs_only_delta_ro
         main([*args, "--floor", "0.5"])
     with pytest.raises(SystemExit):
         main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(root / "o2.csv"), "--base-split", str(base_split_path)])
+    with pytest.raises(SystemExit):  # incremental needs exactly one of --floor / --floor-json
+        main([*args[:-2], "--out", str(root / "o3.csv")])
+    with pytest.raises(ValueError, match="exactly one of floor"):
+        screen(manifest, split, partitions=("train", "test"), factor=FACTOR, base_split=json.loads(base_split_path.read_text()), base_relations=base_relations)
     with pytest.raises(ValueError, match="floor and floor_spec"):
         screen(manifest, split, factor=FACTOR, floor=0.5, floor_spec={"global": 0.9, "groups": {}})
 
@@ -250,7 +254,7 @@ def test_incremental_rejects_conflicts(case, rows, mismatch, message):
         screen(manifest, split, partitions=("train", "test"), factor=FACTOR, floor=0.9, base_relations=base_relations, base_split={**base_split, **(mismatch or {})})
 
 
-def test_incremental_ignores_rows_of_other_partitions_and_non_incremental_output_is_unchanged(case, tmp_path):
+def test_incremental_ignores_rows_of_other_partitions_and_non_incremental_output_is_deterministic_and_has_no_incremental_keys(case, tmp_path):
     manifest, split, root, _ = case
     base_split, _, with_noise, _ = incremental_inputs(root, split, rows=("RING_R00,RING_T00,similar\n", "BUS_R00,RING_R00,different\n", "BUS_R00,BUS_T00,similar\n"))
     only_train = screen(manifest, split, partitions=("train",), factor=FACTOR, floor=0.9, base_split=base_split, base_relations=with_noise)

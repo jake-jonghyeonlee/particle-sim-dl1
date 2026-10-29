@@ -260,6 +260,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     if floor is not None and floor_spec is not None:
         raise ValueError("floor and floor_spec are exclusive")
     incremental = base_split is not None
+    if incremental and floor is None and floor_spec is None:
+        raise ValueError("incremental screening needs exactly one of floor and floor_spec")
     if type(factor) is not int or factor <= 0 or type(tolerance) is not int or tolerance < 0 or not 0 <= margin < 1 or not 0 <= cross_group_fraction <= 1:
         raise ValueError("factor > 0, tolerance >= 0, margin in [0,1) and cross_group_fraction in [0,1] required")
     if anchor not in {"auto", CNT, "ELECTRODES"} or not 0 < max_shift <= 1 or type(candidates) is not int or candidates < 1:
@@ -296,6 +298,12 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                               "anchor": result["anchor"], "shift_y_um": round(result["shift"][0] * result["um_per_px"], 3), "shift_x_um": round(result["shift"][1] * result["um_per_px"], 3),
                               "alignment_score": None if result["anchor_score"] is None else round(result["anchor_score"], 4), "roi_overlap": round(float(result["roi_overlap"]), 4),
                               "alignment_flag": ";".join(result["flags"])})
+    if incremental:
+        new_of = {part: sorted(set(split[part]) - old_of[part]) for part in partitions}
+        expected = {part: len(new_of[part]) * (len(new_of[part]) - 1) // 2 + len(new_of[part]) * len(old_of[part]) for part in partitions}
+        counts = {part: sum(p["partition"] == part for p in pairs) for part in partitions}
+        if counts != expected:
+            raise ValueError(f"delta pair count {counts} differs from the expected n(n-1)/2 + n*m {expected}")
     same = [p for p in pairs if p["same_lineage"]]
     global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (min(p["similarity"] for p in same) if same else None)
     if global_floor is None:
@@ -350,10 +358,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                 raise ValueError(f"base relation {kind} {sorted((a, b))} " + ("contradicts" if tier != kind else "duplicates") + f" a delta pair judged {tier}")
         summary = summarize(pairs, split, partitions, group_of, global_floor, group_floor, margin,
                             extra_different={part: {pid for a, b, k, q in used if k == "different" and q == part for pid in (a, b)} for part in partitions})
-        new_of = {part: sorted(set(split[part]) - old_of[part]) for part in partitions}
         summary.update({"mode": "incremental", "base": {"relations": str(base_relations), "sha256": base_sha, "pairs": len(used)},
-                        "new_products": new_of, "delta_pairs": {part: sum(p["partition"] == part for p in pairs) for part in partitions},
-                        "expected_delta_pairs": {part: len(new_of[part]) * (len(new_of[part]) - 1) // 2 + len(new_of[part]) * len(old_of[part]) for part in partitions}})
+                        "new_products": new_of, "delta_pairs": counts, "expected_delta_pairs": expected})
     if floor_spec is not None:
         summary["floor"]["source"] = "base_summary"
     return {"pairs": pairs, "signatures": signatures, "floor": floor_info, "summary": summary}
@@ -501,6 +507,8 @@ def main(argv=None):
         ap.error("--floor and --floor-json are exclusive")
     if (a.base_split is None) != (a.base_relations is None):
         ap.error("--base-split and --base-relations go together")
+    if a.base_split is not None and a.floor is None and a.floor_json is None:
+        ap.error("incremental screening needs exactly one of --floor and --floor-json")
     split = json.loads(Path(a.split).read_text(encoding="utf-8"))
     extra = {} if a.base_split is None else {"base_split": json.loads(Path(a.base_split).read_text(encoding="utf-8")), "base_relations": a.base_relations}
     if a.floor_json is not None:

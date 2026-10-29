@@ -11,7 +11,7 @@ def query(qid, recall, known=4, unknown=2, lineage=None):
 
 
 def evaluation(path, queries, *, weights="w1", topk=5, input_hash="in1"):
-    available = [q["recall_at_k"] for q in queries if q["recall_at_k"] is not None]
+    available = [q["recall_at_k"] for q in queries if q.get("recall_at_k") is not None]
     path.write_text(json.dumps({"schema_version": "dl1_evaluation_v1", "topk": topk, "checkpoint_weights_hash": weights, "input_hash": input_hash, "split_hash": "s",
                                 "evaluated_queries": len(available), "recall_at_k": sum(available) / len(available) if available else None, "queries": queries}, indent=2) + "\n")
     return path
@@ -44,6 +44,27 @@ def test_compare_warns_on_forgetting_and_same_input_hash(tmp_path):
     current = evaluation(tmp_path / "c.json", [query("A1", 0.5), query("B1", 0.5)], weights="w2")
     warnings = compare(previous, current)["warnings"]
     assert warnings[0].startswith("possible_forgetting:") and any(w.startswith("same_input_hash") for w in warnings)
+
+
+def test_compare_reports_lost_metric_and_queries_missing_from_current(tmp_path):
+    previous = evaluation(tmp_path / "p.json", [query("A1", 1.0), query("B1", 0.5), query("G1", 0.5, lineage="LG")])
+    current = evaluation(tmp_path / "c.json", [query("A1", None), query("B1", 0.5)], weights="w2", input_hash="in2")
+    result = compare(previous, current)
+    assert {q["query_id"]: q["status"] for q in result["common_queries"]} == {"A1": "lost_metric", "B1": "unchanged"}
+    assert result["missing_queries"] == [{"query_id": "G1", "lineage_id": "LG"}]
+    assert "queries_lost_metric: 1" in result["warnings"] and "queries_missing_from_current: 1" in result["warnings"]
+
+
+@pytest.mark.parametrize("field", ["known_candidate_pairs", "unknown_candidate_pairs", "recall_at_k"])
+def test_compare_rejects_queries_missing_required_fields(tmp_path, field):
+    bad = query("A1", 1.0)
+    del bad[field]
+    previous = evaluation(tmp_path / "p.json", [bad])
+    current = evaluation(tmp_path / "c.json", [query("A1", 1.0)], weights="w2")
+    with pytest.raises(ValueError, match="without query_id"):
+        compare(previous, current)
+    with pytest.raises(ValueError, match="without query_id"):
+        compare(current, previous)
 
 
 def test_compare_rejects_mismatched_topk_and_same_checkpoint(rounds, tmp_path):

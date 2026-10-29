@@ -22,6 +22,9 @@ def load_evaluation(path):
     document = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(document, dict) or document.get("schema_version") != EVALUATION_VERSION or not isinstance(document.get("queries"), list):
         raise ValueError(f"{path} is not a {EVALUATION_VERSION} file")
+    for q in document["queries"]:
+        if not isinstance(q, dict) or any(type(q.get(key)) is not int for key in ("known_candidate_pairs", "unknown_candidate_pairs")) or "recall_at_k" not in q:
+            raise ValueError(f"{path} has a query without query_id/recall_at_k/known_candidate_pairs/unknown_candidate_pairs: {q.get('query_id') if isinstance(q, dict) else q!r}")
     ids = [q.get("query_id") for q in document["queries"]]
     if len(set(ids)) != len(ids):
         raise ValueError(f"{path} lists a query_id twice")
@@ -50,12 +53,13 @@ def compare(previous_path, current_path, *, drop_tolerance=0.0):
     if previous.get("checkpoint_weights_hash") is None or previous.get("checkpoint_weights_hash") == current.get("checkpoint_weights_hash"):
         raise ValueError("both evaluations come from the same checkpoint (or a checkpoint without weights hash); compare two different rounds")
     before, after = ({q["query_id"]: q for q in d["queries"]} for d in (previous, current))
-    common, regressed, improved, pairs_prev, pairs_cur = [], 0, 0, [], []
+    common, regressed, improved, lost, pairs_prev, pairs_cur = [], 0, 0, 0, [], []
     for qid in sorted(before.keys() & after.keys()):
         p, c = before[qid], after[qid]
         pr, cr = p["recall_at_k"], c["recall_at_k"]
         if pr is None or cr is None:
-            status, delta = "unavailable", None
+            status, delta = ("lost_metric" if pr is not None else "unavailable"), None
+            lost += status == "lost_metric"
         else:
             delta = cr - pr
             status = "regressed" if cr < pr - drop_tolerance else "improved" if cr > pr + drop_tolerance else "unchanged"
@@ -78,10 +82,13 @@ def compare(previous_path, current_path, *, drop_tolerance=0.0):
         warnings.append("candidate_pool_grew: recall is not directly comparable")
     if previous.get("input_hash") == current.get("input_hash"):
         warnings.append("same_input_hash: both rounds were trained on the same data, so this is not a new round")
-    if before.keys() - after.keys():
-        warnings.append(f"queries_missing_from_current: {len(before.keys() - after.keys())}")
+    if lost:
+        warnings.append(f"queries_lost_metric: {lost}")
+    missing = [{"query_id": qid, "lineage_id": before[qid].get("lineage_id")} for qid in sorted(before.keys() - after.keys())]
+    if missing:
+        warnings.append(f"queries_missing_from_current: {len(missing)}")
     return {"schema_version": SCHEMA_VERSION, "topk": current.get("topk"), "drop_tolerance": drop_tolerance, "previous": side(previous_path, previous), "current": side(current_path, current),
-            "common_queries": common, "new_queries": new, "summary": summary, "warnings": warnings}
+            "common_queries": common, "new_queries": new, "missing_queries": missing, "summary": summary, "warnings": warnings}
 
 
 def comparison_inputs_match(out_path, previous_path, current_path):
