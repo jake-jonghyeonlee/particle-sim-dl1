@@ -27,6 +27,14 @@ from .schema import SCHEMA_VERSION, validate_product
 BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v3"
 
 
+def _add_note(exc, message):
+    """BaseException.add_note is Python 3.11+; older interpreters keep the note in __notes__."""
+    if hasattr(exc, "add_note"):
+        exc.add_note(message)
+    else:
+        exc.__notes__ = [*getattr(exc, "__notes__", []), message]
+
+
 class _ProgressSinkError(RuntimeError):
     """Transport failure must abort, never become recoverable grid evidence."""
 
@@ -288,7 +296,7 @@ def _publish_noreplace(stage, destination):
         try:
             _failure_evidence(stage, None, exc)
         except Exception as evidence_error:
-            exc.add_note("failure evidence could not be updated: " + str(evidence_error))
+            _add_note(exc, "failure evidence could not be updated: " + str(evidence_error))
         raise
 
 
@@ -648,17 +656,17 @@ def run_import(options, *, event_sink=None, progress_sink=None):
             message = (f"bundle was published at {out} and verified, but progress/event "
                        f"transport failed: {exc}")
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                exc.add_note(message)
+                _add_note(exc, message)
                 raise
             raise RuntimeError(message) from exc
         if stage is not None:
             try:
                 _failure_evidence(stage, report, exc)
             except Exception as failure_error:
-                exc.add_note("failure evidence could not be updated: " + str(failure_error))
+                _add_note(exc, "failure evidence could not be updated: " + str(failure_error))
                 _disable_manifest(stage)
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            exc.add_note(f"unpublished staging evidence retained at {stage}")
+            _add_note(exc, f"unpublished staging evidence retained at {stage}")
             raise
         if stage is None:
             raise
