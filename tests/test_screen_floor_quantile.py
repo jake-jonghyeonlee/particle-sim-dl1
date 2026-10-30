@@ -101,6 +101,21 @@ def test_cli_rejects_colliding_output_paths_before_writing_anything(fixed):
         assert not out.parent.exists() or list(out.parent.iterdir()) == []
 
 
+def test_cli_checks_output_paths_before_screening_and_ignores_case(fixed, monkeypatch):
+    run, manifest, split, root = fixed
+    split_path = root / "split.json"
+    split_path.write_text(json.dumps(split))
+    base = ["--manifest", str(manifest), "--split", str(split_path), "--factor", str(FACTOR), "--margin", "0.0"]
+    monkeypatch.setattr(sr, "screen", lambda *a, **k: pytest.fail("screen() ran before the path check"))
+    out = root / "o" / "r.csv"
+    with pytest.raises(ValueError, match="distinct"):
+        main([*base, "--out", str(out), "--bindings-out", str(root / "o" / "R.CSV.scores.csv")])  # 대소문자만 다르다
+    out.parent.mkdir()
+    out.with_name("r.csv.review.html").write_text("x")
+    with pytest.raises(FileExistsError):
+        main([*base, "--out", str(out)])
+
+
 def test_cli_quantile_writes_summary_and_rejects_conflicts(fixed, capsys):
     run, manifest, split, root = fixed
     split_path = root / "split.json"

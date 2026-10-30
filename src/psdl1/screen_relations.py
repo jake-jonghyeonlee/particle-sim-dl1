@@ -718,7 +718,7 @@ def main(argv=None):
     ap.add_argument("--base-relations", help="merged relations.csv of the previous round (hand edits kept); --out then holds the delta rows only")
     ap.add_argument("--align-min-overlap", type=float, default=screen_align.ALIGN_MIN_OVERLAP, help="Layer alignment: a shift needs |valid overlap| / min(|valid A|, |valid B|) at least this")
     ap.add_argument("--align-min-support", type=int, default=screen_align.ALIGN_MIN_SUPPORT, help="Layer alignment: raster pixels a layer needs in A and in B inside the overlap of a shift")
-    ap.add_argument("--align-min-dice", type=float, default=screen_align.ALIGN_MIN_DICE, help="Layer alignment: the deciding layer's Dice at the chosen shift below this is alignment_unreliable (shift not used)")
+    ap.add_argument("--align-min-dice", type=float, default=screen_align.ALIGN_MIN_DICE, help="Layer alignment: L1(first-layer) Dice at the chosen shift below this is alignment_unreliable (shift not used)")
     ap.add_argument("--presence-fraction", type=float, default=PRESENCE_FRACTION, help="a binding counts as present when its original-resolution area is at least this fraction of the larger side's area")
     ap.add_argument("--bindings-out", help="new per-binding metrics CSV (default <out>.bindings.csv)")
     ap.add_argument("--review-pairs", type=int, default=60, help="pairs drawn as image cards; the table always lists every pair to review")
@@ -741,18 +741,18 @@ def main(argv=None):
     extra = {} if a.base_split is None else {"base_split": json.loads(Path(a.base_split).read_text(encoding="utf-8")), "base_relations": a.base_relations}
     if a.floor_json is not None:
         extra["floor_spec"] = load_floor_spec(a.floor_json)
-    result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
-                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band,
-                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, floor_quantile=a.floor_quantile, **extra)
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     bindings = Path(a.bindings_out) if a.bindings_out else out.with_name(out.name + ".bindings.csv")
-    resolved = [p.resolve() for p in (out, scores, review, summary, bindings)]
+    resolved = [str(p.resolve()).casefold() for p in (out, scores, review, summary, bindings)]  # 대소문자만 다른 경로도 같은 경로로 본다(모든 플랫폼 같은 규칙)
     if len(set(resolved)) != len(resolved):
         raise ValueError(f"output paths must be distinct: out={out}, scores={scores}, review={review}, summary={summary}, bindings={bindings}")
     for path in (bindings, review, summary):
         if path.exists():
             raise FileExistsError(f"refusing to overwrite {path}; choose a new path")
+    result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
+                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band,
+                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, floor_quantile=a.floor_quantile, **extra)
     write_csvs(result, out, scores, bindings)
     # 쓰기 순서: bindings·scores → relations → review → summary(필수 3개는 마지막이라 중단되면 부분 출력 검사가 잡는다)
     page = render_review(result, a.review_pairs, a.review_bindings, a.review_layers)

@@ -18,6 +18,7 @@ THUMB = 256
 DENSE_POINTS = 2000  # 이보다 점이 많으면 strip 대신 히스토그램
 HIST_BINS = 20
 DIST_METRICS = ("similarity", "similarity_layer", "usage_jaccard", "usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity")
+PRIMARY_PRIORITY = ("pattern_similarity", "electrode_similarity", "similarity_layer", "similarity", "cnt_similarity", "usage_jaccard_electrodes", "usage_jaccard")  # AUC 동률일 때 앞선 것
 COLOR_A, COLOR_B, COLOR_BOTH = (57, 135, 229, 255), (235, 104, 52, 255), (122, 122, 118, 255)
 LAYER_COLORS = ((57, 135, 229), (235, 104, 52), (42, 157, 110), (192, 80, 160), (200, 160, 30), (40, 170, 190), (140, 100, 220), (210, 90, 90), (110, 150, 60), (160, 110, 70))
 STATUS_TEXT = {"both": "양쪽 사용", "only_a": "A만 사용", "only_b": "B만 사용"}
@@ -37,6 +38,7 @@ h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:14px 0 6px}h3{font-siz
 td,th{padding:3px 10px;border-bottom:1px solid var(--grid);text-align:left}th{color:var(--text2);font-weight:500}td.n{text-align:right;font-variant-numeric:tabular-nums}
 .bar{display:inline-block;width:60px;height:8px;background:var(--grid);border-radius:2px;vertical-align:middle;margin-left:6px}.bar i{display:block;height:8px;background:var(--a);border-radius:2px}
 .triple{display:flex;gap:4px;margin:0 0 8px;align-items:flex-start;flex-wrap:wrap}.triple .tile{width:168px}.triples{display:flex;gap:18px;flex-wrap:wrap}.triples .group{max-width:100%}
+ol.key{margin:4px 0 8px;padding-left:20px}ol.key li{margin:1px 0}ol.key li.warn{color:#d33;font-weight:600}ol.key b{display:inline-block;min-width:64px;color:var(--text2);font-weight:600}p.primary b{color:var(--same)}
 details{margin:6px 0}summary{cursor:pointer;color:var(--text2);font-size:12px}
 svg.dist{max-width:100%;height:auto}svg.dist text{fill:var(--text);font:11px system-ui,sans-serif}svg.dist .muted{fill:var(--text2)}svg.dist line.grid{stroke:var(--grid)}
 svg.dist .pt-same{fill:var(--same);fill-opacity:.7}svg.dist .pt-other{fill:var(--both);fill-opacity:.55}svg.dist .floor{stroke:#d33;stroke-width:1.5}svg.dist .floor-group{stroke:#d33;stroke-width:1;stroke-dasharray:3 3}
@@ -147,11 +149,11 @@ def triple_html(caption, a, b):
     return f'<div class="group"><h3>{esc(caption)}</h3><div class="triple">{tiles}</div></div>'
 
 
-def layer_triples(p, sa, sb, names, shift, top_layers):
-    """정렬 후 층별 A | B | 차이. 차이(1 − 래스터 Dice)가 큰 층 top_layers 개는 펼치고 나머지는 접는다."""
+def layer_items(sa, sb, names, shift):
+    """정렬 후 층별 (차이=1 − 래스터 Dice, 이름, A 마스크, B 마스크), 차이가 큰 순. 두 프레임이 겹치지 않으면 None."""
     views = sr.roi_views(sa, sb, shift[0], shift[1])
     if views is None:
-        return "<p class=\"sub\">선택한 정렬에서 두 프레임이 겹치지 않아 층별 비교를 그리지 않습니다.</p>"
+        return None
     _, a_slice, b_slice, valid = views
     items = []
     for name in names:
@@ -159,6 +161,13 @@ def layer_triples(p, sa, sb, names, shift, top_layers):
         if a.any() or b.any():
             items.append((1.0 - dice_of(a, b), name, a, b))
     items.sort(key=lambda item: (-item[0], item[1]))
+    return items
+
+
+def layer_triples(p, items, top_layers):
+    """정렬 후 층별 A | B | 차이. 차이(1 − 래스터 Dice)가 큰 층 top_layers 개는 펼치고 나머지는 접는다."""
+    if items is None:
+        return "<p class=\"sub\">선택한 정렬에서 두 프레임이 겹치지 않아 층별 비교를 그리지 않습니다.</p>"
     caption = lambda dist, name: f"{name} · Dice {1 - dist:.2f}"
     shown = "".join(triple_html(caption(d, n), a, b) for d, n, a, b in items[:top_layers])
     rest = "".join(triple_html(caption(d, n), a, b) for d, n, a, b in items[top_layers:])
@@ -235,16 +244,70 @@ def alignment_lines(p):
     return old + new
 
 
-def card_html(p, sig, top_layers):
+def primary_metric(result):
+    """이번 데이터의 주 지표: summary 의 AUC 가 가장 높은 지표(동률이면 PRIMARY_PRIORITY 순). 값이 있는 쌍이 전체의 절반 미만인 지표는 후보에서 뺀다.
+    같은 계열 쌍이 없어 AUC 가 하나도 없으면 similarity. summary 에 쓸 수 있는 dict 를 돌려준다."""
+    pairs, auc = result["pairs"], result["summary"]["separation_auc_same_vs_other_lineage"]
+    counts = {name: sum(p[name] is not None for p in pairs) for name in PRIMARY_PRIORITY}
+    candidates = [(auc.get(name), name) for name in PRIMARY_PRIORITY if auc.get(name) is not None and counts[name] * 2 >= len(pairs)]
+    if candidates:
+        best = max(value for value, _ in candidates)
+        name = next(name for value, name in candidates if value == best)
+        return {"name": name, "auc": auc[name], "n": counts[name], "reason": "highest_auc"}
+    return {"name": "similarity", "auc": None, "n": counts["similarity"], "reason": "no_auc"}
+
+
+def primary_context(result):
+    """주 지표와 같은 계열 범위(min–max)·다른 계열 중앙값(카드 ②줄 용)."""
+    primary = primary_metric(result)
+    same = [p[primary["name"]] for p in result["pairs"] if p["same_lineage"] and p[primary["name"]] is not None]
+    other = [p[primary["name"]] for p in result["pairs"] if not p["same_lineage"] and p[primary["name"]] is not None]
+    return {**primary, "same_min": min(same) if same else None, "same_max": max(same) if same else None, "other_median": float(np.median(other)) if other else None}
+
+
+def primary_line(primary):
+    if primary["reason"] == "highest_auc":
+        why = "같은 계열 쌍과 다른 계열 쌍을 가장 잘 가르는(AUC 최고, 동률이면 고정 우선순위) 지표"
+    else:
+        why = "같은 계열 쌍이 없어 AUC 를 못 구해 기본 지표를 씁니다"
+    return f'<p class="sub primary">이번 데이터의 주 지표: <b>{esc(primary["name"])}</b> (AUC {num(primary["auc"])}, n={primary["n"]}) — {esc(why)}.</p>'
+
+
+def key_lines(p, primary, diff_names):
+    """카드 머리 핵심 3줄: ① 정렬 신뢰 ② 주 지표 ③ 차이 큰 층."""
+    layer_flags = [f for f in p["layer_align_flag"].split(";") if f]
+    if p["metrics_anchor"] == "LAYER":
+        first = f'Layer 정렬 · L1 Dice {num(p["layer_align_dice"])} · ' + (f'플래그 {esc(", ".join(layer_flags))}' if layer_flags else "플래그 없음")
+    else:
+        first = f'기존({esc(p["metrics_anchor"])}) 정렬 · ' + (esc(", ".join(layer_flags)) if layer_flags else "Layer 이동 미사용")
+    warn = ' class="warn"' if layer_flags else ""
+    name = primary["name"]
+    low, high = primary["same_min"], primary["same_max"]
+    second = (f'{esc(name)} = {num(p[name])} (같은 계열 {num(low)}–{num(high)}, 다른 계열 중앙값 {num(primary["other_median"])}) · '
+              f'현재 {TIER_TEXT[p["tier"]]} · 기준 {p["floor"]:.3f}')
+    third = ", ".join(esc(n) for n in diff_names) or "비교할 층 없음"
+    return (f'<ol class="key"><li{warn}><b>정렬 신뢰</b> {first}</li><li><b>주 지표</b> {second}</li><li><b>차이 큰 층</b> {third}</li></ol>')
+
+
+def card_html(p, sig, top_layers, primary):
     sa, sb = sig[p["product_a"]], sig[p["product_b"]]
     shift = selected_shift(p, sa)
     names = pair_layers(sa, sb)
     reasons = "".join(f'<li>{esc(REASON_TEXT[r])}</li>' for r in p["review"])
-    body = layer_triples(p, sa, sb, names, shift, top_layers) if names is not None else binding_triples(p, sa, sb, shift, top_layers)
-    return (f'<section class="card"><header><h2>A {esc(p["product_a"])} ↔ B {esc(p["product_b"])}</h2><span class="badge">유사도 {p["similarity"]:.3f}</span>'
-            f'<span class="badge">Layer 유사도 {num(p["similarity_layer"])}</span><span class="badge">기준 {p["floor"]:.3f}</span><span class="badge">전극 사용 일치 {p["usage_jaccard"]:.2f}</span>'
-            f'<span class="badge">{esc(p["group_a"])}/{esc(p["group_b"])}</span><span class="badge">현재: {TIER_TEXT[p["tier"]]}</span></header>'
-            f'<ul class="sub">{reasons}</ul>{alignment_lines(p)}{frame_thumbs(p, sa, sb, names, shift)}{binding_table(p)}{body}</section>')
+    if names is not None:
+        items = layer_items(sa, sb, names, shift)
+        body, diff_names = layer_triples(p, items, top_layers), [item[1] for item in (items or [])[:3]]
+    else:
+        body = binding_triples(p, sa, sb, shift, top_layers)
+        diff_names = [k for k, _, _ in sorted(p["result"]["bindings"], key=lambda item: (-item[2], item[0]))[:3]]
+    group = "" if p["group_a"] == "-" and p["group_b"] == "-" else f'<span class="badge">그룹 {esc(p["group_a"])}/{esc(p["group_b"])}</span>'
+    badges = (f'<div class="line"><b>유사도</b><span class="badge">유사도 {p["similarity"]:.3f}</span><span class="badge">Layer 유사도 {num(p["similarity_layer"])}</span>'
+              f'<span class="badge">기준 {p["floor"]:.3f}</span><span class="badge">현재: {TIER_TEXT[p["tier"]]}</span>{group}</div>'
+              f'<div class="line"><b>사용 일치</b><span class="badge" title="전극 합집합의 사용 일치(Jaccard)">usage_jaccard {p["usage_jaccard"]:.2f}</span>'
+              f'<span class="badge" title="CNT 를 빼고 사용 문턱을 적용한 binding 의 사용 일치">usage_jaccard_electrodes {num(p["usage_jaccard_electrodes"], 2)}</span></div>')
+    folded = f'<details class="all"><summary>모든 값 보기</summary>{badges}{alignment_lines(p)}{binding_table(p)}</details>'
+    return (f'<section class="card"><header><h2>A {esc(p["product_a"])} ↔ B {esc(p["product_b"])}</h2></header>'
+            f'<ul class="sub">{reasons}</ul>{key_lines(p, primary, diff_names)}{frame_thumbs(p, sa, sb, names, shift)}{body}{folded}</section>')
 
 
 def distribution_svg(result):
@@ -298,11 +361,15 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
     counts = "".join(f'<li>{esc(r)}: {n}쌍 — {esc(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
     table = "".join(f'<tr><td>{i}</td><td>{esc(p["product_a"])} ↔ {esc(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
                     f'<td class="n">{p["floor"]:.3f}</td><td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
-    cards = "".join(card_html(p, result["signatures"], top_layers) for p in chosen[:top_pairs])
+    primary = primary_context(result)
+    summary["review"]["primary_metric"] = {key: primary[key] for key in ("name", "auc", "n", "reason")}  # 새 키만 추가한다
+    cards = "".join(card_html(p, result["signatures"], top_layers, primary) for p in chosen[:top_pairs])
     omitted = len(chosen) - min(len(chosen), top_pairs)
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
             f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
             f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하고, 틀린 자동 줄은 지우세요.</p>'
+            f'{primary_line(primary)}'
+            f'<p class="sub">용어: L1 Dice(첫 층) = 첫 층만의 Dice(정렬 신뢰 판정 기준), 결정 층 Dice = 정렬을 정한 층의 Dice, 2순위 Dice 는 결정 층 기준입니다.</p>'
             f'<h2>지표별 분포: 같은 계열(초록) vs 다른 계열(회색)</h2><p class="sub">AUC 1에 가까울수록 두 집단이 잘 갈립니다. 빨간 선은 similarity 의 floor 입니다(실선=global, 점선=그룹). 빈칸 값은 그리지 않고 n 에서 뺍니다.</p>'
             f'{distribution_svg(result)}'
             f'<ul class="sub">{counts or "<li>검토 대상이 없습니다.</li>"}</ul>'

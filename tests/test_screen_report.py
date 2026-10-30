@@ -145,6 +145,58 @@ def test_html_stays_under_the_size_budget_with_ten_layers_per_card(tmp_path, fra
     assert all(card.count('class="group"') == 10 and "나머지 6층" in card for card in cards)
 
 
+def fake_result(auc, values, same_flags):
+    """주 지표 선택 시험용 최소 결과. values: {지표: [쌍마다 값]} (없는 지표는 모두 값 있음 0.5)."""
+    count = len(same_flags)
+    pairs = [{**{name: values.get(name, [0.5] * count)[i] for name in report.PRIMARY_PRIORITY}, "same_lineage": same_flags[i]} for i in range(count)]
+    return {"pairs": pairs, "summary": {"separation_auc_same_vs_other_lineage": auc}}
+
+
+def test_primary_metric_picks_the_highest_auc_then_priority_and_skips_sparse_metrics():
+    flags = [True, False, False, True]
+    auc = {"similarity": 0.8, "usage_jaccard": 0.7, "similarity_layer": 0.9, "pattern_similarity": 0.95, "electrode_similarity": 0.9, "cnt_similarity": 0.6, "usage_jaccard_electrodes": 0.5}
+    sparse = {"pattern_similarity": [0.5, None, None, None]}  # n=1 < 4/2 → 후보 제외
+    got = report.primary_metric(fake_result(auc, sparse, flags))
+    assert got["name"] == "electrode_similarity" and got["auc"] == 0.9 and got["n"] == 4  # 동률(0.9)은 electrode_similarity 가 similarity_layer 보다 앞선다
+    full = report.primary_metric(fake_result(auc, {}, flags))
+    assert full["name"] == "pattern_similarity" and full["reason"] == "highest_auc"
+    exactly_half = report.primary_metric(fake_result(auc, {"pattern_similarity": [0.5, 0.5, None, None]}, flags))
+    assert exactly_half["name"] == "pattern_similarity" and exactly_half["n"] == 2  # 절반은 후보
+    none = report.primary_metric(fake_result({k: None for k in auc}, {}, flags))
+    assert none == {"name": "similarity", "auc": None, "n": 4, "reason": "no_auc"}
+    assert "AUC –" in report.primary_line(none) and "기본 지표" in report.primary_line(none)
+
+
+def test_card_has_three_key_lines_and_folds_only_badges_and_the_binding_table(case):
+    manifest, split, root, _ = case
+    layered_case(root)
+    result = all_review(screen(manifest, split, factor=FACTOR, margin=0.0))
+    page = render_review(result, top_layers=2)
+    assert "이번 데이터의 주 지표" in page and result["summary"]["review"]["primary_metric"]["name"] in page
+    for card in cards_of(page):
+        key = card[card.index('<ol class="key">'):card.index("</ol>")]
+        assert key.count("<li") == 3 and "정렬 신뢰" in key and "주 지표" in key and "차이 큰 층" in key and "다른 계열 중앙값" in key
+        details = card[card.index('<details class="all">'):]  # 접힌 묶음은 카드 끝에 있다
+        assert "<table>" in details and "모든 값 보기" in details and "alignment_score" in details
+        before = card[:card.index('<details class="all">')]
+        assert "<table>" not in before and before.count('class="thumb"') == 2 and 'class="tile"' in before  # 썸네일·층별 타일은 접지 않는다
+    layered = next(c for c in cards_of(page) if "Layer 색 겹침" in c)
+    assert "Layer 정렬 · L1 Dice" in layered
+    plain = next(c for c in cards_of(page) if "Layer 색 겹침" not in c)
+    assert "기존(" in plain and "layer_missing" in plain and 'class="warn"' in plain
+
+
+def test_group_badge_only_with_groups_and_both_usage_values_are_shown(case):
+    manifest, split, *_ = case
+    result = all_review(screen(manifest, split, factor=FACTOR, margin=0.0))
+    assert all(p["group_a"] == "-" and p["group_b"] == "-" for p in result["pairs"])
+    assert all("그룹 " not in c for c in cards_of(render_review(result)))
+    for p in result["pairs"]:
+        p["group_a"], p["group_b"] = "mobile", "it"
+    cards = cards_of(render_review(result))
+    assert all("그룹 mobile/it" in c and "usage_jaccard " in c and "usage_jaccard_electrodes " in c for c in cards)
+
+
 @pytest.mark.skipif(not os.environ.get("SCREEN_REPORT_EXAMPLE"), reason="set SCREEN_REPORT_EXAMPLE=<path> to write an example page")
 def test_write_example_page(tmp_path):
     manifest, split = synthetic(tmp_path, count=6, layers=6)

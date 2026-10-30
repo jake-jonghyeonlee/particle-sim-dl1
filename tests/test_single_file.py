@@ -552,6 +552,21 @@ def test_partial_or_broken_screen_output_stops_with_guidance(stages, tmp_path, c
     assert g["_screen"]("m.json", "s.json", "train", part, [])["floor"]["global"] == 1.5
 
 
+def test_bindings_csv_alone_is_partial_output_and_three_required_files_still_skip(stages, tmp_path, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    part = tmp_path / "train"
+    part.mkdir()
+    (part / "relations.csv.bindings.csv").write_text("product_a\n")
+    with pytest.raises(SystemExit) as stopped:
+        g["_screen"]("m.json", "s.json", "train", part, [])
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and "partial output" in err and "relations.csv.bindings.csv" in err
+    (part / "relations.csv").write_text("A,B,similar\n")
+    (part / "relations.csv.review.html").write_text("<html>")
+    (part / "relations.csv.summary.json").write_text(json.dumps({"floor": {"global": 1.5}}))
+    assert g["_screen"]("m.json", "s.json", "train", part, [])["floor"]["global"] == 1.5  # 필수 3개가 있으면 bindings 가 있어도 건너뛴다
+
+
 def test_merge_stops_on_a_pair_in_two_partitions_and_keeps_csv_quoting(stages, tmp_path):
     import csv
     g = stage_globals(stages, "psdl1_assets.py")

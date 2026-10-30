@@ -461,7 +461,7 @@ def _screen(manifest, split_path, part, out_dir, extra, drop_quantile=False):
     """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다. drop_quantile 이면 --floor-quantile 을 빼고 넘긴다."""
     csv = out_dir / "relations.csv"
     outputs = [csv, csv.with_name(csv.name + ".review.html"), csv.with_name(csv.name + ".summary.json")]
-    found = [p for p in outputs + [csv.with_name(csv.name + ".scores.csv")] if p.exists()]
+    found = [p for p in outputs + [csv.with_name(csv.name + ".scores.csv"), csv.with_name(csv.name + ".bindings.csv")] if p.exists()]
     if all(p.exists() for p in outputs):
         _skip(f"screen_relations {part}", csv)
     elif found:
