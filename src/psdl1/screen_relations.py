@@ -12,10 +12,8 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import hashlib
-import html
 import io
 import json
 import math
@@ -693,78 +691,10 @@ def write_csvs(result, out, scores_path, bindings_path=None):
     validate_relations(similar, different)
 
 
-def overlay_png(a, b, size=168):
-    """겹친 영역(ROI)을 비율을 유지한 채 size 안에 그린다. 남는 부분은 투명하다."""
-    from PIL import Image
-    rgba = np.zeros(a.shape + (4,), dtype=np.uint8)
-    rgba[a & ~b] = (57, 135, 229, 255)    # A만: 파랑
-    rgba[b & ~a] = (235, 104, 52, 255)    # B만: 주황
-    rgba[a & b] = (122, 122, 118, 255)    # 둘 다: 회색
-    scale = size / max(a.shape)
-    image = Image.fromarray(rgba, "RGBA").resize((max(1, round(a.shape[1] * scale)), max(1, round(a.shape[0] * scale))), Image.NEAREST)
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    canvas.paste(image, (0, 0))
-    buffer = io.BytesIO()
-    canvas.save(buffer, "PNG")
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-
-
-REVIEW_CSS = """
-:root{color-scheme:light dark;--surface:#fcfcfb;--text:#0b0b0b;--text2:#52514e;--grid:#e3e2de;--a:#3987e5;--b:#eb6834;--both:#7a7a76}
-@media (prefers-color-scheme:dark){:root{--surface:#1a1a19;--text:#f0efec;--text2:#c3c2b7;--grid:#2e2e2c}}
-body{margin:0;background:var(--surface);color:var(--text);font:14px/1.5 system-ui,'Segoe UI','Malgun Gothic',sans-serif;padding:24px}
-h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:0}p.sub{color:var(--text2);max-width:900px;margin:0 0 12px}
-.legend{display:flex;gap:18px;color:var(--text2);margin:8px 0 18px}.legend i{display:inline-block;width:12px;height:12px;margin-right:6px;border-radius:2px;vertical-align:-1px}
-.card{border:1px solid var(--grid);border-radius:8px;padding:14px;margin:0 0 16px}.card header{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:8px}
-.badge{color:var(--text2);font-size:12px;border:1px solid var(--grid);border-radius:10px;padding:1px 8px}
-.tiles{display:flex;gap:10px;flex-wrap:wrap}.tile{width:168px}.tile img{display:block;width:168px;height:168px;background:var(--surface);border:1px solid var(--grid)}
-.tile span{display:block;font-size:11px;color:var(--text2);word-break:break-all}table{border-collapse:collapse;font-size:12px;margin-bottom:12px}
-td,th{padding:3px 10px;border-bottom:1px solid var(--grid);text-align:left}th{color:var(--text2);font-weight:500}td.n{text-align:right;font-variant-numeric:tabular-nums}
-"""
-REASON_TEXT = {"close_to_same_lineage": "다른 계열인데 같은 계열 쌍만큼 비슷함: 같은 회로일 수 있음", "near_boundary": "경계 부근: 판단 필요",
-               "weakest_same_lineage": "같은 계열 쌍 중 유사도가 가장 낮은 쌍: 정말 비슷한지 확인", "different_near_boundary": "자동으로 different가 됐지만 기준에 가까움: 정말 다른지 확인",
-               "ambiguous_alignment": "정렬 후보가 여러 개(반복 패턴 등): 유사도를 덜 믿을 것", "alignment_unreliable": "기준 마스크가 잘 맞지 않음: 유사도를 덜 믿을 것",
-               "low_overlap": "두 프레임이 겹치는 영역이 작음: 유사도를 덜 믿을 것", "no_anchor": "정렬 기준이 없어 프레임 중심으로 맞춤"}
-REASON_ORDER = list(REASON_TEXT)
-TIER_TEXT = {"similar": "similar", "different": "different", "unknown": "모름"}
-
-
-def render_review(result, top_pairs=60, top_bindings=6):
-    """검토 대상 쌍(p["review"]가 비어 있지 않은 모든 쌍)을 위쪽 표에 전부 나열하고, 경계에 가까운 순으로 top_pairs쌍은 층별 겹침 이미지 카드로 보여 준다."""
-    pairs = result["pairs"]
-    chosen = sorted((p for p in pairs if p["review"]), key=lambda p: (abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
-    summary = result["summary"]
-    counts = "".join(f'<li>{html.escape(r)}: {n}쌍 — {html.escape(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
-    table = "".join(f'<tr><td>{i}</td><td>{html.escape(p["product_a"])} ↔ {html.escape(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
-                    f'<td class="n">{p["floor"]:.3f}</td><td>{html.escape(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
-    cards = []
-    for p in chosen[:top_pairs]:
-        sa, sb = result["signatures"][p["product_a"]], result["signatures"][p["product_b"]]
-        dy, dx = p["result"]["shift"]
-        _, a_slice, b_slice, valid = roi_views(sa, sb, dy, dx)
-        parts = sorted(p["result"]["bindings"], key=lambda item: (-item[2], item[0]))[:top_bindings]
-
-        def roi_mask(sig, key, view):
-            return np.zeros(valid.shape, bool) if key not in sig["rasters"] else sig["rasters"][key]["mask"][view] & valid
-        rows = "".join(f'<tr><td>{html.escape(k)}</td><td>{ {"both": "양쪽 사용", "only_a": "A만 사용", "only_b": "B만 사용"}[s] }</td><td class="n">{d:.3f}</td></tr>' for k, s, d in parts)
-        tiles = "".join(f'<div class="tile"><img alt="{html.escape(k)}" src="{overlay_png(roi_mask(sa, k, a_slice), roi_mask(sb, k, b_slice))}"><span>{html.escape(k)} · 거리 {d:.2f}</span></div>' for k, s, d in parts)
-        reasons = "".join(f'<li>{html.escape(REASON_TEXT[r])}</li>' for r in p["review"])
-        cards.append(f'<section class="card"><header><h2>A {html.escape(p["product_a"])} ↔ B {html.escape(p["product_b"])}</h2><span class="badge">유사도 {p["similarity"]:.3f}</span>'
-                     f'<span class="badge">기준 {p["floor"]:.3f}</span><span class="badge">전극 사용 일치 {p["usage_jaccard"]:.2f}</span><span class="badge">{html.escape(p["group_a"])}/{html.escape(p["group_b"])}</span>'
-                     f'<span class="badge">정렬 기준 {html.escape(p["anchor"])} · 이동 ({p["shift_y_um"]:.1f}, {p["shift_x_um"]:.1f})µm · 겹침 {p["roi_overlap"]:.0%}</span>'
-                     f'{"".join(f"<span class=badge>{html.escape(f)}</span>" for f in p["alignment_flag"].split(";") if f)}'
-                     f'<span class="badge">현재: {TIER_TEXT[p["tier"]]}</span></header><ul class="sub">{reasons}</ul>'
-                     f'<table><tr><th>binding (role/layer)</th><th>사용</th><th>거리</th></tr>{rows}</table><div class="tiles">{tiles}</div></section>')
-    omitted = len(chosen) - min(len(chosen), top_pairs)
-    return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
-            f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
-            f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하고, 틀린 자동 줄은 지우세요.</p>'
-            f'<ul class="sub">{counts or "<li>검토 대상이 없습니다.</li>"}</ul>'
-            f'<div class="legend"><span><i style="background:var(--a)"></i>A만</span><span><i style="background:var(--b)"></i>B만</span><span><i style="background:var(--both)"></i>둘 다</span>'
-            f'<span>기준(같은 계열 최저 유사도) {summary["floor"]["global"]:.3f}</span></div>'
-            f'<h2>검토 대상 전체</h2><table><tr><th>#</th><th>쌍</th><th>현재 판정</th><th>유사도</th><th>기준</th><th>이유</th><th>이미지</th></tr>{table}</table>'
-            + (f'<p class="sub">카드는 {top_pairs}쌍까지만 그렸습니다. 나머지 {omitted}쌍은 위 표와 scores.csv로 보세요(--review-pairs로 늘릴 수 있음).</p>' if omitted else "")
-            + f'<h2>카드</h2>{"".join(cards) or "<p>검토할 쌍이 없습니다.</p>"}</body></html>')
+def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
+    """review.html 문자열. 렌더링은 screen_report 에 있다(그 모듈이 이 모듈을 import 하므로 여기서는 호출할 때 가져온다)."""
+    from . import screen_report
+    return screen_report.render_review(result, top_pairs, top_bindings, top_layers)
 
 
 def main(argv=None):
@@ -793,7 +723,8 @@ def main(argv=None):
     ap.add_argument("--bindings-out", help="new per-binding metrics CSV (default <out>.bindings.csv)")
     ap.add_argument("--review-pairs", type=int, default=60, help="pairs drawn as image cards; the table always lists every pair to review")
     ap.add_argument("--review-band", type=float, default=0.15, help="auto-different pairs within margin + band of the floor are listed for review")
-    ap.add_argument("--review-bindings", type=int, default=6)
+    ap.add_argument("--review-bindings", type=int, default=6, help="deprecated and ignored: cards now list every binding in a metrics table")
+    ap.add_argument("--review-layers", type=int, default=4, help="per card: layers (or bindings, without Layer) shown expanded as A | B | difference tiles; the rest are folded")
     a = ap.parse_args(argv)
     if a.floor_json is not None and a.floor is not None:
         ap.error("--floor and --floor-json are exclusive")
@@ -824,7 +755,9 @@ def main(argv=None):
             raise FileExistsError(f"refusing to overwrite {path}; choose a new path")
     write_csvs(result, out, scores, bindings)
     # 쓰기 순서: bindings·scores → relations → review → summary(필수 3개는 마지막이라 중단되면 부분 출력 검사가 잡는다)
-    review.write_text(render_review(result, a.review_pairs, a.review_bindings), encoding="utf-8")
+    page = render_review(result, a.review_pairs, a.review_bindings, a.review_layers)
+    review.write_text(page, encoding="utf-8")
+    result["summary"]["review"]["html_bytes"] = review.stat().st_size
     summary.write_text(json.dumps(result["summary"], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps({"relations": str(out), "scores": str(scores), "review": str(review), "summary_file": str(summary), **result["summary"]}, ensure_ascii=False))
 
