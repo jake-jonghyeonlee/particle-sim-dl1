@@ -20,7 +20,7 @@ import numpy as np
 
 from .png_contract import (DecoderPolicy, FrameRecord, ImportReport, METADATA_SCHEMA_VERSION,
                            MetadataRecord, ModelMetadata, ModelSource, ResourceEstimate,
-                           SourceAsset, SourceInventory, SourceIssue, canonical_id, mask_hash,
+                           ScreeningLayerFile, SourceAsset, SourceInventory, SourceIssue, canonical_id, mask_hash,
                            StackOrderInput, StackOrderResolution, OrderEntry, STACK_ORDER_SCHEMA_VERSION, order_digest)
 from .schema import identifier
 
@@ -404,7 +404,7 @@ def _scan_source(scanner):
             warning_list.append(SourceIssue(rel(path), "ignored unrelated non-PNG file"))
 
     def merged_layer_entries(model_dir, top, issues, warning_list):
-        """New layout: Merged_Layer/<electrode>/, CNO or cno, Layer ignored. Returns (folder, is_cnt)."""
+        """New layout: Merged_Layer/<electrode>/, CNO or cno; Layer is screening-only. Returns (folder, is_cnt)."""
         entries = []
         merged = [f for f in top if f.name.casefold() == "merged_layer"]
         if len(merged) > 1:
@@ -431,7 +431,7 @@ def _scan_source(scanner):
             elif folded == "cno":
                 cnt_folders.append(folder)
             elif folded == "layer":
-                warning_list.append(SourceIssue(rel(folder), "layer_folder_ignored: Layer folder is not a DL1 input"))
+                pass  # screening-only original layers; scanned separately by scan_layer_folder
             elif any(p.suffix.lower() == ".png" for p in folder.rglob("*") if p.is_file()):
                 issues.append(SourceIssue(rel(folder), "layout_structure_mixed: folder with PNG outside Merged_Layer/CNO in a Merged_Layer model"))
             else:
@@ -442,6 +442,62 @@ def _scan_source(scanner):
         else:
             entries.extend((f, True) for f in cnt_folders)
         return entries
+
+    def scan_layer_folder(model_dir, top, frame, issues, warning_list, policy):
+        """v2 `Layer/`: strict screening-only inventory. Masks are validated one at a time and dropped."""
+        folders = []
+        for f in top:
+            if f.name.casefold() != "layer" or not f.is_dir():
+                continue
+            try:
+                f.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError, RuntimeError):
+                continue  # already reported by merged_layer_entries
+            folders.append(f)
+        if len(folders) > 1:
+            issues.append(SourceIssue(rel(model_dir), "layer_folder_duplicate: both " +
+                                      json.dumps(sorted(f.name for f in folders), ensure_ascii=False)))
+            return ()
+        if not folders:
+            return ()
+        folder = folders[0]
+        found, png_count = [], 0
+        for path in sorted(folder.iterdir()):
+            if not safe(path, issues):
+                continue
+            if path.is_dir() or path.suffix.lower() != ".png":
+                unexpected(path, issues, warning_list)
+                continue
+            png_count += 1
+            try:
+                filename_number, name = parse_png_name(path.name)
+            except ValueError as exc:
+                issues.append(SourceIssue(rel(path), str(exc)))
+                continue
+            warn_name(name, path, warning_list)
+            try:
+                mask, _, file_hash = _decode(path, rel(path), policy)
+            except PNGSourceError as exc:
+                issues.append(exc.issue)
+                continue
+            shape, geometry_hash = tuple(mask.shape), mask_hash(mask)
+            del mask
+            if frame is not None and shape != frame.shape_yx:
+                issues.append(SourceIssue(rel(path), f"layer shape {shape} differs from model frame {frame.shape_yx}"))
+                continue
+            found.append(ScreeningLayerFile(name, filename_number, rel(path), shape, file_hash, geometry_hash))
+        by_name = {}
+        for record in found:
+            by_name.setdefault(record.name.casefold(), []).append(record)
+        for records in by_name.values():
+            if len(records) > 1:
+                issues.append(SourceIssue(rel(model_dir),
+                    f"layer_name_duplicate: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted({r.name for r in records}), ensure_ascii=False)}, files {json.dumps(sorted(r.relative_path for r in records), ensure_ascii=False)}"))
+        if not png_count:
+            warning_list.append(SourceIssue(rel(folder), "layer_folder_empty: Layer folder contains no PNG files"))
+        elif found:
+            warning_list.append(SourceIssue(rel(folder), f"layer_folder_screening_only: {len(found)} files"))
+        return tuple(sorted(found, key=lambda r: (r.filename_number, r.name, r.relative_path)))
 
     def scan_model(model_dir, policy):
         scanner.progress(stage="reading", state="started", model_id=model_dir.name)
@@ -569,11 +625,13 @@ def _scan_source(scanner):
                 code = 'layer_name_case_variants' if image_only else 'stack_order_case_collision'
                 (model_warnings if image_only else model_errors).append(SourceIssue(rel(model_dir),
                     f"{code}: model {json.dumps(model_dir.name, ensure_ascii=False)}, names {json.dumps(sorted(names), ensure_ascii=False)}, files {json.dumps(sorted(a.relative_path for a in assets if a.layer in names), ensure_ascii=False)}"))
+        layer_files = scan_layer_folder(model_dir, top, frame, model_errors, model_warnings, policy) if v2 else ()
         estimate = ResourceEstimate(unknown_reasons=("invalid_source",) if model_errors else ("extraction_not_run",))
         return ModelSource(model_dir.name, tuple(assets),
                            tuple(sorted({a.role for a in assets if a.role is not None})),
                            tuple(sorted({a.layer for a in assets})), frame, cno_present,
-                           tuple(model_errors), tuple(model_warnings), estimate)
+                           tuple(model_errors), tuple(model_warnings), estimate,
+                           layer_files=layer_files)
 
     with decoder_session(scanner.png_max_image_pixels) as policy:
         scanner.decoder = policy
@@ -730,6 +788,8 @@ def report_payload(report: ImportReport) -> dict:
                 result["electrode_layers"] = list(value.electrode_layers)
                 result["cno_layers"] = list(value.cno_layers)
                 result["all_source_layers"] = result.pop("layers")
+                if not value.layer_files:
+                    result.pop("layer_files")  # Layer-less models keep their earlier report shape
             if isinstance(value, SourceAsset):
                 if not value.provenance_files:
                     result.pop('provenance_files')

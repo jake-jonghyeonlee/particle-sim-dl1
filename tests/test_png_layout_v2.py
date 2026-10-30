@@ -42,16 +42,19 @@ def test_v2_accepts_lowercase_cno(tmp_path):
     assert result.valid and result.models[0].cno_present
 
 
-def test_v2_layer_folder_ignored_with_warning(tmp_path):
+def test_v2_layer_folder_is_screening_only(tmp_path):
     _v2(tmp_path)
     write_png(tmp_path, "M/Layer/1-X.png")
     write_png(tmp_path, "M/Layer/9-NOPE.png")
     result = discover_source(tmp_path)
     model = result.models[0]
     assert result.valid
-    assert "NOPE" not in model.layers
+    assert "NOPE" not in model.layers and "NOPE" not in model.roles
     assert all("/Layer/" not in a.relative_path for a in model.assets)
-    assert sum("layer_folder_ignored" in r for r in _reasons(model.warnings)) == 1
+    assert [(f.name, f.filename_number, f.relative_path) for f in model.layer_files] == [
+        ("X", 1, "M/Layer/1-X.png"), ("NOPE", 9, "M/Layer/9-NOPE.png")]
+    assert sum("layer_folder_screening_only: 2 files" in r for r in _reasons(model.warnings)) == 1
+    assert not any("layer_folder_ignored" in r for r in _reasons(model.warnings))
 
 
 def test_v2_mixed_png_folder_is_error(tmp_path):

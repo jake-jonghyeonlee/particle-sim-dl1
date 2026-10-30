@@ -185,6 +185,17 @@ def order_digest(entries):
 
 
 @dataclass(frozen=True)
+class ScreeningLayerFile:
+    """One v2 `Layer/` PNG: screening sidecar input only, never an electrode or CNT asset."""
+    name: str
+    filename_number: int
+    relative_path: str
+    shape_yx: tuple[int, int]
+    file_sha256: str
+    mask_sha256: str
+
+
+@dataclass(frozen=True)
 class ModelSource:
     model_id: str
     assets: tuple[SourceAsset, ...]
@@ -198,6 +209,7 @@ class ModelSource:
 
     stack_order: StackOrderResolution = field(default_factory=StackOrderResolution)
     cnt_mode: str = "image_only"
+    layer_files: tuple[ScreeningLayerFile, ...] = ()
 
     def order_index(self, asset):
         return next((e.order_index for e in self.stack_order.resolved_order if asset.asset_id in e.asset_ids), None)

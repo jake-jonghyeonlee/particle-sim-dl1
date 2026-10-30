@@ -18,13 +18,16 @@ from .png_diagnostic import inspect_grid_diagnostics, observation_descriptors, V
 from ._png_diagnostic_render import DiagnosticSink
 from .png_connections import (element_id, extract_model, iter_connections, to_product,
                               _detach_extraction, _reload_extraction)
-from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_id,
+from .png_contract import (ImportOptions, ImportReport, SourceIssue, canonical_id, mask_hash,
                            require_report_version)
 from .png_source import (decoder_session, load_metadata, report_payload, load_stack_order,
-                         _SourceScanner, _detach_model, _require_model_masks)
+                         _SourceScanner, _decode, _detach_model, _require_model_masks)
 from .schema import SCHEMA_VERSION, validate_product
 
 BUNDLE_SCHEMA_VERSION = "dl1_png_bundle_v3"
+SCREENING_LAYERS_SCHEMA_VERSION = "dl1_screening_layers_v1"
+SCREENING_LAYERS_FILE = "screening-layers.json"
+SCREENING_LAYERS_DIR = "screening_layers"
 
 
 def _add_note(exc, message):
@@ -169,7 +172,9 @@ def _verify_bundle(bundle):
             raise ValueError("unreferenced or missing generated assets")
         if {p[0] for p in report["product_input_identities"]} != {p["product_id"] for p in manifest["products"]}:
             raise ValueError("missing Product input identities")
-    elif "manifest.json" in files or any(p.startswith("assets/") for p in files):
+        _verify_screening_layers(root, files, manifest)
+    elif ("manifest.json" in files or SCREENING_LAYERS_FILE in files or
+          any(p.startswith("assets/") or p.startswith(SCREENING_LAYERS_DIR + "/") for p in files)):
         raise ValueError("diagnostic-only bundle contains model-ready files")
     return {"status": "verified", "report_schema_version": report["report_schema_version"],
             "export_status": report["export_status"], "file_count": len(files),
@@ -475,6 +480,79 @@ def _export_model(stage, root, model, result, metadata, policy, progress):
     return _write_assets(stage, model, result, metadata)
 
 
+def _write_screening_layers(stage, root, model, policy):
+    """Screening-only sidecar masks, one decode at a time; never part of manifest or Product assets.
+
+    Returns the product's sidecar record, or None when the model has no `Layer/` PNG.
+    """
+    if not model.layer_files:
+        return None
+    (stage / SCREENING_LAYERS_DIR).mkdir(exist_ok=True)
+    layers = []
+    for record in sorted(model.layer_files, key=lambda r: (r.filename_number, r.name)):
+        try:
+            mask, _, digest = _decode(root / record.relative_path, record.relative_path, policy)
+            if (digest != record.file_sha256 or tuple(mask.shape) != tuple(record.shape_yx) or
+                    mask_hash(mask) != record.mask_sha256):
+                raise ValueError("snapshot differs from inventory")
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ValueError(f"source changed: {record.relative_path}: {exc}") from exc
+        relative = SCREENING_LAYERS_DIR + "/" + canonical_id("screening_layer", [model.model_id, record.name]) + ".npy"
+        with bundle_path(stage, relative).open("xb") as handle:
+            np.save(handle, np.asarray(mask, dtype=np.bool_), allow_pickle=False)
+        del mask
+        layers.append({"layer": record.name, "filename_number": record.filename_number,
+                       "relative_path": record.relative_path, "mask": relative,
+                       "mask_sha256": record.mask_sha256})
+    return {"frame_id": model.frame.frame_id, "layers": layers}
+
+
+def _verify_screening_layers(root, files, manifest):
+    """Sidecar links: schema, containment, product/frame, case-unique names, bool/shape, geometry hash."""
+    frames = {p["product_id"]: p["frame"] for p in manifest["products"]}
+    referenced = set()
+    if SCREENING_LAYERS_FILE in files:
+        doc = _read_json(bundle_path(root, SCREENING_LAYERS_FILE))
+        if not isinstance(doc, dict) or set(doc) != {"schema_version", "products"}:
+            raise ValueError("invalid screening layers fields")
+        if doc["schema_version"] != SCREENING_LAYERS_SCHEMA_VERSION or not isinstance(doc["products"], dict):
+            raise ValueError("unsupported screening layers schema")
+        for product_id, entry in doc["products"].items():
+            if product_id not in frames:
+                raise ValueError("screening layers product is not in manifest")
+            frame = frames[product_id]
+            if (not isinstance(entry, dict) or set(entry) != {"frame_id", "layers"} or
+                    entry["frame_id"] != frame["frame_id"] or not isinstance(entry["layers"], list) or not entry["layers"]):
+                raise ValueError("invalid screening layers product entry")
+            folded = set()
+            previous = None
+            for layer in entry["layers"]:
+                if not isinstance(layer, dict) or set(layer) != {"layer", "filename_number", "relative_path", "mask", "mask_sha256"}:
+                    raise ValueError("invalid screening layer fields")
+                name, number, mask_path = layer["layer"], layer["filename_number"], layer["mask"]
+                if (not isinstance(name, str) or not name or type(number) is not int or number <= 0 or
+                        not isinstance(layer["relative_path"], str) or not isinstance(layer["mask_sha256"], str)):
+                    raise ValueError("invalid screening layer values")
+                if name.casefold() in folded:
+                    raise ValueError("duplicate screening layer name")
+                folded.add(name.casefold())
+                if previous is not None and previous > (number, name):
+                    raise ValueError("screening layers are not in deterministic order")
+                previous = (number, name)
+                if (not isinstance(mask_path, str) or not mask_path.startswith(SCREENING_LAYERS_DIR + "/") or
+                        mask_path in referenced or files.get(mask_path) is None):
+                    raise ValueError("invalid or duplicate screening layer mask path")
+                referenced.add(mask_path)
+                mask = np.load(bundle_path(root, mask_path), mmap_mode="r", allow_pickle=False)
+                if mask.dtype != np.bool_ or tuple(mask.shape) != tuple(frame["shape_yx"]):
+                    raise ValueError("screening layer mask dtype/shape mismatch")
+                if mask_hash(np.array(mask)) != layer["mask_sha256"]:
+                    raise ValueError("screening layer mask hash mismatch")
+                del mask
+    if {p for p in files if p.startswith(SCREENING_LAYERS_DIR + "/")} != referenced:
+        raise ValueError("unreferenced or missing screening layer files")
+
+
 def run_import(options, *, event_sink=None, progress_sink=None):
     """Build in a new sibling stage; leave failed stages for explicit inspection."""
     if options.verify_bundle is not None:
@@ -541,6 +619,7 @@ def run_import(options, *, event_sink=None, progress_sink=None):
                     pending.append("invalid_source_inventory")
                 if metadata_error:
                     pending.append("invalid_metadata")
+            layer_counts = {m.model_id: len(m.layer_files) for m in inventory.models}
             duplicates = _duplicates(inventory)
             diagnostics.extend(SourceIssue(".", "possible duplicate/alias geometry: " + str(entry)) for entry in duplicates)
             report = ImportReport(inventory, metadata, stack_order=reference, cnt_mode="image_only" if options.stack_order is None else "relations", extraction=extraction,
@@ -553,7 +632,9 @@ def run_import(options, *, event_sink=None, progress_sink=None):
                                       "extraction_coverage": r.connectivity_observation,
                                       "model_connectivity_status": "available" if r.connectivity_observation == "complete" else r.connectivity_observation,
                                       "model_vocabulary_eligibility": "not_evaluated_without_checkpoint",
-                                      "electrical_verification": "not_performed"} for r in extraction),
+                                      "electrical_verification": "not_performed",
+                                      **({"screening_layers": layer_counts[r.model_id]} if layer_counts.get(r.model_id) else {})}
+                                     for r in extraction),
                                   export_status="blocked" if pending and options.export else "not_requested",
                                   grid_readiness="explicit_candidate_supplied" if options.candidate_grid else "pending_explicit_grid")
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -601,7 +682,7 @@ def run_import(options, *, event_sink=None, progress_sink=None):
                 progress("inspect_preview", stage="preview_index", state="completed")
             if options.export and not pending:
                 (stage / "assets").mkdir()
-                entries, hashes = [], []
+                entries, hashes, screening_layers = [], [], {}
                 mapping = {m.model_id: m for m in metadata.models}
                 for index, (model, result) in enumerate(zip(inventory.models, extraction), 1):
                     progress("export", stage="model", state="started", model_id=model.model_id,
@@ -609,8 +690,14 @@ def run_import(options, *, event_sink=None, progress_sink=None):
                     raw, asset_hashes = _export_model(stage, root, model, result, mapping[model.model_id], decoder_policy,
                                                      lambda **record: progress("export", **record))
                     entries.append(raw); hashes.extend(asset_hashes)
+                    layer_record = _write_screening_layers(stage, root, model, decoder_policy)
+                    if layer_record is not None:
+                        screening_layers[model.model_id] = layer_record
                     progress("export", stage="model", state="completed", model_id=model.model_id,
                              model_index=index, model_count=len(inventory.models))
+                if screening_layers:
+                    _write_json(stage / SCREENING_LAYERS_FILE,
+                                {"schema_version": SCREENING_LAYERS_SCHEMA_VERSION, "products": screening_layers})
                 manifest = {"schema_version": SCHEMA_VERSION, "candidate_grid": options.candidate_grid, "products": entries}
                 pending_manifest = stage / "manifest.pending.json"
                 _write_json(pending_manifest, manifest)
