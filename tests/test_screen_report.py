@@ -121,7 +121,7 @@ def synthetic(root, count=12, layers=10, frame=96):
     families = list(FAMILIES)
     products, per_product = [], {}
     for i in range(count):
-        family = families[i % len(families)]
+        family = families[(i // 2) % len(families)]  # 같은 계열(i // 2)은 전극 family 도 같다
         offset = (4 + 7 * (i % 5), 6 + 5 * (i % 4))
         product = embed(make_product(family, 48), f"P{i:02d}", f"L{i // 2}", frame, offset)
         products.append(product)
@@ -163,8 +163,29 @@ def test_primary_metric_picks_the_highest_auc_then_priority_and_skips_sparse_met
     exactly_half = report.primary_metric(fake_result(auc, {"pattern_similarity": [0.5, 0.5, None, None]}, flags))
     assert exactly_half["name"] == "pattern_similarity" and exactly_half["n"] == 2  # 절반은 후보
     none = report.primary_metric(fake_result({k: None for k in auc}, {}, flags))
-    assert none == {"name": "similarity", "auc": None, "n": 4, "reason": "no_auc"}
+    assert none == {"name": "similarity", "auc": None, "n": 4, "reason": "no_auc", "n_same": 2, "n_other": 2}
     assert "AUC –" in report.primary_line(none) and "기본 지표" in report.primary_line(none)
+
+
+def test_low_auc_primary_metric_gets_a_warning_reason_and_side_counts():
+    flags = [True, False, False, True]
+    low = report.primary_metric(fake_result({"similarity": 0.55, "usage_jaccard": 0.5, "similarity_layer": 0.4, "pattern_similarity": 0.3, "electrode_similarity": 0.2,
+                                             "cnt_similarity": 0.1, "usage_jaccard_electrodes": 0.0}, {"similarity": [0.5, 0.5, None, 0.5]}, flags))
+    assert low["name"] == "similarity" and low["reason"] == "highest_auc_low_separation" and (low["n_same"], low["n_other"]) == (2, 1)
+    line = report.primary_line(low)
+    assert "분리도가 낮아 이 지표만으로 판단하기 어렵습니다" in line and "같은 계열 2쌍, 다른 계열 1쌍" in line
+    good = report.primary_metric(fake_result({"similarity": 0.6, "usage_jaccard": 0.5, "similarity_layer": 0.4, "pattern_similarity": 0.3, "electrode_similarity": 0.2,
+                                              "cnt_similarity": 0.1, "usage_jaccard_electrodes": 0.0}, {}, flags))
+    assert good["reason"] == "highest_auc" and "분리도가 낮아" not in report.primary_line(good)
+
+
+def test_card_second_line_says_the_verdict_is_by_similarity_unless_it_is_the_primary_metric():
+    pair = {"layer_align_flag": "", "metrics_anchor": "CNT", "tier": "similar", "floor": 0.5, "similarity": 0.7, "pattern_similarity": 0.6}
+    base = {"same_min": 0.5, "same_max": 0.9, "other_median": 0.2}
+    other = report.key_lines(pair, {**base, "name": "pattern_similarity"}, [])
+    assert "현재 판정(similarity 기준)" in other and "similarity floor 0.500" in other and "기준 0.500" not in other.replace("similarity floor 0.500", "")
+    same = report.key_lines(pair, {**base, "name": "similarity"}, [])
+    assert "현재 판정(similarity 기준)" not in same and "· 기준 0.500" in same
 
 
 def test_card_has_three_key_lines_and_folds_only_badges_and_the_binding_table(case):

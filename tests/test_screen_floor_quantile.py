@@ -116,6 +116,32 @@ def test_cli_checks_output_paths_before_screening_and_ignores_case(fixed, monkey
         main([*base, "--out", str(out)])
 
 
+@pytest.mark.parametrize("existing", [["r.csv"], ["r.csv.scores.csv"]])
+def test_cli_checks_every_existing_output_before_screening(fixed, monkeypatch, existing):
+    run, manifest, split, root = fixed
+    split_path = root / "split.json"
+    split_path.write_text(json.dumps(split))
+    base = ["--manifest", str(manifest), "--split", str(split_path), "--factor", str(FACTOR), "--margin", "0.0"]
+    monkeypatch.setattr(sr, "screen", lambda *a, **k: pytest.fail("screen() ran before the existing-output check"))
+    out = root / "o" / "r.csv"
+    out.parent.mkdir()
+    (out.parent / existing[0]).write_text("keep")
+    before = sorted(p.name for p in out.parent.iterdir())
+    with pytest.raises(FileExistsError):
+        main([*base, "--out", str(out)])
+    assert sorted(p.name for p in out.parent.iterdir()) == before
+
+
+@pytest.mark.parametrize("extra", [["--review-pairs", "-1"], ["--review-layers", "-2"]])
+def test_cli_rejects_negative_review_counts(fixed, extra):
+    run, manifest, split, root = fixed
+    split_path = root / "split.json"
+    split_path.write_text(json.dumps(split))
+    with pytest.raises(SystemExit) as stopped:
+        main(["--manifest", str(manifest), "--split", str(split_path), "--out", str(root / "n.csv"), *extra])
+    assert stopped.value.code == 2 and not (root / "n.csv").exists()
+
+
 def test_cli_quantile_writes_summary_and_rejects_conflicts(fixed, capsys):
     run, manifest, split, root = fixed
     split_path = root / "split.json"

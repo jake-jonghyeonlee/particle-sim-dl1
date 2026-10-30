@@ -18,6 +18,7 @@ THUMB = 256
 DENSE_POINTS = 2000  # 이보다 점이 많으면 strip 대신 히스토그램
 HIST_BINS = 20
 DIST_METRICS = ("similarity", "similarity_layer", "usage_jaccard", "usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity")
+LOW_AUC = 0.6  # 주 지표의 AUC 가 이보다 낮으면 분리도 경고를 단다
 PRIMARY_PRIORITY = ("pattern_similarity", "electrode_similarity", "similarity_layer", "similarity", "cnt_similarity", "usage_jaccard_electrodes", "usage_jaccard")  # AUC 동률일 때 앞선 것
 COLOR_A, COLOR_B, COLOR_BOTH = (57, 135, 229, 255), (235, 104, 52, 255), (122, 122, 118, 255)
 LAYER_COLORS = ((57, 135, 229), (235, 104, 52), (42, 157, 110), (192, 80, 160), (200, 160, 30), (40, 170, 190), (140, 100, 220), (210, 90, 90), (110, 150, 60), (160, 110, 70))
@@ -250,11 +251,14 @@ def primary_metric(result):
     pairs, auc = result["pairs"], result["summary"]["separation_auc_same_vs_other_lineage"]
     counts = {name: sum(p[name] is not None for p in pairs) for name in PRIMARY_PRIORITY}
     candidates = [(auc.get(name), name) for name in PRIMARY_PRIORITY if auc.get(name) is not None and counts[name] * 2 >= len(pairs)]
+
+    def sides(name):  # 값이 있는 쌍 수: 같은 계열, 다른 계열
+        return {"n_same": sum(p["same_lineage"] and p[name] is not None for p in pairs), "n_other": sum(not p["same_lineage"] and p[name] is not None for p in pairs)}
     if candidates:
         best = max(value for value, _ in candidates)
         name = next(name for value, name in candidates if value == best)
-        return {"name": name, "auc": auc[name], "n": counts[name], "reason": "highest_auc"}
-    return {"name": "similarity", "auc": None, "n": counts["similarity"], "reason": "no_auc"}
+        return {"name": name, "auc": auc[name], "n": counts[name], "reason": "highest_auc" if best >= LOW_AUC else "highest_auc_low_separation", **sides(name)}
+    return {"name": "similarity", "auc": None, "n": counts["similarity"], "reason": "no_auc", **sides("similarity")}
 
 
 def primary_context(result):
@@ -266,11 +270,12 @@ def primary_context(result):
 
 
 def primary_line(primary):
-    if primary["reason"] == "highest_auc":
-        why = "같은 계열 쌍과 다른 계열 쌍을 가장 잘 가르는(AUC 최고, 동률이면 고정 우선순위) 지표"
-    else:
+    if primary["reason"] == "no_auc":
         why = "같은 계열 쌍이 없어 AUC 를 못 구해 기본 지표를 씁니다"
-    return f'<p class="sub primary">이번 데이터의 주 지표: <b>{esc(primary["name"])}</b> (AUC {num(primary["auc"])}, n={primary["n"]}) — {esc(why)}.</p>'
+    else:
+        why = "같은 계열 쌍과 다른 계열 쌍을 가장 잘 가르는(AUC 최고, 동률이면 고정 우선순위) 지표"
+    low = ' <span class="badge">분리도가 낮아 이 지표만으로 판단하기 어렵습니다</span>' if primary["reason"] == "highest_auc_low_separation" else ""
+    return (f'<p class="sub primary">이번 데이터의 주 지표: <b>{esc(primary["name"])}</b> (AUC {num(primary["auc"])}, n={primary["n"]}; 같은 계열 {primary["n_same"]}쌍, 다른 계열 {primary["n_other"]}쌍) — {esc(why)}.{low}</p>')
 
 
 def key_lines(p, primary, diff_names):
@@ -283,8 +288,9 @@ def key_lines(p, primary, diff_names):
     warn = ' class="warn"' if layer_flags else ""
     name = primary["name"]
     low, high = primary["same_min"], primary["same_max"]
-    second = (f'{esc(name)} = {num(p[name])} (같은 계열 {num(low)}–{num(high)}, 다른 계열 중앙값 {num(primary["other_median"])}) · '
-              f'현재 {TIER_TEXT[p["tier"]]} · 기준 {p["floor"]:.3f}')
+    verdict = (f'현재 {TIER_TEXT[p["tier"]]} · 기준 {p["floor"]:.3f}' if name == "similarity"
+               else f'현재 판정(similarity 기준) {TIER_TEXT[p["tier"]]} · similarity floor {p["floor"]:.3f}')
+    second = f'{esc(name)} = {num(p[name])} (같은 계열 {num(low)}–{num(high)}, 다른 계열 중앙값 {num(primary["other_median"])}) · {verdict}'
     third = ", ".join(esc(n) for n in diff_names) or "비교할 층 없음"
     return (f'<ol class="key"><li{warn}><b>정렬 신뢰</b> {first}</li><li><b>주 지표</b> {second}</li><li><b>차이 큰 층</b> {third}</li></ol>')
 
@@ -362,7 +368,7 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
     table = "".join(f'<tr><td>{i}</td><td>{esc(p["product_a"])} ↔ {esc(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
                     f'<td class="n">{p["floor"]:.3f}</td><td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
     primary = primary_context(result)
-    summary["review"]["primary_metric"] = {key: primary[key] for key in ("name", "auc", "n", "reason")}  # 새 키만 추가한다
+    summary["review"]["primary_metric"] = {key: primary[key] for key in ("name", "auc", "n", "reason", "n_same", "n_other")}  # 새 키만 추가한다
     cards = "".join(card_html(p, result["signatures"], top_layers, primary) for p in chosen[:top_pairs])
     omitted = len(chosen) - min(len(chosen), top_pairs)
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'

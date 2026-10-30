@@ -726,6 +726,9 @@ def main(argv=None):
     ap.add_argument("--review-bindings", type=int, default=6, help="deprecated and ignored: cards now list every binding in a metrics table")
     ap.add_argument("--review-layers", type=int, default=4, help="per card: layers (or bindings, without Layer) shown expanded as A | B | difference tiles; the rest are folded")
     a = ap.parse_args(argv)
+    for flag, value in (("--review-pairs", a.review_pairs), ("--review-layers", a.review_layers)):
+        if value < 0:
+            ap.error(f"{flag} must be 0 or more")
     if a.floor_json is not None and a.floor is not None:
         ap.error("--floor and --floor-json are exclusive")
     if a.floor_quantile is not None:
@@ -747,7 +750,7 @@ def main(argv=None):
     resolved = [str(p.resolve()).casefold() for p in (out, scores, review, summary, bindings)]  # 대소문자만 다른 경로도 같은 경로로 본다(모든 플랫폼 같은 규칙)
     if len(set(resolved)) != len(resolved):
         raise ValueError(f"output paths must be distinct: out={out}, scores={scores}, review={review}, summary={summary}, bindings={bindings}")
-    for path in (bindings, review, summary):
+    for path in (out, scores, bindings, review, summary):  # 5개 모두 screen() 전에 검사한다
         if path.exists():
             raise FileExistsError(f"refusing to overwrite {path}; choose a new path")
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,

@@ -573,7 +573,7 @@ def _split(manifest, split_path, previous=None):
 
 def _check_screen_args():
     """SCREEN_ARGS 의 예약 인자를 시작 전에 검사한다. ROUND 2 이상은 --floor 를 받지 않고(r01 floor 를 고정한다) 증분 인자도 예약한다."""
-    reserved = ("--out", "--manifest", "--split", "--partitions")
+    reserved = ("--out", "--manifest", "--split", "--partitions", "--bindings-out")
     if ROUND is not None and ROUND >= 2:
         if _floor_quantile_arg(SCREEN_ARGS):
             _stop("SCREEN_ARGS must not contain --floor-quantile: ROUND >= 2 always uses the round-1 floor (--floor-json from WORK/rounds/r01), "

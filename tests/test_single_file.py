@@ -446,7 +446,8 @@ def stage_globals(stages, name):
     ("psdl1_assets.py", "SCREEN_ARGS", ["--partition", "test"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--manif=x"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--sp", "x"]),
     ("psdl1_train.py", "TRAIN_ARGS", ["--resum", "x"]), ("psdl1_train.py", "PRETRAIN_ARGS", ["--wei", "x"]), ("psdl1_train.py", "EVALUATE_ARGS", ["--ckp", "x"]),
     ("psdl1_train.py", "TRAIN_ARGS", ["--config", "x.json"]), ("psdl1_train.py", "TRAIN_ARGS", ["--conf=x.json"]), ("psdl1_train.py", "TRAIN_ARGS", ["--c", "x"]),
-    ("psdl1_assets.py", "SCREEN_ARGS", ["--flo", "2"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--fl=2"])])
+    ("psdl1_assets.py", "SCREEN_ARGS", ["--flo", "2"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--fl=2"]),
+    ("psdl1_assets.py", "SCREEN_ARGS", ["--bindings-out", "x.csv"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--bindings-out=x.csv"]), ("psdl1_assets.py", "SCREEN_ARGS", ["--bindings", "x.csv"])])
 def test_abbreviations_and_config_stop_before_anything_starts(stages, assets_done, tmp_path, name, key, args):
     _, _, work = assets_done
     values = assets_values(tmp_path / "no-png", tmp_path / "w") if name == "psdl1_assets.py" else train_values(work)
