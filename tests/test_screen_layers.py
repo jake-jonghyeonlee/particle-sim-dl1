@@ -76,7 +76,7 @@ def test_layer_alignment_adds_columns_but_leaves_the_existing_judgement_byte_ide
         assert row["layer_align_flag"] == "layer_missing" and row["metrics_anchor"] == row["anchor"] and row["similarity_layer"] == row["similarity"]
         assert all(row[c] == "" for c in NEW_COLUMNS[2:-1])
     assert list(rows_with[0])[:18] == LEGACY_COLUMNS and list(rows_with[0])[18:27] == NEW_COLUMNS
-    assert list(rows_with[0])[27:] == ["usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity"]
+    assert list(rows_with[0])[27:] == ["usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity", "layer_align_decided_dice"]
     summary = with_layers["summary"]
     assert summary["alignment"]["metrics_anchors"] == {"CNT": 5, "LAYER": 1} and without["summary"]["alignment"]["metrics_anchors"] == {"CNT": 6}
     assert summary["layer_alignment"]["flags"]["layer_missing"] == 5 and summary["layer_alignment"]["flags"]["ambiguous_alignment"] == 0

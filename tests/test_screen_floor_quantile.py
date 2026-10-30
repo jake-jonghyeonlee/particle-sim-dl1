@@ -83,6 +83,24 @@ def test_quantile_out_of_range_is_rejected(fixed, bad):
         run(floor_quantile=bad)
 
 
+def test_floor_index_is_exact_for_decimal_quantiles():
+    assert sr.floor_index(0.29, 101) == 29  # float 0.29*100 = 28.999999999999996 would give 28
+    assert sr.floor_index(0, 50) == 0 and sr.floor_index(1, 50) == 49 and sr.floor_index(0.2, 7) == 1 and sr.floor_index(0.5, 7) == 3
+
+
+def test_cli_rejects_colliding_output_paths_before_writing_anything(fixed):
+    run, manifest, split, root = fixed
+    split_path = root / "split.json"
+    split_path.write_text(json.dumps(split))
+    base = ["--manifest", str(manifest), "--split", str(split_path), "--factor", str(FACTOR), "--margin", "0.0"]
+    out = root / "o" / "r.csv"
+    for n, extra in enumerate((["--bindings-out", str(out)], ["--bindings-out", str(root / "o" / "x" / ".." / "r.csv.scores.csv")],
+                               ["--bindings-out", str(out) + ".summary.json"], ["--bindings-out", str(out) + ".review.html"])):
+        with pytest.raises(ValueError, match="distinct"):
+            main([*base, "--out", str(out), *extra])
+        assert not out.parent.exists() or list(out.parent.iterdir()) == []
+
+
 def test_cli_quantile_writes_summary_and_rejects_conflicts(fixed, capsys):
     run, manifest, split, root = fixed
     split_path = root / "split.json"

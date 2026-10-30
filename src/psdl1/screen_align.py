@@ -101,7 +101,8 @@ def block_sum(mask, factor):
     """factor×factor 칸마다 참인 픽셀 수(래스터 크기는 block_reduce 와 같다)."""
     height, width = mask.shape
     padded = np.pad(mask, ((0, -height % factor), (0, -width % factor)))
-    return padded.reshape(padded.shape[0] // factor, factor, padded.shape[1] // factor, factor).sum(axis=(1, 3), dtype=np.int64)
+    small = np.uint16 if factor * factor <= 65535 else np.uint32
+    return padded.reshape(padded.shape[0] // factor, factor, padded.shape[1] // factor, factor).sum(axis=(1, 3), dtype=small)
 
 
 def exclusion_cause(mask, valid, min_support):
@@ -133,9 +134,9 @@ def align_layers(layers_a, layers_b, va, vb, *, center, limit, min_overlap=ALIGN
                  min_dice=ALIGN_MIN_DICE, epsilon=EPSILON):
     """Layer 래스터 {casefold 이름: bool} 두 개로 B 를 A 에 정렬한다. layers_a/b 가 None 이면 그 제품은 사이드카 항목이 없다.
 
-    반환 dict: flags(FLAGS 순서), applied(Layer 이동을 쓰는가), shift (dy, dx) 또는 None, dice(결정 층의 선택 이동 Dice), second_dice,
+    반환 dict: flags(FLAGS 순서), applied(Layer 이동을 쓰는가), shift (dy, dx) 또는 None, dice(L1 의 선택 이동 Dice), decided_dice(결정 층의 Dice), second_dice,
     decided(결정 층 이름), disagreeing(선택 이동과 최고점이 다른 층 수), order(층 순서), excluded({이름: 원인})."""
-    out = {"flags": [], "applied": False, "shift": None, "dice": None, "second_dice": None, "decided": None, "disagreeing": None,
+    out = {"flags": [], "applied": False, "shift": None, "dice": None, "decided_dice": None, "second_dice": None, "decided": None, "disagreeing": None,
            "order": [], "excluded": {}}
     if layers_a is None or layers_b is None:
         out["flags"] = ["layer_missing"]
@@ -213,7 +214,9 @@ def align_layers(layers_a, layers_b, va, vb, *, center, limit, min_overlap=ALIGN
             decided = name
             break
     t = tables[decided]
-    dice = Fraction(int(t["num"][chosen]), int(t["den"][chosen]))
+    decided_dice = Fraction(int(t["num"][chosen]), int(t["den"][chosen]))
+    t1 = tables[order[0]]  # 신뢰 판정은 compare 와 같이 L1(좁히기 첫 층)의 Dice 로 한다. survivors 는 L1 의 ok 안에 있다
+    dice = Fraction(int(t1["num"][chosen]), int(t1["den"][chosen]))
     if float(dice) < min_dice:
         flags.append("alignment_unreliable")
     if abs(int(ry[chosen])) >= limit[0] - 1 or abs(int(rx[chosen])) >= limit[1] - 1:
@@ -224,7 +227,7 @@ def align_layers(layers_a, layers_b, va, vb, *, center, limit, min_overlap=ALIGN
         indices = np.flatnonzero(far)
         second = round(float(Fraction(*_best(t["num"], t["den"], indices))), 6)
     out.update({"flags": [f for f in FLAGS if f in flags], "shift": (int(center[0] + ry[chosen]), int(center[1] + rx[chosen])),
-                "dice": round(float(dice), 6), "second_dice": second, "decided": decided,
+                "dice": round(float(dice), 6), "decided_dice": round(float(decided_dice), 6), "second_dice": second, "decided": decided,
                 "disagreeing": sum(tables[n]["argmax"] != chosen for n in order)})
     out["applied"] = not ({"alignment_unreliable", "alignment_at_search_bound"} & set(flags))
     return out

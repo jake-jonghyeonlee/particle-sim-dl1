@@ -232,7 +232,7 @@ def test_cli_writes_bindings_csv_and_new_columns_without_nan_or_inf(case, capsys
     keys = [(r["partition"], r["product_a"], r["product_b"], r["kind"], r["key"]) for r in rows]
     assert keys == sorted(keys) and set(r["kind"] for r in rows) <= {"binding", "role", "layer", "cnt"} and {r["status"] for r in rows} <= {"both", "only_a", "only_b"}
     score_rows = list(csv.DictReader(scores.splitlines()))
-    assert list(score_rows[0])[-4:] == ["usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity"]
+    assert list(score_rows[0])[-5:] == ["usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity", "layer_align_decided_dice"]
     assert all(r["pattern_similarity"] == "" for r in score_rows)  # 이 fixture 에는 Layer 가 없다
     assert all(0 <= float(r["usage_jaccard_electrodes"]) <= 1 for r in score_rows if r["usage_jaccard_electrodes"])
     summary = json.loads(summary_text)

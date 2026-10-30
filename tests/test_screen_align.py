@@ -157,6 +157,28 @@ def test_unreliable_when_the_deciding_dice_is_below_the_minimum():
     assert run(la, lb, va, vb, min_dice=0.5)["applied"]
 
 
+def _sparse_decider_pair():
+    """L1(넓은 층)은 Dice 1.0 으로 이동을 정하고, 결정 층(성긴 점 층)은 일부 점이 사라져 Dice 가 낮다."""
+    shape = (64, 64)
+    stripes = np.zeros(shape, bool)
+    for x in range(2, 64, 8):
+        stripes[:, x:x + 3] = True
+    dots = put(shape, blobs((26, 26), 11, count=30, low=1, high=3), (20, 28))
+    rng = np.random.RandomState(1)
+    dots_b = put(shape, blobs((26, 26), 11, count=30, low=1, high=3), (20, 20)) & (rng.rand(*shape) > 0.6)
+    return {"a_stripes": stripes, "b_dots": dots}, {"a_stripes": stripes.copy(), "b_dots": dots_b}, np.ones(shape, bool), np.ones(shape, bool)
+
+
+def test_reliability_is_judged_on_the_first_layer_dice_not_the_deciding_layer():
+    la, lb, va, vb = _sparse_decider_pair()
+    out = run(la, lb, va, vb, min_dice=0.8)
+    assert out["order"][0] == "a_stripes" and out["decided"] == "b_dots" and out["shift"] == (0, 8)
+    assert out["dice"] == 1.0 and out["decided_dice"] < 0.8
+    assert out["flags"] == [] and out["applied"]
+    low = run(la, lb, va, vb, min_dice=1.01)  # the first layer's Dice is the one below the minimum
+    assert low["flags"] == ["alignment_unreliable"] and not low["applied"] and low["dice"] == 1.0
+
+
 def test_search_bound_hit_is_not_applied_but_recorded():
     la, lb, va, vb = pair_with_shift()
     out = run(la, lb, va, vb, limit=(13, 13))
@@ -276,6 +298,10 @@ def test_original_window_pack_and_block_sum():
     assert original_window((10, 10), (6, 8), 10, 0) is None
     mask = blobs((13, 17), 5)
     assert np.array_equal(unpack_mask(pack_mask(mask), mask.shape), mask)
+    assert block_sum(mask, 8).dtype == np.uint16 and block_sum(mask, 256).dtype == np.uint32
+    big = blobs((70, 90), 9, count=20, low=10, high=40)
+    sums = block_sum(big, 8)
+    assert sums.dtype == np.uint16 and sums.sum(dtype=np.int64) == big.sum() and sums[2, 3] == big[16:24, 24:32].sum()
     sums = block_sum(mask, 4)
     assert sums.shape == (4, 5) and sums.sum() == mask.sum() and sums[0, 0] == mask[:4, :4].sum() and sums[3, 4] == mask[12:, 16:].sum()
 

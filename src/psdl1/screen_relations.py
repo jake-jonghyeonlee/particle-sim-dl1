@@ -19,6 +19,7 @@ import html
 import io
 import json
 import math
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,7 +43,7 @@ SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "li
                 "geometry_distance", "anchor", "shift_y_um", "shift_x_um", "alignment_score", "roi_overlap", "alignment_flag", "tier", "reason",
                 "metrics_anchor", "similarity_layer", "layer_shift_y_um", "layer_shift_x_um", "layer_align_dice", "layer_align_second_dice",
                 "layer_align_decided", "layer_align_disagreeing", "layer_align_flag",
-                "usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity")
+                "usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity", "layer_align_decided_dice")
 
 
 def block_reduce(mask, factor, how):
@@ -284,6 +285,7 @@ def layer_columns(sa, sb, result, layers_a, layers_b, *, max_shift, min_overlap,
     return align, {"metrics_anchor": "LAYER" if align["applied"] else result["anchor"], "similarity_layer": round(similarity_layer, 6),
                    "layer_shift_y_um": round(align["shift"][0] * um, 3) if shown else None, "layer_shift_x_um": round(align["shift"][1] * um, 3) if shown else None,
                    "layer_align_dice": align["dice"], "layer_align_second_dice": align["second_dice"], "layer_align_decided": align["decided"],
+                   "layer_align_decided_dice": align["decided_dice"],
                    "layer_align_disagreeing": align["disagreeing"], "layer_align_flag": ";".join(align["flags"])}
 
 
@@ -480,6 +482,11 @@ def base_old_sets(base_split, split, product_ids):
     return old_of
 
 
+def floor_index(q, n):
+    """lower index floor(q·(n−1)). q 의 십진 표기(repr)를 정확한 분수로 곱해 float 반올림(0.29·100 = 28.999…)을 피한다."""
+    return math.floor(Fraction(repr(float(q))) * (n - 1))
+
+
 def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
            min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None,
            align_min_overlap=screen_align.ALIGN_MIN_OVERLAP, align_min_support=screen_align.ALIGN_MIN_SUPPORT, align_min_dice=screen_align.ALIGN_MIN_DICE,
@@ -561,7 +568,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     same = [p for p in pairs if p["same_lineage"]]
     def pick(values):  # 정렬한 값의 lower index. q=None 이면 최솟값
         ordered = sorted(values)
-        return ordered[0 if floor_quantile is None else int(math.floor(floor_quantile * (len(ordered) - 1)))]
+        return ordered[0 if floor_quantile is None else floor_index(floor_quantile, len(ordered))]
 
     global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (pick([p["similarity"] for p in same]) if same else None)
     if global_floor is None:
@@ -809,6 +816,9 @@ def main(argv=None):
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     bindings = Path(a.bindings_out) if a.bindings_out else out.with_name(out.name + ".bindings.csv")
+    resolved = [p.resolve() for p in (out, scores, review, summary, bindings)]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f"output paths must be distinct: out={out}, scores={scores}, review={review}, summary={summary}, bindings={bindings}")
     for path in (bindings, review, summary):
         if path.exists():
             raise FileExistsError(f"refusing to overwrite {path}; choose a new path")
