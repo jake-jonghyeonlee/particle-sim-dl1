@@ -66,6 +66,44 @@ def window_scores(layers_a, layers_b, va, vb, dys, dxs):
     return overlap, scores
 
 
+def inner_boundary(mask, omega):
+    """∂A = A ∧ ¬erode₁(A) (3×3 침식). 침식할 때 Ω 밖과 배열 밖은 전부 전경으로 본다: ROI 가장자리·valid 구멍 둘레에 인공 경계가 생기지 않는다.
+    mask 는 omega 안의 bool 배열이다."""
+    mask, omega = np.asarray(mask, dtype=bool), np.asarray(omega, dtype=bool)
+    height, width = mask.shape
+    foreground = np.pad(mask | ~omega, 1, constant_values=True)
+    eroded = np.ones(mask.shape, dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            eroded &= foreground[dy:dy + height, dx:dx + width]
+    return mask & ~eroded
+
+
+def original_window(shape_a, shape_b, dy, dx):
+    """원본 해상도 이동 (dy, dx) 에서 B[y, x] 가 A[y + dy, x + dx] 에 놓일 때의 겹침. (A 슬라이스, B 슬라이스) 이고 겹침이 없으면 None."""
+    y0, y1 = max(0, dy), min(shape_a[0], shape_b[0] + dy)
+    x0, x1 = max(0, dx), min(shape_a[1], shape_b[1] + dx)
+    if y1 <= y0 or x1 <= x0:
+        return None
+    return (slice(y0, y1), slice(x0, x1)), (slice(y0 - dy, y1 - dy), slice(x0 - dx, x1 - dx))
+
+
+def pack_mask(mask):
+    """bool 마스크를 비트로 묶어 보관한다(원본 해상도 마스크를 제품마다 여럿 들고 있어도 메모리가 작다)."""
+    return np.packbits(np.asarray(mask, dtype=bool).ravel())
+
+
+def unpack_mask(packed, shape):
+    return np.unpackbits(packed, count=shape[0] * shape[1]).reshape(shape).astype(bool)
+
+
+def block_sum(mask, factor):
+    """factor×factor 칸마다 참인 픽셀 수(래스터 크기는 block_reduce 와 같다)."""
+    height, width = mask.shape
+    padded = np.pad(mask, ((0, -height % factor), (0, -width % factor)))
+    return padded.reshape(padded.shape[0] // factor, factor, padded.shape[1] // factor, factor).sum(axis=(1, 3), dtype=np.int64)
+
+
 def exclusion_cause(mask, valid, min_support):
     """층이 정렬 키로 쓸모 있는지. 쓸모 없으면 원인, 있으면 None."""
     count = int(np.count_nonzero(mask & valid))

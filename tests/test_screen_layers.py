@@ -60,8 +60,10 @@ def test_layer_alignment_adds_columns_but_leaves_the_existing_judgement_byte_ide
     relations_with, rows_with = scores_rows(with_layers, root, "with")
     assert relations_with == relations_without
     assert [[r[c] for c in LEGACY_COLUMNS] for r in rows_with] == [[r[c] for c in LEGACY_COLUMNS] for r in rows_without]
-    for key in ("pairs_by_tier", "unknown_by_reason", "floor", "review", "products_without_different_pair", "separation_auc_same_vs_other_lineage"):
+    for key in ("pairs_by_tier", "unknown_by_reason", "floor", "review", "products_without_different_pair"):
         assert with_layers["summary"][key] == without["summary"][key]
+    for key in ("similarity", "usage_jaccard", "geometry"):  # 새 쌍 지표 AUC 는 Layer 위치에서 계산하므로 달라질 수 있다
+        assert with_layers["summary"]["separation_auc_same_vs_other_lineage"][key] == without["summary"]["separation_auc_same_vs_other_lineage"][key]
     assert with_layers["summary"]["alignment"]["anchors"] == without["summary"]["alignment"]["anchors"]
     plain, layered = pair(rows_without, "BUS_R00", "BUS_T00"), pair(rows_with, "BUS_R00", "BUS_T00")
     assert [layered[c] for c in LEGACY_COLUMNS] == [plain[c] for c in LEGACY_COLUMNS] and layered["anchor"] == "CNT" and layered["shift_y_um"] == "-0.8"
@@ -73,11 +75,29 @@ def test_layer_alignment_adds_columns_but_leaves_the_existing_judgement_byte_ide
     for row in rows_without + [r for r in rows_with if (r["product_a"], r["product_b"]) != ("BUS_R00", "BUS_T00")]:
         assert row["layer_align_flag"] == "layer_missing" and row["metrics_anchor"] == row["anchor"] and row["similarity_layer"] == row["similarity"]
         assert all(row[c] == "" for c in NEW_COLUMNS[2:-1])
-    assert list(rows_with[0])[:18] == LEGACY_COLUMNS and list(rows_with[0])[18:] == NEW_COLUMNS
+    assert list(rows_with[0])[:18] == LEGACY_COLUMNS and list(rows_with[0])[18:27] == NEW_COLUMNS
+    assert list(rows_with[0])[27:] == ["usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity"]
     summary = with_layers["summary"]
     assert summary["alignment"]["metrics_anchors"] == {"CNT": 5, "LAYER": 1} and without["summary"]["alignment"]["metrics_anchors"] == {"CNT": 6}
     assert summary["layer_alignment"]["flags"]["layer_missing"] == 5 and summary["layer_alignment"]["flags"]["ambiguous_alignment"] == 0
     assert summary["layer_alignment"]["excluded_layers"] == {"empty": 0, "covers_valid": 0, "insufficient_support": 0, "no_candidate_support": 0}
+
+
+def test_layer_rows_and_pattern_similarity_exist_only_where_the_layer_shift_is_used(case):
+    manifest, split, root, _ = case
+    write_sidecar(root, {"BUS_R00": layer_masks((30, 30)), "BUS_T00": layer_masks((10, 20))})
+    result = screen(manifest, split, factor=FACTOR, margin=0.0)
+    by = {(p["product_a"], p["product_b"]): p for p in result["pairs"]}
+    layered = by[("BUS_R00", "BUS_T00")]
+    assert layered["metrics_anchor"] == "LAYER" and layered["pattern_similarity"] == 1.0  # 복제 Layer 를 Layer 이동에서 비교
+    rows = [r for r in layered["metric_rows"] if r["kind"] == "layer"]
+    assert [r["key"] for r in rows] == sorted(n.casefold() for n in NAMES) and all(r["status"] == "both" and r["boundary_f1"] == 1.0 for r in rows)
+    assert all(r["area_a_px"] == r["area_b_px"] for r in rows)
+    for key, p in by.items():
+        if key != ("BUS_R00", "BUS_T00"):
+            assert p["pattern_similarity"] is None and all(r["kind"] != "layer" for r in p["metric_rows"])
+    summary = result["summary"]["separation_auc_same_vs_other_lineage"]
+    assert summary["n_pairs_with_value"]["pattern_similarity"] == 1 and summary["n_pairs_with_value"]["similarity_layer"] == 6
 
 
 def test_incremental_old_pairs_are_skipped_and_a_missing_layer_falls_back(case, tmp_path):

@@ -256,6 +256,30 @@ def test_fast_len_is_a_five_smooth_number_not_below_the_request():
         assert m == 1
 
 
+# ---- T5 지표 헬퍼(numpy 전용) -------------------------------------------------------------------------------------------
+def test_inner_boundary_treats_everything_outside_omega_as_foreground():
+    from psdl1.screen_align import inner_boundary
+    omega = np.ones((12, 12), bool)
+    omega[3:9, 3:9] = False  # valid 구멍
+    assert not inner_boundary(omega, omega).any()  # Ω 를 꽉 채운 마스크: 배열 가장자리·구멍 둘레에 경계가 없다
+    square = np.zeros((12, 12), bool)
+    square[2:10, 2:10] = True
+    assert inner_boundary(square, np.ones((12, 12), bool)).sum() == 28 and not inner_boundary(square, np.ones((12, 12), bool))[3:9, 3:9].any()
+    touching = np.zeros((12, 12), bool)
+    touching[:, :6] = True  # 배열 가장자리에 닿은 쪽에는 경계가 없다
+    assert set(np.flatnonzero(inner_boundary(touching, np.ones((12, 12), bool)).any(axis=0))) == {5}
+
+
+def test_original_window_pack_and_block_sum():
+    from psdl1.screen_align import block_sum, original_window, pack_mask, unpack_mask
+    assert original_window((10, 10), (6, 8), 3, -2) == ((slice(3, 9), slice(0, 6)), (slice(0, 6), slice(2, 8)))
+    assert original_window((10, 10), (6, 8), 10, 0) is None
+    mask = blobs((13, 17), 5)
+    assert np.array_equal(unpack_mask(pack_mask(mask), mask.shape), mask)
+    sums = block_sum(mask, 4)
+    assert sums.shape == (4, 5) and sums.sum() == mask.sum() and sums[0, 0] == mask[:4, :4].sum() and sums[3, 4] == mask[12:, 16:].sum()
+
+
 def test_results_contain_only_finite_plain_numbers():
     la, lb, va, vb = pair_with_shift()
     out = run(la, lb, va, vb)
