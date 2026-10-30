@@ -1,0 +1,46 @@
+{
+  "pairs_by_tier": {
+    "similar": 1,
+    "different": 0,
+    "unknown": 0
+  },
+  "unknown_by_reason": {},
+  "floor": {
+    "global": 1.0,
+    "per_group": {},
+    "margin": 0.05
+  },
+  "separation_auc_same_vs_other_lineage": {
+    "similarity": null,
+    "usage_jaccard": null,
+    "geometry": null
+  },
+  "alignment": {
+    "anchors": {
+      "CNT": 1
+    },
+    "flags": {
+      "no_anchor": 0,
+      "anchor_fallback_electrodes": 0,
+      "ambiguous_alignment": 0,
+      "alignment_unreliable": 0,
+      "low_overlap": 0
+    },
+    "median_roi_overlap": 0.7296
+  },
+  "review": {
+    "pairs_to_review": 1,
+    "by_reason": {
+      "weakest_same_lineage": 1
+    }
+  },
+  "products_without_different_pair": {
+    "test": [
+      "RING_R00",
+      "RING_T00"
+    ]
+  },
+  "groups": {
+    "-": 2
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "pairs_by_tier": {
+    "similar": 3,
+    "different": 0,
+    "unknown": 4
+  },
+  "unknown_by_reason": {
+    "cross_group_capped": 4
+  },
+  "floor": {
+    "global": 1.0,
+    "per_group": {},
+    "margin": 0.05
+  },
+  "separation_auc_same_vs_other_lineage": {
+    "similarity": 1.0,
+    "usage_jaccard": 0.5,
+    "geometry": 1.0
+  },
+  "alignment": {
+    "anchors": {
+      "CNT": 7
+    },
+    "flags": {
+      "no_anchor": 0,
+      "anchor_fallback_electrodes": 0,
+      "ambiguous_alignment": 0,
+      "alignment_unreliable": 0,
+      "low_overlap": 0
+    },
+    "median_roi_overlap": 0.7292
+  },
+  "review": {
+    "pairs_to_review": 1,
+    "by_reason": {
+      "weakest_same_lineage": 1
+    }
+  },
+  "products_without_different_pair": {
+    "train": [
+      "BUS_R00",
+      "BUS_T00",
+      "COMB_R00",
+      "COMB_T00"
+    ],
+    "test": [
+      "RING_R00",
+      "RING_T00"
+    ]
+  },
+  "groups": {
+    "auto": 2,
+    "it": 2,
+    "mobile": 2
+  }
+}

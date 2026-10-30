@@ -1,0 +1,2 @@
+product_a,product_b,partition,group_a,group_b,lineage_a,lineage_b,similarity,usage_jaccard,geometry_distance,anchor,shift_y_um,shift_x_um,alignment_score,roi_overlap,alignment_flag,tier,reason
+RING_R00,RING_T00,test,-,-,RING,RING,1.0,1.0,0.0,CNT,0.7,-0.7,1.0,0.7296,,similar,same_lineage

@@ -1,0 +1,7 @@
+product_a,product_b,partition,group_a,group_b,lineage_a,lineage_b,similarity,usage_jaccard,geometry_distance,anchor,shift_y_um,shift_x_um,alignment_score,roi_overlap,alignment_flag,tier,reason
+BUS_R00,BUS_T00,train,-,-,BUS,BUS,1.0,1.0,0.0,CNT,-0.8,-0.6,1.0,0.7292,,similar,same_lineage
+COMB_R00,COMB_T00,train,-,-,COMB,COMB,1.0,1.0,0.0,CNT,-0.8,1.2,1.0,0.625,,similar,same_lineage
+BUS_R00,COMB_T00,train,-,-,BUS,COMB,0.340767,1.0,0.659233,CNT,-1.2,0.8,1.0,0.625,,different,below_same_lineage_floor
+BUS_T00,COMB_T00,train,-,-,BUS,COMB,0.340767,1.0,0.659233,CNT,-0.4,1.4,1.0,0.6493,,different,below_same_lineage_floor
+BUS_R00,COMB_R00,train,-,-,BUS,COMB,0.33921,1.0,0.66079,CNT,-0.4,-0.4,1.0,0.8403,,different,below_same_lineage_floor
+BUS_T00,COMB_R00,train,-,-,BUS,COMB,0.33921,1.0,0.66079,CNT,0.4,0.2,1.0,0.8785,,different,below_same_lineage_floor

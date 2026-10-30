@@ -1,0 +1,72 @@
+{
+  "pairs_by_tier": {
+    "similar": 2,
+    "different": 2,
+    "unknown": 0
+  },
+  "unknown_by_reason": {},
+  "floor": {
+    "global": 0.9,
+    "per_group": {},
+    "margin": 0.05,
+    "source": "base_summary"
+  },
+  "separation_auc_same_vs_other_lineage": {
+    "similarity": 1.0,
+    "usage_jaccard": 0.5,
+    "geometry": 1.0
+  },
+  "alignment": {
+    "anchors": {
+      "CNT": 4
+    },
+    "flags": {
+      "no_anchor": 0,
+      "anchor_fallback_electrodes": 0,
+      "ambiguous_alignment": 0,
+      "alignment_unreliable": 0,
+      "low_overlap": 0
+    },
+    "median_roi_overlap": 0.63715
+  },
+  "review": {
+    "pairs_to_review": 1,
+    "by_reason": {
+      "weakest_same_lineage": 1
+    }
+  },
+  "products_without_different_pair": {
+    "train": [
+      "COMB_R00"
+    ],
+    "test": [
+      "RING_R00",
+      "RING_T00"
+    ]
+  },
+  "groups": {
+    "-": 6
+  },
+  "mode": "incremental",
+  "base": {
+    "relations": "<BASE_RELATIONS>",
+    "sha256": "a2ab918d54803d7adec227fafb99a7b2e425e6740ec1c64d26fd42ca0e1b447d",
+    "pairs": 1
+  },
+  "new_products": {
+    "train": [
+      "COMB_T00"
+    ],
+    "test": [
+      "RING_T00"
+    ]
+  },
+  "delta_pairs": {
+    "train": 3,
+    "test": 1
+  },
+  "expected_delta_pairs": {
+    "train": 3,
+    "test": 1
+  }
+}

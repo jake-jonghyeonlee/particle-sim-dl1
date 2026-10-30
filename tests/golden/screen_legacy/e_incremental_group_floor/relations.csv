@@ -1,0 +1,4 @@
+RING_R00,RING_T00,similar
+BUS_R00,COMB_T00,different
+BUS_T00,COMB_T00,different
+COMB_R00,COMB_T00,similar
