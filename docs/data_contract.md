@@ -119,7 +119,7 @@ failed contacts; cnt_file_count still counts all observed files. In relations th
 `ambiguous_cnt_asset_identity` error stays, with no merging or number/path tie-breaking. `cno` is reserved, case-sensitive folder spelling in the legacy layout; its layer names
 are not limited to OCNT/GCNT/PCNT. If a model folder has `Merged_Layer` (layout
 `merged_layer_v2`), electrodes are the folders under `Merged_Layer/`, the CNT folder is `CNO`
-or `cno`, and `Layer/` is ignored with warning `layer_folder_ignored`. Errors:
+or `cno`, and `Layer/` is a screening-only asset (see [Screening layers sidecar](#screening-layers-sidecar-dl1_screening_layers_v1)), not a training input: warning `layer_folder_screening_only: N files`, or `layer_folder_empty` when it holds no PNG. Errors:
 `layout_structure_mixed`, `cnt_folder_duplicate`. `relative_path` is the real path;
 asset_id and mask do not depend on it, so equal content gives equal ids in both layouts. Without an order file, source layer case variants warn with `layer_name_case_variants`
 per model and at inventory level across models, preserving separate exact-spelling
@@ -607,6 +607,22 @@ file changes were explicitly authorized by the coordinator's T3 scope addition; 
 schema/model/NPY-loader/lock change or installation occurred.
 
 
+## Screening layers sidecar (`dl1_screening_layers_v1`)
+
+In a `merged_layer_v2` model the original-layer folder `Layer/` is read **only for pre-training screening** (`psdl1.screen_relations`, [USAGE §6.2b](USAGE.md)). It is not a training input.
+
+**Training input is unchanged.** `manifest.json`, the hashes of all existing assets and the Product input identities are the same with or without `Layer/`, and no training code changed. This is a statement about the training *input*; it does not claim that a training run's result bytes are identical. Screening reads the sidecar only after the manifest has been fully read; a bundle without a sidecar behaves as before, and with a sidecar the screening verdict (`relations.csv`) is byte-identical on the synthetic benchmark (N=10 and N=30).
+
+**Strict scan.** Every `Layer/` PNG is decoded with the normal strict decoder (black/white only, no alpha, 8-bit, ...). One bad file rejects the whole export pool because one source-invalid model blocks it. Errors: filename grammar, a casefold-duplicate layer name inside the model (`layer_name_duplicate`), image shape different from the model frame, decode failure, a non-binary image, two folders that differ only by case (`layer_folder_duplicate`), a sub-directory (`unsupported directory layout`) or a PNG under it (`PNG at unsupported layout/depth`). Non-PNG files only warn. Masks are decoded one at a time and dropped; the export decodes each file a second time and refuses a file that changed since the scan (`source changed`). A file added to `Layer/` after the scan is not detected. The import report records only the count (`status_summary[].screening_layers`); `ImportReport` has no new field.
+
+**Files** (present only when at least one model has `Layer/` PNG files):
+
+- `screening-layers.json` — strict two-field document `{"schema_version": "dl1_screening_layers_v1", "products": {<product_id>: {"frame_id", "layers": [...]}}}`. `frame_id` must equal the product's manifest frame. Each layer entry has exactly `layer` (exact spelling), `filename_number` (provenance only), `relative_path` (source path, evidence only), `mask` and `mask_sha256` (the geometry hash of the decoded mask). Layers are sorted by `(filename_number, layer)`; names are unique after `casefold`.
+- `screening_layers/*.npy` — one bool `.npy` per layer at the full frame shape (`shape_yx` of the product frame), uncompressed. **Import bundle: flat**, `screening_layers/<id>.npy`. **Merged bundle:** `screening_layers/rNN/<id>.npy` (see below).
+- Both are listed in `bundle-integrity.json` like any other file. The product-to-frame link, bool dtype, shape and hash are checked by `--verify-bundle`.
+
+**Validation rules** (`import_png --verify-bundle`, `merge_bundles --verify` and the screening loader). A sidecar file with `products: {}` is rejected, as is a product entry with no layers. A product or frame that is not in the manifest, a duplicate layer name, a mask path outside `screening_layers/`, a path used twice, a missing or an unreferenced `.npy` in `screening_layers/`, a wrong dtype or shape, or a hash mismatch is rejected. An import bundle accepts only flat `.npy` paths, a merged bundle only `rNN/` paths. A diagnostic-only bundle (export blocked) must not contain a sidecar. The screening loader treats a missing sidecar as "no Layer for any product" and a damaged one as an error, and it reads only the masks of the products being screened.
+
 ## Merged round bundles
 
 `python -m psdl1.merge_bundles --base <dir> --add <dir> --out <new dir> --round N [--base-round M]` joins an earlier bundle with a newly exported one for [incremental rounds](USAGE.md#68-증분-라운드-새-제품만-더하는-학습). `--base` is an import bundle (then `--base-round` is required) or an earlier merged bundle. `--add` must be an exported import bundle. Both inputs are verified first. The merge stops on duplicate product IDs or a difference in `candidate_grid`, `cnt_mode` or `schema_version`, and `N` must exceed the base round. `--out` must be a new path. Unchanged `dl1_shape_v1_draft` manifest and `dl1_png_bundle_v3` integrity versions are used; the new report has its own `merge_schema_version: dl1_merge_bundle_v1`.
@@ -617,6 +633,8 @@ Layout of the output folder:
 - `assets/rNN/*.npy` — the bool masks, byte-identical to their sources.
 - `merge-report.json` — `merge_schema_version`, `round`, `candidate_grid`, `cnt_mode`, `schema_version`, `base` and `add` (`path`, `kind`, `manifest_sha256`, `integrity_sha256`, `product_ids`; `base` also has `round`), `assets`, `asset_method`, `generated_manifest_sha256`, `product_count`. Each `assets` entry has `path`, `source_bundle` (`base`|`add`), `source_path`, `sha256` and its own `asset_method` (`hardlink`|`copy`). The top-level `asset_method` is `hardlink`, `copy` or `mixed`.
 - `bundle-integrity.json` — hashes of every file, as in an import bundle. There is no `import-report.json`, preview or diagnostic evidence.
+- `screening-layers.json` and `screening_layers/rNN/*.npy` — only when at least one input bundle has a [screening layers sidecar](#screening-layers-sidecar-dl1_screening_layers_v1). The merged sidecar has the same schema (`dl1_screening_layers_v1`). The merge copies or hard-links each mask, byte-identical, and checks its hash against the source. Masks of an import `--base` go to `screening_layers/r<base round>/`, masks of the `--add` bundle to `screening_layers/r<N>/`, and masks of an earlier merged bundle keep their `rNN/` path. The merge stops on a product ID that appears in both sidecars. One input without a sidecar is allowed: the products of that side then have no Layer.
+- `merge-report.json` field `screening_layers` (optional; present exactly when the merged bundle has a sidecar) — a list of `{path, source_bundle (base|add), source_path, sha256, asset_method (hardlink|copy)}` for every sidecar mask. `merge_bundles --verify` requires that this list equals the paths and hashes the sidecar uses, that every path matches `screening_layers/rNN/<file>.npy` with `NN` not above the report `round`, and that the sidecar passes the same checks as an import bundle (merged layout) — including a non-empty `products` mapping and non-empty layer lists. A `screening_layers` item whose fields are not strings, or that is not exactly those five fields, is a clean `ValueError`. The other report fields are unchanged.
 
 `merge_bundles --verify <dir>` (used alone) checks hash integrity of every listed file, exact file listing, report/manifest/asset hash links, bool mask headers and shapes, and then reads the whole manifest with the strict manifest iterator. It prints `verification_meaning: bundle_hash_integrity_not_electrical_verification`. It does not repeat the import diagnostic evidence checks of `import_png --verify-bundle`, and it is not electrical verification.
 

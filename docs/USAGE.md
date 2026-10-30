@@ -147,7 +147,9 @@ DL1 설치/import/help·수치 smoke·실자료 처리의 Windows 성공 여부�
 | 전극명 폴더 | 그대로 전극 이름이자 역할 이름(`role`)이 된다 |
 | `cno` 폴더 | CNT 전용. 예전 구조에서는 소문자 `cno`여야 한다. `CNO`처럼 대소문자가 다르면 오류다 |
 | 새 구조 (`Merged_Layer`) | 모델 폴더에 `Merged_Layer`가 있으면 새 구조다. 전극은 `<모델>\Merged_Layer\<전극>\` 아래 폴더이고 CNT는 `CNO`(또는 `cno`) 폴더다. 구조 표시로 `layout_structure: merged_layer_v2` 경고가 1개 나온다. `Merged_Layer` 바로 아래 파일은 지원하지 않는 배치다 |
-| 새 구조의 `Layer` 폴더 | 원본 층 영상이라 DL1 입력이 아니다. 읽지 않고 `layer_folder_ignored` 경고를 낸다 |
+| 새 구조의 `Layer` 폴더 | 원본 층 영상이다. **스크리닝 정렬 전용으로만 읽고 학습 입력이 아니다**(manifest·asset·input identity에 들어가지 않는다). PNG가 있으면 `layer_folder_screening_only: N files` 경고를, PNG가 하나도 없으면 `layer_folder_empty` 경고를 낸다. 내보내기(`--export`)가 `screening-layers.json`과 `screening_layers/*.npy` 사이드카로 저장하고 `psdl1.screen_relations`가 읽는다(6.2b) |
+| `Layer` 폴더 오류 | `Layer`는 **엄격하게** 검사한다. 하나라도 걸리면 **그 모델이 소스 오류가 되고, 소스 오류 모델이 하나라도 있으면 내보내기 전체(모든 모델)가 막힌다**: 파일 이름 규칙 위반, 한 모델 안 layer 이름의 casefold 중복(`layer_name_duplicate`), 이미지 크기가 모델 프레임과 다름, 디코드 실패, 이진(검정/흰색)이 아닌 PNG(위 "이미지 규칙"과 같다). 대소문자만 다른 `Layer`·`layer` 폴더가 둘이면 `layer_folder_duplicate` 오류다. `Layer` 안의 하위 폴더는 `unsupported directory layout`, 그 안의 PNG는 `PNG at unsupported layout/depth` 오류이고, PNG가 아닌 파일은 `ignored unrelated non-PNG file` 경고만 낸다. 회색 픽셀이 든 Layer 영상 하나가 그 모델의 내보내기를 막을 수 있으니 실제 자료는 먼저 4장의 검사(`--export` 없이 `--root --out`)로 확인한다. 스캔이 같은 검사를 하므로 `Layer` 오류가 검사 보고서에 나온다 |
+| `Layer`의 비용 | 스캔 때 모든 `Layer` PNG를 디코드해 검증하고, 내보내기 때 다시 디코드한다(원본이 그 사이 바뀌었으면 거부). 합성 3000×3000, 층 10장 기준으로 내보내기에 제품당 약 +3.4 s가 더 걸렸고 사이드카는 제품당 약 86 MiB(층 한 장 약 8.6 MiB, 비압축 bool `.npy`)다. 측정은 6.2b "비용"에 있다 |
 | 새 구조 오류 | `Merged_Layer`·`CNO`·`Layer` 밖에 PNG가 든 폴더가 있으면 `layout_structure_mixed`, `Merged_Layer`가 대소문자만 다르게 둘이면 `layout_structure_mixed`, `cno`와 `CNO`가 둘 다 있으면 `cnt_folder_duplicate` 오류다 |
 | 예전 구조 | `Merged_Layer`가 없으면 지금까지와 동작이 같다. `Layer`라는 이름의 폴더도 전극으로 읽는다. 같은 내용이면 두 구조의 asset id와 mask가 같다 |
 | 파일명 | `<번호>-<layer>.png` 또는 `<번호>_<layer>.png`. 숫자 뒤 첫 `-`/`_`가 구분자이고 나머지 전체가 layer 이름이다. 확장자는 대소문자 구분 없이 `.png`/`.PNG`/`.Png`를 받으며 원본 파일명은 보존한다 |
@@ -560,13 +562,70 @@ MODEL-A,MODEL-C,different
   --out relations.csv --groups groups.json --partitions train
 ```
 
+**무엇을 보면 되나** (`relations.csv.review.html`을 연다)
+
+1. 맨 위 "이번 데이터의 주 지표"를 한 번 확인한다. 같은 계열 쌍과 다른 계열 쌍을 가장 잘 가르는(AUC 최고) 지표다. 이 지표를 이번 검토의 기준 자(尺)로 쓴다. `summary.json`의 `review.primary_metric`에도 같은 값이 남는다.
+2. 카드마다 맨 위 3줄만 본다: ① **정렬 신뢰**(Layer 정렬이면 L1 Dice와 플래그, 빨간 줄은 플래그가 있다는 뜻) ② **주 지표**(이 쌍의 값, 같은 계열 범위, 다른 계열 중앙값, 현재 판정과 기준) ③ **차이 큰 층**(층별 A | B | 차이 타일의 위쪽 3개 이름).
+3. 나머지 값은 카드 아래 "모든 값 보기"를 펼친다. 매번 볼 필요는 없다.
+
+**판정은 바뀌지 않는다.** `tier`(similar/different/unknown)와 `relations.csv`는 지금까지와 같은 `similarity`와 floor로 정해지고, Layer 정렬이나 새 지표는 판정에 들어가지 않는다. 새 값은 모두 `scores.csv`·`bindings.csv`·검토 자료의 판단 자료다. 같은 입력에서 Layer 사이드카가 있든 없든 `relations.csv`는 바이트 동일해야 하고, 합성 자료(3000×3000, N=10·30)에서 그렇게 나왔다.
+
 - **비교 단위**: (role, layer)별 요소 마스크와 CNT 합집합이다. 프레임에 맞춰 줄이면 프레임 크기가 다른 제품의 물리 크기가 달라지므로, **모든 제품을 같은 정수 배율(`--factor`, 기본 8)로 줄인 물리 래스터**에서 비교한다(래스터 해상도 = 픽셀 피치 × 배율, 제품 사이 픽셀 피치는 같아야 한다). 얇은 선이 남도록 any 방식으로 줄인다.
 - **정렬**: 단위 이미지의 중심이 제품마다 달라서 제품 쌍마다 먼저 맞춘다. 기준 마스크(CNT 합집합. 비었거나 프레임 대부분을 덮어 위치 정보가 없으면 전극 합집합, `--anchor`로 지정 가능)의 교차상관으로 두 프레임 중심 맞춤 주변 `--max-shift`(기본 0.35, 큰 변 대비) 안에서 후보 이동량 `--candidates`(기본 5)개를 찾는다. 후보마다 **모든 층에 같은 이동**을 적용해 두 프레임이 겹치는 영역(ROI)에서 층별 거리를 구하고 전체 유사도가 가장 큰 후보를 쓴다. 회전·뒤집힘·크기 보정은 하지 않는다. manifest에는 CNT 파일별 마스크가 아니라 합집합만 있어서 `pcnt`만 따로 기준으로 쓸 수는 없다.
+- **Layer 정렬(`metrics_anchor`)**: 두 제품 모두 Layer 사이드카가 있으면(3장 `Layer` 폴더를 내보낸 묶음) 위 정렬과 **별도로** 한 번 더 정렬한다. 위의 CNT/전극 정렬은 그대로 두고 판정(`similarity`)에만 쓴다. Layer 정렬은 같은 탐색 범위(`--max-shift`)에서 층(Layer 이름, 대소문자 무시)별 **Dice**를 구한다. 층을 최고 Dice 내림차순으로 놓고, 첫 층(L1)의 최고 Dice와 0.01 이내인 이동만 남기고 다음 층으로 계속 좁힌다. `similarity`로 위치를 고르지 않는다. 정렬을 쓴 쌍은 `metrics_anchor=LAYER`이고 그 위치에서 지표를 계산한다. 쓰지 못한 쌍은 `metrics_anchor`가 기존 정렬(`CNT` 등)이다. 상태는 `layer_align_flag`에 남는다.
+
+  | 플래그 | 뜻 | Layer 이동 사용 |
+  |---|---|---|
+  | `layer_missing` | 두 제품 중 하나 이상에 Layer가 없다 | 아니오(기존 정렬) |
+  | `layer_no_common` | 두 제품에 공통이면서 쓸 만한 층이 없다(공통 층 이름이 없거나, 공통 층이 모두 비었거나 valid 영역의 90%를 넘게 덮거나 valid 안 픽셀이 `--align-min-support` 미만이라 제외됨) | 아니오 |
+  | `layer_no_candidate` | 겹침(`--align-min-overlap`)과 층 지지 픽셀을 모두 채우는 이동이 없다 | 아니오 |
+  | `alignment_unreliable` | 선택한 이동의 **L1** Dice가 `--align-min-dice` 미만이다(기존 정렬의 같은 이름 플래그처럼 L1 기준이다) | 아니오 |
+  | `alignment_at_search_bound` | 선택한 이동이 탐색 범위의 가장자리 1칸 안이다 | 아니오 |
+  | `ambiguous_alignment` | 남은 후보가 서로 2칸 이상 떨어져 있다(반복 패턴 등). 시작점에 가까운 후보를 쓴다 | **예**(플래그만 남긴다) |
+
+  제외된 층과 그 원인(`empty`, `covers_valid`, `insufficient_support`, `no_candidate_support`)은 `summary.json`의 `layer_alignment.excluded_layers`에 센다.
 - **층별 거리**: 한쪽에서만 쓰이는 전극(ROI 안에서 마스크가 비어 있지 않은 binding)은 거리 1, 양쪽에서 쓰이면 정렬 후 남는 어긋남(`--tolerance`, 래스터 픽셀)을 허용한 형상 거리다. 유사도는 `1 − 층별 거리의 평균`이다.
 - **정렬 표시(`alignment_flag`)**: `ambiguous_alignment`(1등과 2등 후보 유사도 차이가 0.02 미만. 반복 패턴 등), `alignment_unreliable`(기준 마스크 일치도가 0.5 미만), `low_overlap`(ROI가 작은 프레임의 50% 미만), `anchor_fallback_electrodes`(전극 합집합을 기준으로 씀), `no_anchor`(기준 없음, 프레임 중심 맞춤).
 - **판정**: 같은 계열(`lineage_id`)은 `similar`. 같은 계열 쌍 중 **가장 낮은 유사도**(기준)보다 `--margin`(기본 0.05) 이상 낮은 다른 계열 쌍만 `different`. 나머지는 모름이다. 다른 계열인데 기준 이상으로 비슷한 쌍은 같은 회로일 수 있어 검토 대상이다.
 - **제품군**: `--groups groups.json`(`{"제품명": "mobile", ...}`, 검사 대상 제품 모두 필요)을 주면 군 안의 같은 계열 쌍이 3개 이상일 때 군별 기준을 쓰고, 아니면 전체 기준을 쓴다. 군이 다른 `different` 쌍은 쉬운 쌍이라 군 안의 `different` 수의 `--cross-group-fraction`(기본 0.2)만큼만 가장 비슷한 것부터 쓰고 나머지는 모름(`cross_group_capped`)이다. 제품군이 같은 회로를 뜻하지 않으므로 같은 군이라고 `similar`로 보지 않는다.
-- **출력**: `relations.csv`(similar/different만, 머리글 없음, `psdl1.train --relations`에 그대로 쓴다), `relations.csv.scores.csv`(모든 쌍의 유사도·전극 사용 일치도·형상 거리·정렬 기준과 이동량(µm)·정렬 신뢰도·ROI 겹침·판정·사유), `relations.csv.review.html`(**검토 대상 쌍 전체를 위쪽 표에 나열**하고, 경계에 가까운 순으로 `--review-pairs`(기본 60)쌍은 정렬한 뒤 ROI만 binding별로 겹쳐 그림. A만 파랑, B만 주황, 둘 다 회색. 검토 이유는 다른 계열인데 같은 계열만큼 비슷함, 경계 부근, 같은 계열 중 가장 낮은 쌍, 기준에 가까운 자동 `different`(`--review-band`, 기본 0.15), 정렬 불확실(`ambiguous_alignment`, `alignment_unreliable`, `low_overlap`, `no_anchor`)이다), `relations.csv.summary.json`(기준, 판정 수, 계열 분리도 AUC, `different` 쌍이 없는 제품). 기존 파일은 덮어쓰지 않는다.
+- **출력 5개**(기존 파일은 덮어쓰지 않는다. 출력 경로 5개는 서로 달라야 하며 대소문자만 다른 경로도 같은 경로로 본다. 경로가 겹치거나 `bindings.csv`·`review.html`·`summary.json`이 이미 있으면 긴 계산(`screen()`)을 시작하기 전에 멈춘다. `relations.csv`·`scores.csv`가 이미 있으면 계산 뒤 쓰기 직전에 멈추므로 `--out`은 새 이름으로 준다):
+  - `relations.csv`: similar/different만, 머리글 없음. `psdl1.train --relations`에 그대로 쓴다.
+  - `relations.csv.scores.csv`: 모든 쌍의 한 줄 요약. 열은 아래 "scores.csv 열"에 있다.
+  - `relations.csv.bindings.csv`: 쌍 × binding(전극 binding, role, Layer 층, CNT)의 지표 행. 열은 `product_a, product_b, partition, metrics_anchor, kind, key, status, area_a_px, area_b_px, area_ratio, dice, boundary_f1, boundary_precision, boundary_recall, fill_f1`이고 `kind`는 `binding`/`role`/`layer`/`cnt`다. `--bindings-out`으로 경로를 바꿀 수 있다.
+  - `relations.csv.review.html`: 검토 보고서. **검토 대상 쌍 전체를 위쪽 표에 나열**하고, 경계에 가까운 순으로 `--review-pairs`(기본 60)쌍은 카드로 그린다. 검토 이유는 다른 계열인데 같은 계열만큼 비슷함, 경계 부근, 같은 계열 중 가장 낮은 쌍, 기준에 가까운 자동 `different`(`--review-band`, 기본 0.15), 정렬 불확실(`ambiguous_alignment`, `alignment_unreliable`, `low_overlap`, `no_anchor`)이다. 구성은 아래 "보고서 구성"에 있다.
+  - `relations.csv.summary.json`: 기준(floor), 판정 수, 계열 분리도 AUC, 정렬 요약, 검토 요약, `different` 쌍이 없는 제품. 새 키는 아래 "summary 새 키"에 있다.
+- **지표 정의**(`bindings.csv`와 `scores.csv`의 판단 자료. 판정에 쓰지 않는다). 지표는 `metrics_anchor` 위치에서, 두 프레임이 겹치고 둘 다 valid인 영역(Ω)만 센다.
+  - **있음**: binding의 **원본 해상도** 면적(Ω 안 px)이 있고 큰 쪽 면적의 `--presence-fraction`(기본 0.01) 이상이면 "쓴다". 양쪽 다 못 미치면 행을 만들지 않는다. `status`는 `both`/`only_a`/`only_b`다. 한쪽에만 있으면 `area_ratio`·`dice`·`boundary_f1`·`fill_f1`을 0으로 둔다.
+  - **면적**: `area_a_px`, `area_b_px`(원본 px)와 `area_ratio` = 작은 쪽 / 큰 쪽.
+  - **Dice**: 래스터 Ω 안 `2|A∩B| / (|A|+|B|)`. 허용 오차를 두지 않는 엄격한 겹침이다.
+  - **경계 F1·P/R**(`boundary_f1`, `boundary_precision`, `boundary_recall`): 각 마스크의 안쪽 경계(3×3 침식으로 구함, Ω 가장자리에는 인공 경계를 만들지 않는다)를 `--tolerance`(래스터 픽셀)만큼 부풀린 상대 경계에 얼마나 들어가는지다. P는 A의 경계가 B 쪽에 들어간 비율, R은 B의 경계가 A 쪽에 들어간 비율이다.
+  - **fill F1**(`fill_f1`): 기존 `geometry_distance`와 같은 식(면 기준 허용 F1)이다. 1 − 거리.
+  - **쌍 지표 4개**(`scores.csv`): `usage_jaccard_electrodes` = CNT를 뺀 binding 중 양쪽에 "쓴다"인 비율, `electrode_similarity` = role 합집합의 경계 F1 평균, `pattern_similarity` = Layer 층별 경계 F1 평균(`metrics_anchor=LAYER`일 때만), `cnt_similarity` = CNT 합집합의 경계 F1. 기존 `usage_jaccard`는 CNT를 포함하는 전극 합집합 기준으로 그대로 남는다.
+  - **`similarity_layer`**: Layer 이동이 쓰이면 그 위치에서 같은 식으로 다시 계산한 `similarity`, 아니면 `similarity`와 같다. 비교용 값이고 floor·판정에는 쓰지 않는다.
+  - **수치 계약(빈칸 규칙)**: 계산할 수 없는 값은 0이 아니라 **빈칸**이다. 예: 원본에는 있으나 래스터 Ω 안에 없는 binding의 형상 지표, 경계가 한쪽 또는 양쪽이 비어 경계 지표를 낼 수 없는 경우, 평균을 낼 항목이 하나도 없는 쌍 지표, Layer 정렬이 아닌 쌍의 `pattern_similarity`. 평균은 빈칸을 빼고 낸다. `summary.json`의 AUC는 빈칸인 쌍을 뺀 쌍으로 구하고 그 수를 `n_pairs_with_value`에 적는다.
+- **scores.csv 열 중 Layer 정렬 관련**:
+  - `metrics_anchor`: 지표를 계산한 위치(`LAYER` 또는 기존 `anchor`와 같은 값). `anchor`/`shift_*_um`/`alignment_score`/`alignment_flag`는 **기존 정렬의 값**이고 판정의 근거다.
+  - `layer_shift_y_um`, `layer_shift_x_um`: Layer 이동(µm). 플래그와 상관없이 이동을 구했으면 값이 있다(쓰지 않은 `alignment_unreliable`도 포함). 구하지 못하면 빈칸.
+  - `layer_align_dice` = 선택한 이동에서의 **L1(첫 층) Dice**, `layer_align_decided` = 정렬을 마지막에 정한 층 이름, `layer_align_decided_dice` = 그 **결정 층**의 Dice, `layer_align_second_dice` = 결정 층에서 선택 이동과 2칸 이상 떨어진 후보 중 최고 Dice(**결정 층 기준**이고 `layer_align_dice`와 짝이 아니다), `layer_align_disagreeing` = 선택 이동이 자기 최고점이 아닌 층의 수. `layer_missing` 등 이동을 구하지 못한 행은 이 값들이 빈칸이다.
+  - `layer_align_flag`: 위 플래그 표의 값(`;`로 이어짐).
+  - **기존 정렬과의 차이**: 기존 정렬의 `alignment_unreliable`은 기준 마스크 일치도 < 0.5이고, Layer 정렬의 `alignment_unreliable`은 L1 Dice < `--align-min-dice`(기본 0.3)다. 이름은 같지만 서로 다른 열(`alignment_flag`, `layer_align_flag`)에 남는다. 한 쌍에서 두 열의 플래그가 달라도 모순이 아니다. 어느 쪽이든 판정은 기존 정렬로만 정해진다.
+- **summary 새 키**: `alignment.metrics_anchors`(metrics_anchor별 쌍 수), `layer_alignment.flags`(플래그별 쌍 수), `layer_alignment.excluded_layers`(제외 원인별 층 수), `review.primary_metric`(`name`, `auc`, `n`, `reason`: `highest_auc` 또는 `no_auc`), `review.html_bytes`(review.html 바이트), `separation_auc_same_vs_other_lineage`의 새 AUC 키(`similarity_layer`, `usage_jaccard_electrodes`, `electrode_similarity`, `pattern_similarity`, `cnt_similarity`)와 `n_pairs_with_value`(이 5개 지표의 값이 있는 쌍 수). 기존 AUC 키(`similarity`, `usage_jaccard`, `geometry`)는 그대로다. `--floor-quantile`을 쓰면 `floor.quantile`과 `floor.quantile_method: lower_index`가 더해진다.
+- **인수**(기본값은 `psdl1.screen_relations --help`):
+  - `--align-min-overlap`(0.5): Layer 이동 후보의 최소 valid 겹침 비율. `--align-min-support`(16): 층이 겹침 안에서 양쪽에 가져야 할 래스터 픽셀 수. `--align-min-dice`(0.3): L1 Dice가 이보다 낮으면 `alignment_unreliable`.
+  - `--presence-fraction`(0.01): 위 "있음" 문턱.
+  - `--bindings-out`: `bindings.csv` 경로(기본 `<out>.bindings.csv`).
+  - `--floor-quantile Q`: 같은 계열 유사도를 오름차순으로 놓고 `floor(Q·(n−1))`번째(lower index) 값을 기준으로 쓴다. 기본은 최솟값(Q=0)이다. 0 ≤ Q ≤ 1이고 `--floor`·`--floor-json`과 함께 쓸 수 없다. 그룹별 기준도 그룹 안 같은 계열 쌍에 같은 Q를 쓴다. 경계값이 float 오차로 밀리지 않도록 Q를 십진 표기 그대로 정확한 분수로 곱한다. Q를 올리면 기준이 올라 `different`가 늘 수 있으므로 판정이 바뀌는 선택이다(기본은 불변).
+  - `--review-layers`(4): 카드에서 펼쳐 보이는 층(Layer가 없으면 binding) 수. 나머지는 접힌다.
+  - `--review-bindings`: 더 이상 쓰지 않는다. 받기만 하고 무시한다(카드가 모든 binding의 지표 표를 보여 준다).
+- **보고서 구성**(`review.html`): ① 위에 주 지표 한 줄과 용어 한 줄. ② 지표별 같은 계열 vs 다른 계열 분포(인라인 SVG, 점이 많으면 히스토그램, similarity에 floor 선). ③ 검토 대상 전체 표. ④ 카드: 머리에 핵심 3줄(정렬 신뢰·주 지표·차이 큰 층), 이어서 A·B 전체 프레임 썸네일(ROI 박스), 정렬 후 Layer 층별 A | B | 차이 타일(Layer가 없으면 binding별 타일, `--review-layers`개만 펼침), 맨 아래에 접힌 "모든 값 보기"(유사도·기준·사용 일치 두 값·두 정렬의 근거·모든 binding 지표 표). 주 지표는 AUC가 가장 높은 지표이고(값이 있는 쌍이 전체의 절반 미만인 지표는 제외, 동률이면 pattern → electrode → similarity_layer → similarity → cnt → usage_jaccard_electrodes → usage_jaccard 순), 같은 계열 쌍이 없으면 `similarity`다. 외부 CDN 없이 파일 하나로 열린다. 합성 자료에서 60카드·Layer 10층이 약 1.1–1.8 MB였다.
+- **비용**(합성 3000×3000 이진, 층 10장, Apple M4 Pro 48 GiB, 단독 실행, 조합당 1회라 분산은 모른다. 자세한 표는 T7 측정 `RESULTS.md`):
+
+  | N | Layer 사이드카 | 스크리닝 시간 | 쌍당 | peak RSS |
+  |---|---|---|---|---|
+  | 30 (435쌍) | 있음 | 174 s | 0.40 s | 2.86 GiB |
+  | 30 (435쌍) | 없음 | 112 s | 0.26 s | 2.80 GiB |
+
+  N=10·30 두 점으로 적합한 시간은 `T ≈ c·N + p·쌍 수`이고, 사이드카가 있으면 쌍당 약 +0.12 s(정렬+지표), 제품당 약 +0.4 s(사이드카 읽기)다. 외삽(N=200, 19 900쌍, 선형 가정이라 오차 범위를 주지 못한다)은 사이드카 있음 약 77분·RSS 약 7.4 GiB, 없음 약 37분이다. **Layer가 없어도** 새 지표(원본 해상도 면적·경계) 계산 때문에 이전 버전보다 쌍당 약 0.08 s 더 걸린다. 디스크는 사이드카가 제품당 약 86 MiB(3000²에서 층 한 장 약 9 MB, 층 10장)이고 N=200이면 사이드카만 약 17 GiB, 번들 전체 약 37 GiB다. 내보내기는 사이드카가 있으면 제품당 약 +3.4 s 느리다(N=200 전체 약 36분, 없으면 약 25분).
 - 쌍은 같은 구획 안에서만 만든다. 같은 계열이 두 구획에 걸치면 분할 검사에서 거부한다.
 - 이 값은 정답이 아니라 판단을 돕는 지표다. 검토 자료를 보고 확정한 쌍을 `relations.csv`에 직접 고쳐 넣는다. `summary.json`의 `separation_auc_same_vs_other_lineage`는 유사도, 전극 사용 일치도, 형상 중 무엇이 계열을 잘 가르는지 보여 준다(1에 가까울수록 잘 갈림).
 - 같은 계열이 1개뿐이어서 기준을 못 잡으면 `--floor`로 직접 정한다. 점수는 나중에 정도(degree)를 쓰는 학습으로 넘어갈 때 다시 계산하지 않도록 `scores.csv`에 모두 남는다.
@@ -706,7 +765,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 | `GRID_CANDIDATES` | 비교할 grid 후보 리스트 |
 | `NO_PREVIEW` | `True` 면 미리보기 이미지·HTML 을 만들지 않는다 |
 
-**psdl1_assets.py** — 순서: (a) `WORK/inputs/metadata.json`(`stack-order.json`) 쓰기 → (b) `import_png --export` → `WORK/export/` → (c) `import_png --verify-bundle`(매번) → (d) `data` 격자 보고서 `WORK/reports/grid-report.json` → (e) 자동 split `WORK/inputs/split.json`(계보 단위, 구획별 제품·계보 수를 로그에 출력) → (f) `screen_relations` 을 구획별로 두 번 실행(train → `WORK/relations/train/`, split 에 test 제품이 있으면 test → `WORK/relations/test/`, 각각 `relations.csv`·`.review.html`·`.scores.csv`·`.summary.json`)하고 두 `relations.csv` 를 합쳐 `WORK/relations/relations.csv` 로 쓴다(쌍이 겹치면 멈춤) → (g) 사람이 확인할 파일 경로 출력.
+**psdl1_assets.py** — 순서: (a) `WORK/inputs/metadata.json`(`stack-order.json`) 쓰기 → (b) `import_png --export` → `WORK/export/` → (c) `import_png --verify-bundle`(매번) → (d) `data` 격자 보고서 `WORK/reports/grid-report.json` → (e) 자동 split `WORK/inputs/split.json`(계보 단위, 구획별 제품·계보 수를 로그에 출력) → (f) `screen_relations` 을 구획별로 두 번 실행(train → `WORK/relations/train/`, split 에 test 제품이 있으면 test → `WORK/relations/test/`, 각각 `relations.csv`·`.review.html`·`.scores.csv`·`.bindings.csv`·`.summary.json`)하고 두 `relations.csv` 를 합쳐 `WORK/relations/relations.csv` 로 쓴다(쌍이 겹치면 멈춤) → (g) 사람이 확인할 파일 경로 출력.
 
 | 항목 | 뜻 |
 |---|---|
@@ -715,7 +774,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 | `METADATA` | 모델별 `lineage_id`·`design_version`(metadata JSON 내용) |
 | `STACK_ORDER` | 층 순서 dict 또는 `None`(`None` 이면 CNT 는 이미지로만 내보낸다) |
 | `SPLIT_SEED`, `VALIDATION_FRACTION`, `TEST_FRACTION` | 자동 split 설정(기본 0, 0.2, 0.2) |
-| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`). `--out`·`--manifest`·`--split`·`--partitions` 는 약어(`--partition` 등)까지 쓰지 않는다(쓰면 시작 전에 멈춤). `--floor` 는 전체 이름으로만 쓴다 |
+| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`). `--out`·`--manifest`·`--split`·`--partitions` 는 약어(`--partition` 등)까지 쓰지 않는다(쓰면 시작 전에 멈춤). `--floor` 는 전체 이름으로만 쓴다. `["--floor-quantile", "0.2"]` 처럼 train 의 floor 를 같은 계보 유사도의 분위수(lower index)로 계산하게 할 수 있다(공백형과 `--floor-quantile=0.2` 형 모두). 이 인자는 **train 구획에만** 전달하고 test 구획은 계산된 train floor 를 쓴다. `--floor`·`--floor-json` 과 함께 쓰거나 약어(`--floor-q` 등)로 쓰면 시작 전에 멈춘다. `ROUND >= 2` 에서는 쓸 수 없어 멈춘다(floor 는 r01 값 고정) |
 
 **psdl1_train.py** — 시작할 때 `WORK/export/manifest.json`, `WORK/inputs/split.json`, `WORK/relations/relations.csv` 가 없으면 "psdl1_assets.py 를 먼저 실행" 오류로 멈춘다. 순서: (a) `PRETRAIN` 이면 `pretrain` → `WORK/pretrain/` → (b) `WORK/train/dl1.pt` 가 있으면 멈춤(이 확인은 pretrain 보다 먼저 한다) → (c) `train` → `WORK/train/`(사전학습했으면 `--weights WORK/pretrain/backbone.pt` 자동) → (d) `EVALUATE` 이고 split 에 **test** 제품이 있으면 `evaluate` → `WORK/train/evaluation.json`(`evaluate` 는 test 구획만 쓴다. test 가 없으면 이유를 로그에 남기고 건너뜀). `WORK/train/` 을 옮기면 평가 결과도 함께 움직인다.
 
@@ -732,7 +791,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 **다시 실행하면**
 - 끝난 단계는 건너뛰고 로그에 `[psdl1_job] <시각> skip <단계> (exists: <경로>)` 를 남긴다. `import_png --verify-bundle` 은 매번 실행한다.
 - export 가 끝나기 전(`WORK/export/manifest.json` 없음)에는 `METADATA`·`STACK_ORDER` 가 저장된 JSON 과 달라도 EDIT 값으로 바꿔 쓰고 로그에 남긴다. export 가 끝난 뒤에 다르면 덮어쓰지 않고 0 아닌 코드로 멈춘다. 바꾸려면 `WORK/inputs/` 의 해당 파일과 `WORK/export/` 를 직접 옮긴 뒤 다시 실행한다. export 전에 `STACK_ORDER = None` 으로 바꾸면 기존 `inputs/stack-order.json` 은 지우지 않고 `stack-order.json.removed-<YYYYmmdd-HHMMSS>` 로 옮기고 로그에 남긴다.
-- `import_png` 가 실패하면(inspect 의 출력 폴더, assets 의 `WORK/export/`) 먼저 실패 원인(종료 코드나 예외 요약)을 로그에 남기고, 그 폴더를 `<폴더>.failed-<YYYYmmdd-HHMMSS>` 로 옮겨 진단 근거를 보존한 뒤 멈춘다. 같은 이름이 이미 있으면 `-2`, `-3` … 을 붙이고 기존 폴더는 건드리지 않는다. 폴더를 옮기지 못하면 "이동 실패: <경로>, 손으로 옮긴 뒤 다시 실행" 을 남기고 원래 실패 코드로 멈춘다. 다음 실행은 새로 만든다. 프로세스가 강제 종료되어 `manifest.json` 없는 `WORK/export/` 가 남았으면 멈춘다. 폴더를 직접 옮긴 뒤 다시 실행한다. `relations/train`·`relations/test` 에 일부 파일만 있거나 `relations.csv.summary.json` 이 깨졌어도 "부분 출력: <폴더> 를 옮긴 뒤 다시 실행" 으로 멈춘다.
+- `import_png` 가 실패하면(inspect 의 출력 폴더, assets 의 `WORK/export/`) 먼저 실패 원인(종료 코드나 예외 요약)을 로그에 남기고, 그 폴더를 `<폴더>.failed-<YYYYmmdd-HHMMSS>` 로 옮겨 진단 근거를 보존한 뒤 멈춘다. 같은 이름이 이미 있으면 `-2`, `-3` … 을 붙이고 기존 폴더는 건드리지 않는다. 폴더를 옮기지 못하면 "이동 실패: <경로>, 손으로 옮긴 뒤 다시 실행" 을 남기고 원래 실패 코드로 멈춘다. 다음 실행은 새로 만든다. 프로세스가 강제 종료되어 `manifest.json` 없는 `WORK/export/` 가 남았으면 멈춘다. 폴더를 직접 옮긴 뒤 다시 실행한다. `relations/train`·`relations/test` 에 일부 파일만 있거나 `relations.csv.summary.json` 이 깨졌어도 "부분 출력: <폴더> 를 옮긴 뒤 다시 실행" 으로 멈춘다. 끝난 것으로 보는 기준은 `relations.csv`·`.review.html`·`.summary.json` 세 파일이 모두 있는 경우다. `screen_relations` 는 `.bindings.csv`·`.scores.csv` 를 먼저 쓰고 summary 를 마지막에 쓰므로, 중간에 끊기면 `.bindings.csv` 만 남아도 부분 출력으로 멈춘다.
 - `reports/grid-report.json` 이 있으면 JSON 으로 파싱되는지 확인하고 깨졌으면 멈춘다.
 - `split.json` 이 있으면 다시 만들지 않고 재사용한다(제품과 맞는지 검증한다). 직접 쓴 split 을 넣어 두어도 된다.
 - `WORK/pretrain/` 은 `pretrain.json` 과 가중치 해시가 맞을 때만 끝난 것으로 본다. 중단된 결과면 멈추고 JOBS 방식의 `pretrain --resume` 을 안내한다.
@@ -746,7 +805,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 - `WORK/relations/train/relations.csv.review.html`, `WORK/relations/test/relations.csv.review.html`(test 제품이 있을 때) — 애매한 쌍 검토. 고친 relations 를 쓰려면 합친 `WORK/relations/relations.csv` 를 직접 수정한 뒤 train 을 실행한다
 - `WORK/reports/grid-report.json` — 격자 보고서(얇은 선 경고)
 
-**relations 기준값**: held-out(test)이 train 라벨의 기준(floor)에 섞이지 않도록 train 구획의 global floor 를 먼저 구하고, test 구획은 그 값을 `--floor` 로 받아 판정한다. `--groups` 를 쓰면 group 별 floor 는 train 안에서만 쓰이고 test 로 넘어가지 않는다(`--floor` 를 주면 `screen_relations` 가 group floor 를 계산하지 않는다). train 구획에 같은 계보 쌍이 없으면 `SCREEN_ARGS` 에 `--floor <값>` 이 필요하다. `SCREEN_ARGS` 에 `--floor` 가 있으면 두 구획에 같은 값을 쓴다. validation 은 train·evaluate 가 쓰지 않으므로 스크리닝하지 않는다.
+**relations 기준값**: held-out(test)이 train 라벨의 기준(floor)에 섞이지 않도록 train 구획의 global floor 를 먼저 구하고, test 구획은 그 값을 `--floor` 로 받아 판정한다. `--groups` 를 쓰면 group 별 floor 는 train 안에서만 쓰이고 test 로 넘어가지 않는다(`--floor` 를 주면 `screen_relations` 가 group floor 를 계산하지 않는다). train 구획에 같은 계보 쌍이 없으면 `SCREEN_ARGS` 에 `--floor <값>` 이 필요하다. `SCREEN_ARGS` 에 `--floor` 가 있으면 두 구획에 같은 값을 쓴다. `SCREEN_ARGS` 에 `--floor-quantile` 이 있으면 train 의 global floor(그리고 `--groups` 의 group floor)를 그 분위수로 계산하고, test 는 계산된 global floor 를 `--floor` 로 받는다. validation 은 train·evaluate 가 쓰지 않으므로 스크리닝하지 않는다.
 
 학습 파일은 CUDA 를 확인하지 않는다. 얇은 선 경고를 승인했다면 `TRAIN_ARGS` 에 `"--allow-grid-check-failure"` 를 넣는다.
 
@@ -918,6 +977,9 @@ R1=$WORK/rounds/r01; R2=$WORK/rounds/r02
 #### 알아 둘 한계
 
 - 라운드 ≥ 2 에서는 `--floor` 를 어떤 형태로도 쓸 수 없다. floor 는 항상 r01 train 구획 값이다. 라운드마다 다시 계산하지 않는다.
+- `--floor-quantile` 은 `--floor-json` 과 함께 쓸 수 없다(배타). 증분 스크리닝의 floor 는 r01 summary 값 그대로이고, 단일 파일 실행기는 `ROUND >= 2` 에서 `--floor-quantile` 을 멈춘다.
+- Layer 가 있는 새 제품과 Layer 가 없는 이전 라운드 제품의 쌍은 Layer 정렬을 못 한다(`layer_missing`). 그 쌍은 기존 정렬로 지표를 계산하고 `metrics_anchor` 가 `CNT` 등 기존 값이다. Layer 가 양쪽에 있는 쌍만 `metrics_anchor=LAYER` 일 수 있으므로 한 `scores.csv` 에 두 종류가 섞인다. `metrics_anchor` 열로 구분하고, `pattern_similarity` 같은 Layer 전용 값은 `LAYER` 쌍에서만 있다. 판정은 어느 쪽이든 기존 `similarity` 와 r01 floor 로 정해지므로 섞여도 라벨은 일관된다.
+- `merge_bundles` 는 두 묶음의 Layer 사이드카를 합쳐 `screening_layers/rNN/` 아래에 둔다(import 묶음의 파일은 평면 `screening_layers/` 에서 라운드 폴더로 옮겨진다). 같은 제품 ID 가 두 쪽에 있으면 병합이 멈춘다. 한쪽에만 사이드카가 있어도 합쳐진다. 규칙은 `docs/data_contract.md` 의 Merged round bundles 에 있다.
 - 앞 라운드에서 `unknown` 으로 남은 기존×기존 쌍은 다시 판정하지 않는다. 새×기존 쌍만 새로 판정한다.
 - 증분 스크리닝의 그룹(`--groups`) 간 `different` 쌍 상한(`--cross-group-fraction`)은 **delta 쌍만으로** 계산한다. 앞 라운드의 쌍 수는 세지 않는다.
 - 라운드 비교는 쿼리별로 두 `evaluation.json` 을 맞춘다. 이전 체크포인트를 새 데이터로 다시 평가하지 않는다. 라운드마다 후보 풀이 커지므로 recall 하락이 모두 망각은 아니다. 쿼리마다 후보 수가 같이 기록되고, 경고(`possible_forgetting`, `candidate_pool_grew`, `same_input_hash`, `queries_lost_metric`, `queries_missing_from_current`)를 먼저 읽는다.
