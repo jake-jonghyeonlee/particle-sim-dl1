@@ -26,8 +26,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from . import screen_align
 from .data import _iter_manifest_products
+from .import_png import SCREENING_LAYERS_DIR, SCREENING_LAYERS_FILE, SCREENING_LAYERS_SCHEMA_VERSION, _read_json, bundle_path
 from .losses import validate_relations
+from .png_contract import mask_hash
 from .pretrain import check_split_ids
 from .schema import binary_mask
 from .split import validate_split
@@ -36,7 +39,9 @@ PARTITIONS = ("train", "validation", "test")
 CNT = "CNT"
 CHECK_GRID = 64  # manifest 읽기용 grid 검사 해상도. 스크리닝 결과와 무관하다
 SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "lineage_a", "lineage_b", "similarity", "usage_jaccard",
-                "geometry_distance", "anchor", "shift_y_um", "shift_x_um", "alignment_score", "roi_overlap", "alignment_flag", "tier", "reason")
+                "geometry_distance", "anchor", "shift_y_um", "shift_x_um", "alignment_score", "roi_overlap", "alignment_flag", "tier", "reason",
+                "metrics_anchor", "similarity_layer", "layer_shift_y_um", "layer_shift_x_um", "layer_align_dice", "layer_align_second_dice",
+                "layer_align_decided", "layer_align_disagreeing", "layer_align_flag")
 
 
 def block_reduce(mask, factor, how):
@@ -191,6 +196,87 @@ def compare(sa, sb, *, anchor="auto", max_shift=0.35, candidates=5, tolerance=1)
     return {**best, "anchor": kind, "flags": flags, "um_per_px": sa["um_per_px"]}
 
 
+def load_screening_layers(manifest, needed, factor):
+    """manifest 폴더의 screening-layers.json 에서 `needed` 제품의 Layer 를 읽어 {product_id: {casefold 층 이름: 래스터(bool)}} 로 돌려준다.
+
+    사이드카 파일이 없으면 {} (모든 제품에 Layer 없음). 파일이 있는데 손상됐으면 ValueError 다: 스키마, 경로 containment, manifest 의 product_id·frame 연결,
+    casefold 중복 층 이름, npy 의 dtype bool·shape==frame, mask_sha256. 마스크는 필요한 제품만 읽고 `block_reduce(any, factor)` 로 줄여 보관한다."""
+    root = Path(manifest).parent
+    if not (root / SCREENING_LAYERS_FILE).exists() and not (root / SCREENING_LAYERS_FILE).is_symlink():
+        return {}
+    frames = {p["product_id"]: p.get("frame") for p in json.loads(Path(manifest).read_text(encoding="utf-8"))["products"]}
+
+    def bad(reason):
+        return ValueError(f"{SCREENING_LAYERS_FILE} is corrupt: {reason}")
+    try:
+        document = _read_json(bundle_path(root, SCREENING_LAYERS_FILE))
+    except (OSError, ValueError) as exc:
+        raise bad(str(exc)) from exc
+    if not isinstance(document, dict) or set(document) != {"schema_version", "products"} or not isinstance(document["products"], dict):
+        raise bad("fields")
+    if document["schema_version"] != SCREENING_LAYERS_SCHEMA_VERSION:
+        raise bad("unsupported schema_version")
+    loaded, seen_paths = {}, set()
+    for product_id, entry in document["products"].items():
+        frame = frames.get(product_id)
+        if not isinstance(frame, dict):
+            raise bad(f"product {product_id!r} is not in the manifest")
+        if (not isinstance(entry, dict) or set(entry) != {"frame_id", "layers"} or entry["frame_id"] != frame.get("frame_id") or
+                not isinstance(entry["layers"], list) or not entry["layers"]):
+            raise bad(f"product {product_id!r} entry or frame_id")
+        folded, rasters = set(), {}
+        for layer in entry["layers"]:
+            if not isinstance(layer, dict) or set(layer) != {"layer", "filename_number", "relative_path", "mask", "mask_sha256"}:
+                raise bad(f"product {product_id!r} layer fields")
+            name, path = layer["layer"], layer["mask"]
+            if not isinstance(name, str) or not name or not isinstance(layer["mask_sha256"], str):
+                raise bad(f"product {product_id!r} layer values")
+            if name.casefold() in folded:
+                raise bad(f"product {product_id!r} has duplicate layer name {name!r}")
+            folded.add(name.casefold())
+            if not isinstance(path, str) or not path.startswith(SCREENING_LAYERS_DIR + "/") or path in seen_paths:
+                raise bad(f"product {product_id!r} layer mask path")
+            seen_paths.add(path)
+            if product_id not in needed:
+                continue
+            try:
+                mask = np.load(bundle_path(root, path), allow_pickle=False)
+            except (OSError, ValueError, EOFError) as exc:
+                raise bad(f"{path}: {exc}") from exc
+            if not isinstance(mask, np.ndarray) or mask.dtype != np.bool_ or list(mask.shape) != list(frame["shape_yx"]):
+                raise bad(f"{path}: dtype bool and the frame shape are required")
+            if mask_hash(mask) != layer["mask_sha256"]:
+                raise bad(f"{path}: mask_sha256 mismatch")
+            rasters[name.casefold()] = block_reduce(mask, factor, "any")
+        if product_id in needed:
+            loaded[product_id] = rasters
+    return loaded
+
+
+def search_window(sa, sb, max_shift):
+    """compare 가 쓰는 시작점(center)과 탐색 반경(limit) — 같은 식이다."""
+    center = ((sa["shape"][0] - sb["shape"][0]) // 2, (sa["shape"][1] - sb["shape"][1]) // 2)
+    return center, tuple(math.ceil(max_shift * max(sa["shape"][i], sb["shape"][i])) for i in range(2))
+
+
+def layer_columns(sa, sb, result, layers_a, layers_b, *, max_shift, min_overlap, min_support, min_dice):
+    """Layer 정렬을 따로 한 번 호출하고 scores.csv 의 새 컬럼 값을 만든다. compare 의 결과는 바꾸지 않는다."""
+    center, limit = search_window(sa, sb, max_shift)
+    align = screen_align.align_layers(layers_a, layers_b, sa["valid"], sb["valid"], center=center, limit=limit, min_overlap=min_overlap,
+                                      min_support=min_support, min_dice=min_dice)
+    shown = align["shift"] is not None
+    similarity_layer = result["similarity"]
+    if align["applied"]:
+        moved = evaluate_shift(sa, sb, align["shift"][0], align["shift"][1])
+        if moved is not None:
+            similarity_layer = moved["similarity"]
+    um = sa["um_per_px"]
+    return align, {"metrics_anchor": "LAYER" if align["applied"] else result["anchor"], "similarity_layer": round(similarity_layer, 6),
+                   "layer_shift_y_um": round(align["shift"][0] * um, 3) if shown else None, "layer_shift_x_um": round(align["shift"][1] * um, 3) if shown else None,
+                   "layer_align_dice": align["dice"], "layer_align_second_dice": align["second_dice"], "layer_align_decided": align["decided"],
+                   "layer_align_disagreeing": align["disagreeing"], "layer_align_flag": ";".join(align["flags"])}
+
+
 def auc(higher, lower):
     """무작위로 뽑은 higher 쪽 값이 lower 쪽 값보다 클 확률(동점은 절반). 1에 가까울수록 두 집단이 잘 갈린다."""
     if not higher or not lower:
@@ -253,8 +339,10 @@ def base_old_sets(base_split, split, product_ids):
 
 
 def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
-           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None):
-    """base_split과 base_relations를 함께 주면 증분 모드: 새 제품이 낀 쌍(새×새, 새×기존)만 계산한다. floor_spec은 load_floor_spec() 결과다."""
+           min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None,
+           align_min_overlap=screen_align.ALIGN_MIN_OVERLAP, align_min_support=screen_align.ALIGN_MIN_SUPPORT, align_min_dice=screen_align.ALIGN_MIN_DICE):
+    """base_split과 base_relations를 함께 주면 증분 모드: 새 제품이 낀 쌍(새×새, 새×기존)만 계산한다. floor_spec은 load_floor_spec() 결과다.
+    align_*는 Layer 정렬(scores.csv 의 새 컬럼)에만 쓰이고 tier·floor 판정은 바꾸지 않는다."""
     if (base_split is None) != (base_relations is None):
         raise ValueError("base_split and base_relations go together")
     if floor is not None and floor_spec is not None:
@@ -268,6 +356,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         raise ValueError("anchor must be auto/CNT/ELECTRODES, max_shift in (0,1] and candidates >= 1")
     if not partitions or any(p not in PARTITIONS for p in partitions):
         raise ValueError(f"partitions must be chosen from {PARTITIONS}")
+    if not 0 <= align_min_overlap <= 1 or type(align_min_support) is not int or align_min_support < 1 or not 0 <= align_min_dice <= 1:
+        raise ValueError("align_min_overlap in [0,1], align_min_support >= 1 and align_min_dice in [0,1] required")
     document = json.loads(Path(manifest).read_text(encoding="utf-8"))
     ids = [p["product_id"] for p in document["products"]]
     check_split_ids(split, ids)
@@ -283,6 +373,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         if product.product_id in wanted:
             signatures[product.product_id] = product_signature(product, factor, tolerance)
     validate_split(stubs, split)
+    layers = load_screening_layers(manifest, wanted, factor)  # 사이드카 파일이 없으면 {}, 손상됐으면 오류
     pairs = []
     for part in partitions:
         names = sorted(split[part])
@@ -298,6 +389,10 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                               "anchor": result["anchor"], "shift_y_um": round(result["shift"][0] * result["um_per_px"], 3), "shift_x_um": round(result["shift"][1] * result["um_per_px"], 3),
                               "alignment_score": None if result["anchor_score"] is None else round(result["anchor_score"], 4), "roi_overlap": round(float(result["roi_overlap"]), 4),
                               "alignment_flag": ";".join(result["flags"])})
+                align, columns = layer_columns(signatures[a], signatures[b], result, layers.get(a), layers.get(b), max_shift=max_shift,
+                                               min_overlap=align_min_overlap, min_support=align_min_support, min_dice=align_min_dice)
+                pairs[-1].update(columns)
+                pairs[-1]["layer_flags"], pairs[-1]["layer_excluded"] = align["flags"], align["excluded"]
     if incremental:
         new_of = {part: sorted(set(split[part]) - old_of[part]) for part in partitions}
         expected = {part: len(new_of[part]) * (len(new_of[part]) - 1) // 2 + len(new_of[part]) * len(old_of[part]) for part in partitions}
@@ -383,7 +478,10 @@ def summarize(pairs, split, partitions, group_of, global_floor, group_floor, mar
                                                       "geometry": separation(lambda p: 0.0 if p["geometry_distance"] is None else 1 - p["geometry_distance"])},
             "alignment": {"anchors": {k: sum(p["anchor"] == k for p in pairs) for k in sorted({p["anchor"] for p in pairs})},
                           "flags": {f: sum(f in p["alignment_flag"].split(";") for p in pairs) for f in ("no_anchor", "anchor_fallback_electrodes", "ambiguous_alignment", "alignment_unreliable", "low_overlap")},
+                          "metrics_anchors": {k: sum(p["metrics_anchor"] == k for p in pairs) for k in sorted({p["metrics_anchor"] for p in pairs})},
                           "median_roi_overlap": float(np.median([p["roi_overlap"] for p in pairs])) if pairs else None},
+            "layer_alignment": {"flags": {f: sum(f in p["layer_flags"] for p in pairs) for f in screen_align.FLAGS},
+                                "excluded_layers": {c: sum(c == cause for p in pairs for cause in p["layer_excluded"].values()) for c in screen_align.EXCLUDE_CAUSES}},
             "review": {"pairs_to_review": sum(bool(p["review"]) for p in pairs),
                        "by_reason": {r: sum(r in p["review"] for p in pairs) for r in sorted({r for p in pairs for r in p["review"]})}},
             "products_without_different_pair": uncovered, "groups": {g: sum(v == g for v in group_of.values()) for g in sorted(set(group_of.values()))}}
@@ -499,6 +597,9 @@ def main(argv=None):
     ap.add_argument("--floor-json", help="summary.json of an earlier screening: reuse its floor.global and floor.per_group (exclusive with --floor)")
     ap.add_argument("--base-split", help="split.json of the previous round; with --base-relations only pairs that include a new product are screened")
     ap.add_argument("--base-relations", help="merged relations.csv of the previous round (hand edits kept); --out then holds the delta rows only")
+    ap.add_argument("--align-min-overlap", type=float, default=screen_align.ALIGN_MIN_OVERLAP, help="Layer alignment: a shift needs |valid overlap| / min(|valid A|, |valid B|) at least this")
+    ap.add_argument("--align-min-support", type=int, default=screen_align.ALIGN_MIN_SUPPORT, help="Layer alignment: raster pixels a layer needs in A and in B inside the overlap of a shift")
+    ap.add_argument("--align-min-dice", type=float, default=screen_align.ALIGN_MIN_DICE, help="Layer alignment: the deciding layer's Dice at the chosen shift below this is alignment_unreliable (shift not used)")
     ap.add_argument("--review-pairs", type=int, default=60, help="pairs drawn as image cards; the table always lists every pair to review")
     ap.add_argument("--review-band", type=float, default=0.15, help="auto-different pairs within margin + band of the floor are listed for review")
     ap.add_argument("--review-bindings", type=int, default=6)
@@ -514,7 +615,8 @@ def main(argv=None):
     if a.floor_json is not None:
         extra["floor_spec"] = load_floor_spec(a.floor_json)
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
-                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band, **extra)
+                    floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band,
+                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, **extra)
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     for path in (review, summary):
