@@ -90,6 +90,7 @@ TEST_FRACTION = 0.2
 # screen_relations 추가 인자. 예: ["--groups", "/data/groups.json", "--margin", "0.05"]. --out/--manifest/--split/--partitions 는 쓰지 않는다.
 # train 구획에 같은 계보 쌍이 없으면 ["--floor", "<값>"] 이 필요하다. 있으면 두 구획(train, test)에 같은 값을 쓴다.
 # ROUND 2 이상에서는 --floor 를 쓸 수 없다. 항상 WORK/rounds/r01 의 floor 를 고정해 쓴다.
+# ["--floor-quantile", "0.2"] 는 train 의 floor 를 같은 계보 유사도의 분위수로 계산한다(--floor 와 함께 쓸 수 없고 ROUND 2 이상에서는 쓰지 않는다). test 는 계산된 train floor 를 쓴다.
 SCREEN_ARGS = []
 LOG_FILE = WORK + "/logs/assets.log"    # stdout/stderr(진행 줄)를 이 파일에도 남긴다. 필요 없으면 None
 WORK_DIR = None                         # 패키지를 풀 폴더. None이면 이 파일 옆, 쓸 수 없으면 임시 폴더
@@ -416,8 +417,37 @@ def _floor_arg(args):
     return None
 
 
+def _floor_quantile_arg(args):
+    """SCREEN_ARGS 에 --floor-quantile 이 있는가. 약어(--floor-q 등)와 모호한 --floor- 는 전체 이름을 쓰라며 멈춘다."""
+    found = False
+    for arg in args:
+        name = str(arg).split("=", 1)[0]
+        if name == "--floor-quantile":
+            found = True
+        elif name.startswith("--floor-") and "--floor-quantile".startswith(name):
+            _stop(f"SCREEN_ARGS has {name}: write the full name --floor-quantile (or --floor-json)")
+    return found
+
+
+def _without_floor_quantile(args):
+    """--floor-quantile Q / --floor-quantile=Q 를 뺀 인자 목록. test 구획은 train 에서 계산한 floor 를 쓰므로 quantile 을 받지 않는다."""
+    kept, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        name = str(arg).split("=", 1)[0]
+        if name == "--floor-quantile":
+            skip = "=" not in str(arg)
+            continue
+        kept.append(arg)
+    return kept
+
+
 def _user_floor_source(args):
-    """사용자가 기준(floor)을 직접 정했는가: --floor 이거나 --floor-json(약어 포함)이면 True. 이때 실행기는 test 구획에 train 기준을 따로 넣지 않는다."""
+    """사용자가 기준(floor)을 직접 정했는가: --floor 이거나 --floor-json(약어 포함)이면 True. 이때 실행기는 test 구획에 train 기준을 따로 넣지 않는다.
+    --floor-quantile 은 기준값이 아니라 train 에서 floor 를 계산하는 규칙이라 False 다."""
+    _floor_quantile_arg(args)
     if _floor_arg(args) is not None:
         return True
     for arg in args:
@@ -427,8 +457,8 @@ def _user_floor_source(args):
     return False
 
 
-def _screen(manifest, split_path, part, out_dir, extra):
-    """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다."""
+def _screen(manifest, split_path, part, out_dir, extra, drop_quantile=False):
+    """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다. drop_quantile 이면 --floor-quantile 을 빼고 넘긴다."""
     csv = out_dir / "relations.csv"
     outputs = [csv, csv.with_name(csv.name + ".review.html"), csv.with_name(csv.name + ".summary.json")]
     found = [p for p in outputs + [csv.with_name(csv.name + ".scores.csv")] if p.exists()]
@@ -438,7 +468,7 @@ def _screen(manifest, split_path, part, out_dir, extra):
         _stop("screen_relations left partial output: " + ", ".join(str(p) for p in found) + f". Move {out_dir} away and run again")
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
-        _call("screen_relations", ["--manifest", manifest, "--split", split_path, "--out", csv, "--partitions", part, *SCREEN_ARGS, *extra])
+        _call("screen_relations", ["--manifest", manifest, "--split", split_path, "--out", csv, "--partitions", part, *(_without_floor_quantile(SCREEN_ARGS) if drop_quantile else SCREEN_ARGS), *extra])
     try:
         summary = json.loads(outputs[2].read_text(encoding="utf-8"))
         if not isinstance(summary, dict):
@@ -545,6 +575,9 @@ def _check_screen_args():
     """SCREEN_ARGS 의 예약 인자를 시작 전에 검사한다. ROUND 2 이상은 --floor 를 받지 않고(r01 floor 를 고정한다) 증분 인자도 예약한다."""
     reserved = ("--out", "--manifest", "--split", "--partitions")
     if ROUND is not None and ROUND >= 2:
+        if _floor_quantile_arg(SCREEN_ARGS):
+            _stop("SCREEN_ARGS must not contain --floor-quantile: ROUND >= 2 always uses the round-1 floor (--floor-json from WORK/rounds/r01), "
+                  "so a new quantile would change the floor between rounds. Remove it")
         for arg in SCREEN_ARGS:
             name = str(arg).split("=", 1)[0]
             if name.startswith("--") and len(name) > 2 and "--floor".startswith(name):
@@ -553,6 +586,8 @@ def _check_screen_args():
     else:
         _check_reserved("SCREEN_ARGS", SCREEN_ARGS, reserved)
         _floor_arg(SCREEN_ARGS)  # --floor 약어는 시작 전에 멈춘다
+        if _floor_quantile_arg(SCREEN_ARGS) and _user_floor_source(SCREEN_ARGS):
+            _stop("SCREEN_ARGS has --floor-quantile together with --floor or --floor-json: the quantile computes the floor, so use only one")
 
 
 def _merge_step(prev, export, export_new):
@@ -673,7 +708,7 @@ def stage():
         review.append(train_dir / "relations.csv.review.html")
         if split.get("test"):
             floor = [] if _user_floor_source(SCREEN_ARGS) else ["--floor", repr(train_summary["floor"]["global"])]
-            _screen(manifest, split_path, "test", test_dir, floor)
+            _screen(manifest, split_path, "test", test_dir, floor, drop_quantile=True)
             parts.append(test_dir / "relations.csv")
             review.append(test_dir / "relations.csv.review.html")
         else:

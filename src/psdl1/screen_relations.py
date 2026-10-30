@@ -483,9 +483,15 @@ def base_old_sets(base_split, split, product_ids):
 def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
            min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None,
            align_min_overlap=screen_align.ALIGN_MIN_OVERLAP, align_min_support=screen_align.ALIGN_MIN_SUPPORT, align_min_dice=screen_align.ALIGN_MIN_DICE,
-           presence_fraction=PRESENCE_FRACTION):
+           presence_fraction=PRESENCE_FRACTION, floor_quantile=None):
     """base_split과 base_relations를 함께 주면 증분 모드: 새 제품이 낀 쌍(새×새, 새×기존)만 계산한다. floor_spec은 load_floor_spec() 결과다.
-    align_*는 Layer 정렬(scores.csv 의 새 컬럼)에만 쓰이고 tier·floor 판정은 바꾸지 않는다."""
+    align_*는 Layer 정렬(scores.csv 의 새 컬럼)에만 쓰이고 tier·floor 판정은 바꾸지 않는다.
+    floor_quantile=q 이면 같은 계열 유사도를 정렬한 index floor(q*(n-1)) 의 값을 floor 로 쓴다(None 이면 최솟값). floor·floor_spec 과 배타다."""
+    if floor_quantile is not None:
+        if isinstance(floor_quantile, bool) or not isinstance(floor_quantile, (int, float)) or not 0 <= floor_quantile <= 1:
+            raise ValueError("floor_quantile in [0,1] required")
+        if floor is not None or floor_spec is not None:
+            raise ValueError("floor_quantile is exclusive with floor and floor_spec")
     if (base_split is None) != (base_relations is None):
         raise ValueError("base_split and base_relations go together")
     if floor is not None and floor_spec is not None:
@@ -553,7 +559,11 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         if counts != expected:
             raise ValueError(f"delta pair count {counts} differs from the expected n(n-1)/2 + n*m {expected}")
     same = [p for p in pairs if p["same_lineage"]]
-    global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (min(p["similarity"] for p in same) if same else None)
+    def pick(values):  # 정렬한 값의 lower index. q=None 이면 최솟값
+        ordered = sorted(values)
+        return ordered[0 if floor_quantile is None else int(math.floor(floor_quantile * (len(ordered) - 1)))]
+
+    global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (pick([p["similarity"] for p in same]) if same else None)
     if global_floor is None:
         raise ValueError("no same-lineage pair to calibrate with; pass an explicit --floor")
     group_floor = {}
@@ -562,7 +572,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     for g in sorted(set(group_of.values())):
         within = [p["similarity"] for p in same if p["group_a"] == g and p["group_b"] == g]
         if floor is None and floor_spec is None and len(within) >= min_group_pairs:
-            group_floor[g] = min(within)
+            group_floor[g] = pick(within)
     for p in pairs:
         p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
         if p["same_lineage"]:
@@ -610,6 +620,9 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                         "new_products": new_of, "delta_pairs": counts, "expected_delta_pairs": expected})
     if floor_spec is not None:
         summary["floor"]["source"] = "base_summary"
+    if floor_quantile is not None:
+        summary["floor"]["quantile"] = floor_quantile
+        summary["floor"]["quantile_method"] = "lower_index"
     return {"pairs": pairs, "signatures": signatures, "floor": floor_info, "summary": summary}
 
 
@@ -761,6 +774,7 @@ def main(argv=None):
     ap.add_argument("--candidates", type=int, default=5, help="alignment candidates (correlation peaks) verified with the full similarity")
     ap.add_argument("--margin", type=float, default=0.05, help="a cross-lineage pair is 'different' only this far below the weakest same-lineage similarity")
     ap.add_argument("--floor", type=float, help="explicit similarity floor instead of the weakest same-lineage pair")
+    ap.add_argument("--floor-quantile", type=float, help="use the lower-index quantile q in [0,1] of the same-lineage similarities as the floor instead of the minimum (exclusive with --floor and --floor-json)")
     ap.add_argument("--cross-group-fraction", type=float, default=0.2, help="cross-group 'different' pairs kept, as a fraction of within-group ones")
     ap.add_argument("--floor-json", help="summary.json of an earlier screening: reuse its floor.global and floor.per_group (exclusive with --floor)")
     ap.add_argument("--base-split", help="split.json of the previous round; with --base-relations only pairs that include a new product are screened")
@@ -776,6 +790,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.floor_json is not None and a.floor is not None:
         ap.error("--floor and --floor-json are exclusive")
+    if a.floor_quantile is not None:
+        if a.floor is not None or a.floor_json is not None:
+            ap.error("--floor-quantile is exclusive with --floor and --floor-json")
+        if not 0 <= a.floor_quantile <= 1:  # NaN 도 여기서 걸린다
+            ap.error("--floor-quantile must be in [0,1]")
     if (a.base_split is None) != (a.base_relations is None):
         ap.error("--base-split and --base-relations go together")
     if a.base_split is not None and a.floor is None and a.floor_json is None:
@@ -786,7 +805,7 @@ def main(argv=None):
         extra["floor_spec"] = load_floor_spec(a.floor_json)
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
                     floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band,
-                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, **extra)
+                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, floor_quantile=a.floor_quantile, **extra)
     out = Path(a.out)
     scores, review, summary = (out.with_name(out.name + suffix) for suffix in (".scores.csv", ".review.html", ".summary.json"))
     bindings = Path(a.bindings_out) if a.bindings_out else out.with_name(out.name + ".bindings.csv")

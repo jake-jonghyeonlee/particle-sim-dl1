@@ -1073,3 +1073,90 @@ def test_merge_and_compare_jobs_run_from_the_single_file(bundle, rounds_env, tmp
     result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, cwd=tmp_path, env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"})
     assert result.returncode == 0, result.stderr[-3000:]
     assert json.loads(comparison.read_text(encoding="utf-8"))["schema_version"] == "dl1_round_comparison_v1"
+
+
+# ---- --floor-quantile (T6) ----
+
+QUANTILE_FORMS = [["--floor-quantile", "0.5"], ["--floor-quantile=0.5"]]
+
+
+@pytest.mark.parametrize("args", QUANTILE_FORMS)
+def test_floor_quantile_helpers_split_the_train_only_argument(stages, args):
+    g = stage_globals(stages, "psdl1_assets.py")
+    mixed = ["--groups", "g.json", *args, "--margin", "0.1"]
+    assert g["_floor_quantile_arg"](mixed) is True and g["_floor_quantile_arg"](["--groups", "g.json"]) is False
+    assert g["_without_floor_quantile"](mixed) == ["--groups", "g.json", "--margin", "0.1"]
+    assert g["_user_floor_source"](args) is False  # a rule that computes the floor, not a user floor
+    assert g["_user_floor_source"]([*args, "--floor", "1"]) is True
+
+
+@pytest.mark.parametrize("args", QUANTILE_FORMS)
+def test_floor_quantile_goes_to_train_only_and_test_gets_the_train_floor(stages, tmp_path, args):
+    png = tmp_path / "png"
+    names = ["W1", "W2", "W3", "W4"]
+    for name in names:
+        write_wide_import_fixture(png, model=name)
+    metadata = {"metadata_schema_version": "dl1_png_metadata_v1", "models": {
+        n: {"lineage_id": "F1" if n in ("W1", "W2") else "F2", "design_version": "V1"} for n in names}}
+    work = tmp_path / "work"
+    (work / "inputs").mkdir(parents=True)
+    (work / "inputs" / "split.json").write_text(json.dumps({"schema_version": SPLIT_VERSION, "train": ["W1", "W2"], "validation": [], "test": ["W3", "W4"]}))
+    script = stage_script(stages, "psdl1_assets.py", tmp_path, **assets_values(png, work, METADATA=metadata, NO_PREVIEW=True, SCREEN_ARGS=args))
+    result = run_script(script, tmp_path)
+    assert result.returncode == 0, result.stderr[-3000:]
+    train, test = (json.loads((work / "relations" / part / "relations.csv.summary.json").read_text(encoding="utf-8")) for part in ("train", "test"))
+    assert train["floor"]["quantile"] == 0.5 and train["floor"]["quantile_method"] == "lower_index"
+    assert "quantile" not in test["floor"] and test["floor"]["global"] == train["floor"]["global"]
+
+
+@pytest.mark.parametrize("args", QUANTILE_FORMS)
+def test_floor_quantile_is_in_the_train_call_arguments_and_not_in_the_test_call(stages, tmp_path, args):
+    g = stage_globals(stages, "psdl1_assets.py")
+    calls = []
+
+    def fake_call(name, call_args):
+        calls.append([str(a) for a in call_args])
+        csv = Path(call_args[call_args.index("--out") + 1])
+        csv.write_text("", encoding="utf-8")
+        csv.with_name(csv.name + ".review.html").write_text("", encoding="utf-8")
+        csv.with_name(csv.name + ".summary.json").write_text(json.dumps({"floor": {"global": 0.25}}), encoding="utf-8")
+
+    g.update(_call=fake_call, SCREEN_ARGS=["--groups", "g.json", *args])
+    train = g["_screen"]("m.json", "s.json", "train", tmp_path / "train", [])
+    floor = ["--floor", repr(train["floor"]["global"])]
+    g["_screen"]("m.json", "s.json", "test", tmp_path / "test", floor, drop_quantile=True)
+    train_call, test_call = calls
+    assert any(a.split("=")[0] == "--floor-quantile" for a in train_call) and (len(args) == 1 or "0.5" in train_call)
+    assert not any(a.split("=")[0] == "--floor-quantile" for a in test_call) and "0.5" not in test_call
+    assert test_call[-2:] == ["--floor", "0.25"] and "--groups" in test_call
+
+
+@pytest.mark.parametrize("args", [
+    ["--floor-quantile", "0.2", "--floor", "0.5"], ["--floor-quantile=0.2", "--floor=0.5"], ["--floor-quantile", "0.2", "--floor-json", "s.json"],
+    ["--floor-quantile", "0.2", "--floor-j=s.json"], ["--floor-q", "0.2"], ["--floor-qu=0.2"], ["--floor-quantil", "0.2"], ["--floor-", "x"]])
+def test_floor_quantile_conflicts_and_abbreviations_stop_before_anything_starts(stages, tmp_path, args, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    g.update(WORK=str(tmp_path / "w"), ROUND=None, SCREEN_ARGS=args)
+    with pytest.raises(SystemExit) as stopped:
+        g["stage"]()
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and "STOP:" in err and " start " not in err and not (tmp_path / "w").exists()
+
+
+@pytest.mark.parametrize("args", QUANTILE_FORMS + [["--floor-q", "0.5"], ["--floor-", "x"]])
+def test_floor_quantile_is_refused_from_round_two_before_export(stages, tmp_path, args, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    g.update(WORK=str(tmp_path / "w"), ROUND=2, SCREEN_ARGS=args)
+    with pytest.raises(SystemExit) as stopped:
+        g["stage"]()
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and "STOP:" in err and " start " not in err and not (tmp_path / "w").exists()
+    if args[0] == "--floor-quantile" or args[0].startswith("--floor-quantile="):
+        assert "round-1 floor" in err
+
+
+def test_floor_quantile_alone_is_accepted_in_round_one(stages):
+    g = stage_globals(stages, "psdl1_assets.py")
+    for rnd in (None, 1):
+        g.update(ROUND=rnd, SCREEN_ARGS=["--floor-quantile", "0.2"])
+        g["_check_screen_args"]()
