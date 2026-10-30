@@ -21,15 +21,18 @@ import sys
 import numpy as np
 
 from .data import _iter_manifest_products
-from .import_png import (BUNDLE_SCHEMA_VERSION, _read_json, _seal_bundle, _write_json,
-                         bundle_path, file_sha256, verify_bundle)
+from .import_png import (BUNDLE_SCHEMA_VERSION, SCREENING_LAYERS_DIR, SCREENING_LAYERS_FILE,
+                         SCREENING_LAYERS_SCHEMA_VERSION, _read_json, _seal_bundle, _verify_screening_layers,
+                         _write_json, bundle_path, file_sha256, verify_bundle)
 from .schema import SCHEMA_VERSION
 
 MERGE_SCHEMA_VERSION = "dl1_merge_bundle_v1"
 VERIFICATION_MEANING = "bundle_hash_integrity_not_electrical_verification"
 _ASSET_ROUND = re.compile(r"assets/r([0-9]{2,})/[^/]+")
+_LAYER_ROUND = re.compile(re.escape(SCREENING_LAYERS_DIR) + r"/r([0-9]{2,})/[^/]+")
 _REPORT_FIELDS = {"merge_schema_version", "round", "candidate_grid", "cnt_mode", "schema_version", "base", "add",
                   "asset_method", "assets", "generated_manifest_sha256", "product_count"}
+_OPTIONAL_REPORT_FIELDS = {"screening_layers"}
 
 
 def _asset_paths(product):
@@ -150,8 +153,41 @@ def merge_bundles(base_dir, add_dir, out_dir, *, round_index, base_round=None):
                 return destination
             products.append(_remap_product(product, remap))
     assets.sort(key=lambda item: item["path"])
+    layer_products, layer_items = {}, []
+    for label, side in (("base", base), ("add", add)):
+        if SCREENING_LAYERS_FILE not in side["files"]:
+            continue
+        folder = None
+        if side["kind"] == "import":
+            folder = f"{SCREENING_LAYERS_DIR}/r{side['round'] if label == 'base' else round_index:02d}/"
+        doc = _read_json(side["root"] / SCREENING_LAYERS_FILE)
+        for product_id, entry in doc["products"].items():
+            if product_id in layer_products:
+                raise ValueError(f"duplicate screening layers product: {product_id}")
+            layers = []
+            for layer in entry["layers"]:
+                source = layer["mask"]
+                destination = source if folder is None else folder + source[len(SCREENING_LAYERS_DIR) + 1:]
+                tail = source[len(SCREENING_LAYERS_DIR) + 1:]
+                if (not source.startswith(SCREENING_LAYERS_DIR + "/") or
+                        (side["kind"] == "import" and "/" in tail) or
+                        (side["kind"] == "merge" and not _LAYER_ROUND.fullmatch(source)) or
+                        destination in {i["path"] for i in layer_items}):
+                    raise ValueError(f"unexpected screening layer path: {source}")
+                method = _place(bundle_path(side["root"], source), bundle_path(out, destination))
+                digest = file_sha256(bundle_path(out, destination))
+                if digest != side["files"].get(source):
+                    raise ValueError(f"merged screening layer hash differs from its source: {source}")
+                layer_items.append({"path": destination, "source_bundle": label, "source_path": source,
+                                    "sha256": digest, "asset_method": method})
+                layers.append({**layer, "mask": destination})
+            layer_products[product_id] = {**entry, "layers": layers}
+    layer_items.sort(key=lambda item: item["path"])
     manifest = {"schema_version": base["manifest"]["schema_version"],
                 "candidate_grid": base["manifest"]["candidate_grid"], "products": products}
+    if layer_products:
+        _write_json(out / SCREENING_LAYERS_FILE,
+                    {"schema_version": SCREENING_LAYERS_SCHEMA_VERSION, "products": layer_products})
     _write_json(out / "manifest.pending.json", manifest)
     manifest_sha = file_sha256(out / "manifest.pending.json")
     method = methods.pop() if len(methods) == 1 else "mixed"
@@ -164,6 +200,8 @@ def merge_bundles(base_dir, add_dir, out_dir, *, round_index, base_round=None):
               "asset_method": method, "assets": assets, "generated_manifest_sha256": manifest_sha,
               "product_count": len(products)}
     report["add"].pop("round")
+    if layer_items:
+        report["screening_layers"] = layer_items
     try:
         _write_json(out / "merge-report.json", report)
         (out / "manifest.pending.json").rename(out / "manifest.json")
@@ -199,9 +237,47 @@ def merge_inputs_match(out_dir, base_dir, add_dir, round_index, base_round=None)
                 current = file_sha256(folder / name)
                 if report[label][key] != current:
                     return f"{label} {key} differs from the current {folder / name}"
+        # The input integrity hash already covers sidecar content; this also pins its presence.
+        expected = any((Path(folder) / SCREENING_LAYERS_FILE).is_file() for folder in (base_dir, add_dir))
+        if (Path(out_dir) / SCREENING_LAYERS_FILE).is_file() != expected or ("screening_layers" in report) != expected:
+            return "screening layers sidecar presence differs from the inputs"
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return f"merge-report cannot be compared: {exc}"
     return None
+
+
+def _verify_merged_screening_layers(root, files, manifest, report):
+    """Sidecar checks of an import bundle, plus: paths under screening_layers/rNN/ and equal to the report list."""
+    _verify_screening_layers(root, files, manifest)
+    listed = report.get("screening_layers")
+    if SCREENING_LAYERS_FILE not in files:
+        if listed is not None:
+            raise ValueError("merge report lists screening layers but the sidecar is missing")
+        return
+    if not isinstance(listed, list) or not listed:
+        raise ValueError("merge report does not list the screening layers")
+    entries, methods = {}, set()
+    for item in listed:
+        source = item.get("source_path") if isinstance(item, dict) else None
+        if (not isinstance(item, dict) or set(item) != {"path", "source_bundle", "source_path", "sha256", "asset_method"} or
+                item["source_bundle"] not in {"base", "add"} or item["asset_method"] not in {"hardlink", "copy"} or
+                not isinstance(source, str) or not source or "\\" in source or source.startswith("/") or
+                any(part in {"", ".", ".."} for part in source.split("/"))):
+            raise ValueError("invalid merge report screening layer entry")
+        if item["path"] in entries:
+            raise ValueError("duplicate reported screening layer")
+        entries[item["path"]] = item["sha256"]
+    doc = _read_json(bundle_path(root, SCREENING_LAYERS_FILE))
+    used = set()
+    for entry in doc["products"].values():
+        for layer in entry["layers"]:
+            path = layer["mask"]
+            match = _LAYER_ROUND.fullmatch(path)
+            if not match or int(match.group(1)) > report["round"]:
+                raise ValueError(f"merged screening layer is not under {SCREENING_LAYERS_DIR}/rNN/: {path}")
+            used.add(path)
+    if used != set(entries) or any(files[p] != entries[p] for p in used):
+        raise ValueError("merge report screening layers differ from the sidecar")
 
 
 def _verify_merged_bundle(bundle):
@@ -230,7 +306,8 @@ def _verify_merged_bundle(bundle):
     if actual != set(files) | set(directories) | {"bundle-integrity.json"}:
         raise ValueError("unlisted or missing bundle files")
     report = _read_json(bundle_path(root, "merge-report.json"))
-    if not isinstance(report, dict) or set(report) != _REPORT_FIELDS or report["merge_schema_version"] != MERGE_SCHEMA_VERSION:
+    if (not isinstance(report, dict) or not _REPORT_FIELDS <= set(report) <= _REPORT_FIELDS | _OPTIONAL_REPORT_FIELDS or
+            report["merge_schema_version"] != MERGE_SCHEMA_VERSION):
         raise ValueError("invalid merge report fields")
     if type(report["round"]) is not int or report["round"] < 1 or report["generated_manifest_sha256"] != files["manifest.json"]:
         raise ValueError("manifest/report hash link mismatch")
@@ -270,6 +347,7 @@ def _verify_merged_bundle(bundle):
             del mask
     if set(listed) != required or {p for p in files if p.startswith("assets/")} != required:
         raise ValueError("unreferenced or missing merged assets")
+    _verify_merged_screening_layers(root, files, manifest, report)
     ids = [p["product_id"] for p in manifest["products"]]
     if ids != report["base"]["product_ids"] + report["add"]["product_ids"] or report["product_count"] != len(ids):
         raise ValueError("merge report product list differs from the manifest")
