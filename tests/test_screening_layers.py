@@ -207,9 +207,27 @@ def _drop_layer_entry(copy):
     _write_sidecar(copy, doc)
 
 
+def _empty_products(copy):
+    doc = _sidecar(copy)
+    for layer in doc["products"]["M"]["layers"]:
+        (copy / layer["mask"]).unlink()
+    doc["products"] = {}
+    _write_sidecar(copy, doc)
+
+
+def _nested_path(copy):
+    doc = _sidecar(copy)
+    layer = _first_layer(doc)
+    nested = layer["mask"].replace("screening_layers/", "screening_layers/sub/")
+    (copy / "screening_layers" / "sub").mkdir()
+    (copy / layer["mask"]).rename(copy / nested)  # the file moves with its sidecar path
+    layer["mask"] = nested
+    _write_sidecar(copy, doc)
+
+
 @pytest.mark.parametrize("mutation", [
     _flip_npy, _wrong_dtype, _wrong_shape, _bad_hash, _extra_file, _unknown_product, _wrong_frame, _escape,
-    _absolute, _case_duplicate, _bad_version, _drop_sidecar_json, _drop_layer_entry])
+    _absolute, _case_duplicate, _bad_version, _drop_sidecar_json, _drop_layer_entry, _empty_products, _nested_path])
 def test_verify_rejects_tampered_sidecar_even_when_resealed(tmp_path, mutation):
     out = _export(tmp_path, "a")
     assert importer.verify_bundle(out)["status"] == "verified"

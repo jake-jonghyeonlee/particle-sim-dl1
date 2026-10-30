@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import sys
 import tempfile
 
@@ -507,8 +508,13 @@ def _write_screening_layers(stage, root, model, policy):
     return {"frame_id": model.frame.frame_id, "layers": layers}
 
 
-def _verify_screening_layers(root, files, manifest):
-    """Sidecar links: schema, containment, product/frame, case-unique names, bool/shape, geometry hash."""
+def _verify_screening_layers(root, files, manifest, layout="import"):
+    """Sidecar links: schema, containment, product/frame, case-unique names, bool/shape, geometry hash.
+
+    layout "import": masks sit flat in screening_layers/<file>.npy. "merged": screening_layers/rNN/<file>.npy.
+    """
+    if layout not in {"import", "merged"}:
+        raise ValueError("unknown screening layers layout")
     frames = {p["product_id"]: p["frame"] for p in manifest["products"]}
     referenced = set()
     if SCREENING_LAYERS_FILE in files:
@@ -517,6 +523,8 @@ def _verify_screening_layers(root, files, manifest):
             raise ValueError("invalid screening layers fields")
         if doc["schema_version"] != SCREENING_LAYERS_SCHEMA_VERSION or not isinstance(doc["products"], dict):
             raise ValueError("unsupported screening layers schema")
+        if not doc["products"]:
+            raise ValueError("screening layers sidecar has no products")
         for product_id, entry in doc["products"].items():
             if product_id not in frames:
                 raise ValueError("screening layers product is not in manifest")
@@ -542,6 +550,11 @@ def _verify_screening_layers(root, files, manifest):
                 if (not isinstance(mask_path, str) or not mask_path.startswith(SCREENING_LAYERS_DIR + "/") or
                         mask_path in referenced or files.get(mask_path) is None):
                     raise ValueError("invalid or duplicate screening layer mask path")
+                tail = mask_path[len(SCREENING_LAYERS_DIR) + 1:]
+                if layout == "import" and ("/" in tail or not tail.endswith(".npy")):
+                    raise ValueError("invalid or duplicate screening layer mask path")
+                if layout == "merged" and not re.fullmatch(r"r[0-9]{2,}/[^/]+\.npy", tail):
+                    raise ValueError(f"merged screening layer is not under {SCREENING_LAYERS_DIR}/rNN/: {mask_path}")
                 referenced.add(mask_path)
                 mask = np.load(bundle_path(root, mask_path), mmap_mode="r", allow_pickle=False)
                 if mask.dtype != np.bool_ or tuple(mask.shape) != tuple(frame["shape_yx"]):

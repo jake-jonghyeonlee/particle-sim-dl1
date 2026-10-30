@@ -197,9 +197,45 @@ def _report_dropped(copy):
     (copy / "merge-report.json").write_text(json.dumps(doc))
 
 
+def _other_dir(copy):
+    doc = _sidecar(copy)
+    layer = doc["products"]["L1"]["layers"][0]
+    moved = layer["mask"].replace("screening_layers/r01/", "screening_layers/q01/")
+    (copy / "screening_layers" / "q01").mkdir()
+    (copy / layer["mask"]).rename(copy / moved)
+    layer["mask"] = moved
+    (copy / "screening-layers.json").write_text(json.dumps(doc, sort_keys=True, indent=2) + "\n")
+
+
+def _rewrite_report_field(key, value):
+    def mutate(copy):
+        doc = _report(copy)
+        doc["screening_layers"][0][key] = value
+        (copy / "merge-report.json").write_text(json.dumps(doc))
+    mutate.__name__ = f"report_{key}_{type(value).__name__}"
+    return mutate
+
+
+def _empty_sidecar(copy):
+    doc = _sidecar(copy)
+    for entry in doc["products"].values():
+        for layer in entry["layers"]:
+            (copy / layer["mask"]).unlink()
+    doc["products"] = {}
+    (copy / "screening-layers.json").write_text(json.dumps(doc, sort_keys=True, indent=2) + "\n")
+
+
 @pytest.mark.parametrize("mutate, match", [
     (_flip_npy, "mask hash mismatch"),
     (_json_path, "not under screening_layers/rNN"),
+    (_other_dir, "not under screening_layers/rNN"),
+    (_empty_sidecar, "has no products"),
+    (_rewrite_report_field("path", ["x"]), "invalid merge report screening layer entry"),
+    (_rewrite_report_field("path", 7), "invalid merge report screening layer entry"),
+    (_rewrite_report_field("sha256", 7), "invalid merge report screening layer entry"),
+    (_rewrite_report_field("source_bundle", ["base"]), "invalid merge report screening layer entry"),
+    (_rewrite_report_field("asset_method", {}), "invalid merge report screening layer entry"),
+    (_rewrite_report_field("source_path", ["a"]), "invalid merge report screening layer entry"),
     (_extra_file, "unreferenced or missing screening layer"),
     (_report_list, "merge report screening layers differ"),
     (_report_dropped, "does not list the screening layers"),
@@ -228,3 +264,13 @@ def test_merge_inputs_match_notices_sidecar_differences(bundles, tmp_path):
     shutil.copytree(out, stripped)
     (stripped / "screening-layers.json").unlink()
     assert "sidecar" in mb.merge_inputs_match(stripped, bundles["lay1"], bundles["lay2"], 2, base_round=1)
+
+
+def test_screen_relations_loader_reads_a_merged_bundle_sidecar(bundles, tmp_path):
+    from psdl1.screen_relations import load_screening_layers
+    third = _merge(tmp_path, _merge(tmp_path, bundles["lay1"], bundles["lay2"], "r02"), bundles["lay3"], "r03",
+                   round_index=3, base_round=None)
+    assert mb.verify_merged_bundle(third)["status"] == "verified"
+    loaded = load_screening_layers(third / "manifest.json", {"L1", "L3"}, 1)
+    assert sorted(loaded) == ["L1", "L3"] and sorted(loaded["L1"]) == ["alpha", "beta"]
+    assert loaded["L3"]["alpha"].dtype == np.bool_ and loaded["L3"]["alpha"].any()

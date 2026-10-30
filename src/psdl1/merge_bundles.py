@@ -248,7 +248,7 @@ def merge_inputs_match(out_dir, base_dir, add_dir, round_index, base_round=None)
 
 def _verify_merged_screening_layers(root, files, manifest, report):
     """Sidecar checks of an import bundle, plus: paths under screening_layers/rNN/ and equal to the report list."""
-    _verify_screening_layers(root, files, manifest)
+    _verify_screening_layers(root, files, manifest, layout="merged")
     listed = report.get("screening_layers")
     if SCREENING_LAYERS_FILE not in files:
         if listed is not None:
@@ -260,8 +260,9 @@ def _verify_merged_screening_layers(root, files, manifest, report):
     for item in listed:
         source = item.get("source_path") if isinstance(item, dict) else None
         if (not isinstance(item, dict) or set(item) != {"path", "source_bundle", "source_path", "sha256", "asset_method"} or
+                not all(isinstance(item[key], str) for key in item) or
                 item["source_bundle"] not in {"base", "add"} or item["asset_method"] not in {"hardlink", "copy"} or
-                not isinstance(source, str) or not source or "\\" in source or source.startswith("/") or
+                not source or "\\" in source or source.startswith("/") or
                 any(part in {"", ".", ".."} for part in source.split("/"))):
             raise ValueError("invalid merge report screening layer entry")
         if item["path"] in entries:
