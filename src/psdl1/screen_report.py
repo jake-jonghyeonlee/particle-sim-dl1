@@ -47,7 +47,11 @@ svg.dist .pt-same{fill:var(--same);fill-opacity:.7}svg.dist .pt-other{fill:var(-
 REASON_TEXT = {"close_to_same_lineage": "다른 계열인데 같은 계열 쌍만큼 비슷함: 같은 회로일 수 있음", "near_boundary": "경계 부근: 판단 필요",
                "weakest_same_lineage": "같은 계열 쌍 중 유사도가 가장 낮은 쌍: 정말 비슷한지 확인", "different_near_boundary": "자동으로 different가 됐지만 기준에 가까움: 정말 다른지 확인",
                "ambiguous_alignment": "정렬 후보가 여러 개(반복 패턴 등): 유사도를 덜 믿을 것", "alignment_unreliable": "기준 마스크가 잘 맞지 않음: 유사도를 덜 믿을 것",
-               "low_overlap": "두 프레임이 겹치는 영역이 작음: 유사도를 덜 믿을 것", "no_anchor": "정렬 기준이 없어 프레임 중심으로 맞춤"}
+               "low_overlap": "두 프레임이 겹치는 영역이 작음: 유사도를 덜 믿을 것", "no_anchor": "정렬 기준이 없어 프레임 중심으로 맞춤",
+               "pattern_same_usage_differs": "패턴(P)은 같은데 사용(U)이 다름: 사용이 다른 같은 회로인지 확인",
+               "size_differs_out_of_support": "크기가 다르고 P 를 믿을 범위 밖이라 different 로 못 정함: 직접 확인",
+               "pattern_same_usage_unknown": "패턴(P)은 같은데 사용(U) 값이 없음: 사용이 같은지 직접 확인",
+               "no_pattern_value": "패턴(P) 값이 없어 판정하지 못함: 직접 확인"}
 TIER_TEXT = {"similar": "similar", "different": "different", "unknown": "모름"}
 
 
@@ -62,6 +66,23 @@ def num(value, digits=3):
 def floor_text(value):
     """similarity floor 표시. three-axis 에서 같은 계열이 없으면 floor 가 None 이다."""
     return "—" if value is None else f"{value:.3f}"
+
+
+def is_three_axis(result):
+    return "judge" in result["summary"]
+
+
+def axis_text(value, floor):
+    """three-axis 카드 ② 줄의 한 축: 값 (기준 값). 없으면 —."""
+    return f"{'—' if value is None else f'{value:.2f}'} (기준 {'—' if floor is None else f'{floor:.2f}'})"
+
+
+def judge_second_line(p):
+    """three-axis ② 줄: P 0.83 (기준 0.80) · U 0.90 (기준 0.85) · S 1.00/0.95 크기 다름 · 경우 2 → different."""
+    ratio = "—" if p["size_ratio_y"] is None or p["size_ratio_x"] is None else f'{p["size_ratio_y"]:.2f}/{p["size_ratio_x"]:.2f}'
+    size = "크기 다름" if p["size_tag"] == "size_differs" else "크기 같음"
+    case = "—" if p["judge_case"] is None else p["judge_case"]
+    return (f'P {axis_text(p["axis_p"], p["judge_p_floor"])} · U {axis_text(p["axis_u"], p["judge_u_floor"])} · S {ratio} {size} · 경우 {case} → {TIER_TEXT[p["tier"]]}')
 
 
 def data_uri(image):
@@ -296,6 +317,8 @@ def key_lines(p, primary, diff_names):
     verdict = (f'현재 {TIER_TEXT[p["tier"]]} · 기준 {floor_text(p["floor"])}' if name == "similarity"
                else f'현재 판정(similarity 기준) {TIER_TEXT[p["tier"]]} · similarity floor {floor_text(p["floor"])}')
     second = f'{esc(name)} = {num(p[name])} (같은 계열 {num(low)}–{num(high)}, 다른 계열 중앙값 {num(primary["other_median"])}) · {verdict}'
+    if "judge_case" in p:  # three-axis
+        second = esc(judge_second_line(p))
     third = ", ".join(esc(n) for n in diff_names) or "비교할 층 없음"
     return (f'<ol class="key"><li{warn}><b>정렬 신뢰</b> {first}</li><li><b>주 지표</b> {second}</li><li><b>차이 큰 층</b> {third}</li></ol>')
 
@@ -326,12 +349,14 @@ def distribution_svg(result):
     pairs, summary = result["pairs"], result["summary"]
     auc = summary["separation_auc_same_vs_other_lineage"]
     left, width, lane, gap = 170, 520, 26, 10
-    height = len(DIST_METRICS) * (2 * lane + gap) + 30
+    judge = summary.get("judge")
+    metrics = DIST_METRICS + (("axis_p", "axis_u") if judge is not None else ())
+    height = len(metrics) * (2 * lane + gap) + 30
     out = [f'<svg class="dist" viewBox="0 0 {left + width + 130} {height}" width="{left + width + 130}" role="img" aria-label="지표별 같은 계열 대 다른 계열 분포">']
     for i in range(0, 11):
         x = left + width * i / 10
         out.append(f'<line class="grid" x1="{x:.1f}" y1="14" x2="{x:.1f}" y2="{height - 14}"/><text class="muted" x="{x:.1f}" y="10" text-anchor="middle">{i / 10:.1f}</text>')
-    for row, name in enumerate(DIST_METRICS):
+    for row, name in enumerate(metrics):
         top = 20 + row * (2 * lane + gap)
         groups = [[p[name] for p in pairs if p["same_lineage"] and p[name] is not None], [p[name] for p in pairs if not p["same_lineage"] and p[name] is not None]]
         n = len(groups[0]) + len(groups[1])
@@ -351,6 +376,12 @@ def distribution_svg(result):
                 for k, v in enumerate(values):
                     jitter = ((k * 0.6180339887) % 1.0) * (lane - 8)
                     out.append(f'<circle class="{css}" cx="{left + width * min(max(v, 0.0), 1.0):.1f}" cy="{base + 4 + jitter:.1f}" r="2.2"/>')
+        if name in ("axis_p", "axis_u"):
+            floor = judge["p" if name == "axis_p" else "u"]
+            lines = [("floor", f'floor(global) {floor["global"]:.3f}', floor["global"])] + [("floor-group", f'floor {esc(g)} {v:.3f}', v) for g, v in sorted(floor["per_group"].items())]
+            for css, title, value in lines:
+                x = left + width * value
+                out.append(f'<line class="{css}" x1="{x:.1f}" y1="{top - 4}" x2="{x:.1f}" y2="{top + 2 * lane}"><title>{title}</title></line>')
         if name == "similarity" and summary["floor"]["global"] is not None:
             floor = summary["floor"]
             out.append(f'<line class="floor" x1="{left + width * floor["global"]:.1f}" y1="{top - 4}" x2="{left + width * floor["global"]:.1f}" y2="{top + 2 * lane}"><title>floor(global) {floor["global"]:.3f}</title></line>')
@@ -370,8 +401,13 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
     chosen = sorted((p for p in pairs if p["review"]), key=lambda p: (0.0 if p["floor"] is None else abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
     summary = result["summary"]
     counts = "".join(f'<li>{esc(r)}: {n}쌍 — {esc(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
+    three = is_three_axis(result)
+    axis_cells = lambda p: (f'<td class="n">{num(p["axis_p"], 2)}</td><td class="n">{num(p["axis_u"], 2)}</td><td class="n">{"—" if p["judge_case"] is None else p["judge_case"]}</td>' if three else "")
     table = "".join(f'<tr><td>{i}</td><td>{esc(p["product_a"])} ↔ {esc(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
-                    f'<td class="n">{floor_text(p["floor"])}</td><td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
+                    f'<td class="n">{floor_text(p["floor"])}</td>{axis_cells(p)}<td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
+    axis_head = "<th>P</th><th>U</th><th>경우</th>" if three else ""
+    judge_note = (f'<p class="sub">판정 모드: three-axis — 패턴(P)·사용(U)·크기 세 축으로 판정합니다. 다른 계보 쌍의 초기 tier 는 P 로 정하고 그 뒤 그룹 cap 을 적용한다. '
+                  f'G-size: 크기가 다른 쌍은 LAYER 정렬에서 단위 크기 차 |ΔU| 가 {sr.JUDGE_SIZE_SUPPORT_PX}px 이하일 때만 P 를 믿고, 그 밖이면 different 대신 unknown 으로 둔다.</p>' if three else "")
     primary = primary_context(result)
     summary["review"]["primary_metric"] = {key: primary[key] for key in ("name", "auc", "n", "reason", "n_same", "n_other")}  # 새 키만 추가한다
     cards = "".join(card_html(p, result["signatures"], top_layers, primary) for p in chosen[:top_pairs])
@@ -379,13 +415,13 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
             f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
             f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하고, 틀린 자동 줄은 지우세요.</p>'
-            f'{primary_line(primary)}'
+            f'{primary_line(primary)}{judge_note}'
             f'<p class="sub">용어: L1 Dice(첫 층) = 첫 층만의 Dice(정렬 신뢰 판정 기준), 결정 층 Dice = 정렬을 정한 층의 Dice, 2순위 Dice 는 결정 층 기준입니다.</p>'
             f'<h2>지표별 분포: 같은 계열(초록) vs 다른 계열(회색)</h2><p class="sub">AUC 1에 가까울수록 두 집단이 잘 갈립니다. 빨간 선은 similarity 의 floor 입니다(실선=global, 점선=그룹). 빈칸 값은 그리지 않고 n 에서 뺍니다.</p>'
             f'{distribution_svg(result)}'
             f'<ul class="sub">{counts or "<li>검토 대상이 없습니다.</li>"}</ul>'
             f'<div class="legend"><span><i style="background:var(--a)"></i>A만</span><span><i style="background:var(--b)"></i>B만</span><span><i style="background:var(--both)"></i>둘 다</span>'
             f'<span>기준(같은 계열 최저 유사도) {floor_text(summary["floor"]["global"])}</span></div>'
-            f'<h2>검토 대상 전체</h2><table><tr><th>#</th><th>쌍</th><th>현재 판정</th><th>유사도</th><th>기준</th><th>이유</th><th>이미지</th></tr>{table}</table>'
+            f'<h2>검토 대상 전체</h2><table><tr><th>#</th><th>쌍</th><th>현재 판정</th><th>유사도</th><th>기준</th>{axis_head}<th>이유</th><th>이미지</th></tr>{table}</table>'
             + (f'<p class="sub">카드는 {top_pairs}쌍까지만 그렸습니다. 나머지 {omitted}쌍은 위 표와 scores.csv로 보세요(--review-pairs로 늘릴 수 있음).</p>' if omitted else "")
             + f'<h2>카드</h2>{cards or "<p>검토할 쌍이 없습니다.</p>"}</body></html>')

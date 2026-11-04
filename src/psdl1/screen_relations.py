@@ -45,6 +45,8 @@ SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "li
 # three-axis 판정에서만 scores.csv 끝에 붙는 열(legacy 는 SCORE_FIELDS 그대로)
 JUDGE_SCORE_FIELDS = ("axis_p", "axis_p_layer", "axis_u", "size_ratio_y", "size_ratio_x", "size_delta_unit_px_y", "size_delta_unit_px_x", "size_tag",
                       "judge_case", "judge_p_floor", "judge_u_floor")
+JUDGE_REVIEW_REASONS = frozenset({"close_to_same_lineage", "near_boundary", "pattern_same_usage_differs", "size_differs_out_of_support",
+                                  "pattern_same_usage_unknown", "no_pattern_value"})  # three-axis 에서 unknown 쌍이 검토 목록에 들어가는 reason
 JUDGE_MODES = ("legacy", "three-axis")
 JUDGE_SCHEMA = "dl1_judge_v1"
 JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
@@ -786,7 +788,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         p["flag"] = "weakest_same_lineage"
     for p in pairs:  # 사람이 봐야 하는 쌍과 그 이유를 모두 모은다
         p["review"] = []
-        if p["tier"] == "unknown" and p["reason"] in {"close_to_same_lineage", "near_boundary"}:
+        if p["tier"] == "unknown" and p["reason"] in ({"close_to_same_lineage", "near_boundary"} if judge == "legacy" else JUDGE_REVIEW_REASONS):
             p["review"].append(p["reason"])
         if p.get("flag") == "weakest_same_lineage":
             p["review"].append("weakest_same_lineage")
