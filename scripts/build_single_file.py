@@ -504,6 +504,33 @@ def _has_floor_json(args):
     return False
 
 
+def _arg_value(args, flag):
+    """SCREEN_ARGS 의 정확한 이름 `flag` 의 마지막 값(공백형·= 형). 없으면 None."""
+    value = None
+    for i, arg in enumerate(args):
+        text = str(arg)
+        if text.split("=", 1)[0] == flag:
+            if "=" in text:
+                value = text.split("=", 1)[1]
+            elif i + 1 < len(args):
+                value = str(args[i + 1])
+    return value
+
+
+def _floor_json_arg(args):
+    """SCREEN_ARGS 의 --floor-json 값(약어 포함, 마지막 값). 없으면 None."""
+    value = None
+    for i, arg in enumerate(args):
+        text = str(arg)
+        name = text.split("=", 1)[0]
+        if name.startswith("--floor-") and "--floor-json".startswith(name):
+            if "=" in text:
+                value = text.split("=", 1)[1]
+            elif i + 1 < len(args):
+                value = str(args[i + 1])
+    return value
+
+
 def _summary_judge_mode(summary):
     """요약 dict 의 판정 모드: judge 블록이 없으면 legacy, three-axis 블록이면 그 mode, 그 밖은 None."""
     judge = summary.get("judge")
@@ -525,6 +552,7 @@ def _judge_expectation(summary, mode):
                 raise ValueError(f"judge.{axis}.global is not a finite number")
             expect[axis] = float(value)
         expect["margin"] = judge.get("margin")
+        expect["quantile"] = judge.get("quantile")
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         _stop(f"the round-1 train summary has no usable three-axis judge block ({type(exc).__name__}: {exc}); not using it as the fixed criteria")
     return expect
@@ -546,6 +574,8 @@ def _judge_problem(summary, expect):
             return f"has judge.{axis}.global = {got}, but this run fixes {want}"
     if expect.get("margin") is not None and judge.get("margin") != expect["margin"]:
         return f"has judge.margin = {judge.get('margin')}, but this run fixes {expect['margin']}"
+    if "quantile" in expect and judge.get("quantile") != expect["quantile"]:
+        return f"has judge.quantile = {judge.get('quantile')}, but this run fixes {expect['quantile']}"
     return None
 
 
@@ -554,19 +584,29 @@ def _check_relations_reuse(relations, expect, incremental):
     train = None
     for part in ("train", "test"):
         path = relations / part / "relations.csv.summary.json"
+        # three-axis 는 구획 폴더가 있는데 요약이 없거나 깨졌으면 모드를 검사할 수 없으므로 파일을 보존한 채 멈춘다. legacy 는 기존대로 건너뛴다.
+        strict = expect["mode"] == "three-axis" and path.parent.is_dir()
+        unusable = f"{path} is missing or unreadable, so its judge mode cannot be checked. The files are kept; restore it, or move {relations} away (and any later rounds built on it) to start over"
         if not path.is_file():
+            if strict:
+                _stop(unusable)
             continue
         try:
             summary = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            if strict:
+                _stop(unusable)
             continue
         if not isinstance(summary, dict):
+            if strict:
+                _stop(unusable)
             continue
         want = dict(expect)
         if part == "train":
             train = summary
         elif not incremental and expect["mode"] == "three-axis" and train is not None:
             want = _judge_expectation(train, "three-axis")
+            want.pop("quantile")  # test 구획은 quantile 을 받지 않는다(저장값 None)
         problem = _judge_problem(summary, want)
         if problem:
             _stop(f"{path} {problem}. The files are kept; restore SCREEN_ARGS, or move {relations} away (and any later rounds built on it) to switch modes")
@@ -782,12 +822,32 @@ def stage():
         judge_mode = base_mode
         judge_expect = _judge_expectation(base, judge_mode)
     else:
+        given = None
+        if judge_mode is None and _floor_json_arg(SCREEN_ARGS) is not None:
+            # 사용자 --floor-json 의 summary 모드를 기대 모드로 쓴다(screen_relations 도 같은 방식으로 모드를 잇는다). 읽을 수 없으면 screen_relations 가 거부한다.
+            try:
+                given = json.loads(Path(_floor_json_arg(SCREEN_ARGS)).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                given = None
+            if isinstance(given, dict) and _summary_judge_mode(given) == "three-axis":
+                judge_mode = "three-axis"
+            else:
+                given = None
         judge_mode = judge_mode or "legacy"
         judge_expect = {"mode": judge_mode}
-        if judge_mode == "three-axis":
+        if given is not None:
+            judge_expect = _judge_expectation(given, judge_mode)
+        elif judge_mode == "three-axis":
             for axis, value in (("p", judge_floor_p), ("u", judge_floor_u)):
                 if value is not None:
                     judge_expect[axis] = value
+            margin_text, quantile_text = _arg_value(SCREEN_ARGS, "--margin"), _arg_value(SCREEN_ARGS, "--floor-quantile")
+            try:  # 저장값과 비교할 margin·quantile. 숫자가 아니면 screen_relations 가 거부한다.
+                judge_expect["margin"] = 0.05 if margin_text is None else float(margin_text)
+                judge_expect["quantile"] = None if quantile_text is None else float(quantile_text)
+            except ValueError:
+                judge_expect.pop("margin", None)
+                judge_expect.pop("quantile", None)
     _boot()
     work.mkdir(parents=True, exist_ok=True)
     inputs, export, reports, relations = work / "inputs", work / "export", work / "reports", work / "relations"
@@ -871,6 +931,7 @@ def stage():
                 # test 구획은 train 의 p·u 기준(global)을 그대로 받는다. similarity floor 는 train 에 있을 때만 넘긴다. quantile 은 넘기지 않는다.
                 train_expect = _judge_expectation(train_summary, judge_mode)
                 floor = []
+                train_expect.pop("quantile")  # test 구획은 quantile 을 받지 않는다(저장값 None)
                 if not _has_floor_json(SCREEN_ARGS):
                     for flag, axis, given in (("--judge-floor-p", "p", judge_floor_p), ("--judge-floor-u", "u", judge_floor_u)):
                         if given is None:

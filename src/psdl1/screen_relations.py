@@ -230,7 +230,7 @@ def load_screening_layers(manifest, needed, factor, originals=None):
     if document["schema_version"] != SCREENING_LAYERS_SCHEMA_VERSION:
         raise bad("unsupported schema_version")
     if not document["products"]:
-        raise bad("no products")
+        raise bad(f"no products in {bundle_path(root, SCREENING_LAYERS_FILE)}")
     loaded, seen_paths = {}, set()
     for product_id, entry in document["products"].items():
         frame = frames.get(product_id)
@@ -582,15 +582,16 @@ def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin):
     p, u = axes["axis_p"], axes["axis_u"]
     if p is None:
         return "unknown", "no_pattern_value", None
-    if p < p_floor - margin:
+    exact = lambda value: Fraction(repr(float(value)))  # 십진 표기 그대로 비교한다: 0.52 - 0.05 = 0.47000000000000003 같은 float 오차가 경계를 옮기지 않는다
+    if exact(p) < exact(p_floor) - exact(margin):
         if differs and not size_supported(metrics_anchor, axes):
             return "unknown", "size_differs_out_of_support", 3
         return "different", "below_pattern_floor", 2
-    if p < p_floor:
+    if exact(p) < exact(p_floor):
         return "unknown", "near_boundary", None
     if u is None:
         return "unknown", "pattern_same_usage_unknown", None
-    if u < u_floor:
+    if exact(u) < exact(u_floor):
         return "unknown", "pattern_same_usage_differs", 1
     return "unknown", "close_to_same_lineage", 3 if differs else None
 
@@ -648,6 +649,7 @@ def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge):
     quantile = floor_quantile if spec_judge is None else spec_judge["quantile"]
     return {"schema": JUDGE_SCHEMA, "mode": "three-axis", "margin": margin, "quantile": quantile, "p": axes_floor["p"], "u": axes_floor["u"],
             "cases": {"case_1": sum(p["judge_case"] == 1 for p in pairs), "case_2": sum(p["judge_case"] == 2 for p in pairs),
+                      "case_2_capped": sum(p["reason"] == "cross_group_capped" for p in pairs),
                       "case_3": sum(p["judge_case"] == 3 for p in pairs),
                       "size_differs_out_of_support": sum(p["reason"] == "size_differs_out_of_support" for p in pairs)},
             "auc": {**{name: auc([p[name] for p in same if p[name] is not None], [p[name] for p in cross if p[name] is not None]) for name in names},
@@ -697,6 +699,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     if floor is not None and floor_spec is not None:
         raise ValueError("floor and floor_spec are exclusive")
     incremental = base_split is not None
+    if incremental and judge == "three-axis" and floor_spec is None:
+        raise ValueError("three-axis incremental screening needs --floor-json (round 1 criteria)")
     if incremental and floor is None and floor_spec is None:
         raise ValueError("incremental screening needs exactly one of floor and floor_spec")
     if type(factor) is not int or factor <= 0 or type(tolerance) is not int or tolerance < 0 or not 0 <= margin < 1 or not 0 <= cross_group_fraction <= 1:
@@ -774,6 +778,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     cross = sorted((p for p in pairs if p["tier"] == "different" and p["group_a"] != p["group_b"]), key=lambda p: (-strength(p), p["product_a"], p["product_b"]))
     for p in cross[allowed:]:
         p["tier"], p["reason"] = "unknown", "cross_group_capped"  # 쉬운 쌍이라 일부만 쓴다
+        if judge == "three-axis":
+            p["judge_case"] = None  # case 2 는 최종 different 만 센다. cap 으로 떨어진 쌍(모두 case 2 였다)은 judge.cases.case_2_capped 로 센다
     ranked = same if judge == "legacy" else [p for p in same if p["axis_p"] is not None]
     weakest = sorted(ranked, key=strength)[:max(1, math.ceil(0.2 * len(ranked)))] if ranked else []
     for p in weakest:
@@ -931,6 +937,8 @@ def main(argv=None):
         ap.error("--base-split and --base-relations go together")
     if a.base_split is not None and a.floor is None and a.floor_json is None:
         ap.error("incremental screening needs exactly one of --floor and --floor-json")
+    if a.base_split is not None and a.judge == "three-axis" and a.floor_json is None:
+        ap.error("three-axis incremental screening needs --floor-json (round 1 criteria)")
     split = json.loads(Path(a.split).read_text(encoding="utf-8"))
     extra = {} if a.base_split is None else {"base_split": json.loads(Path(a.base_split).read_text(encoding="utf-8")), "base_relations": a.base_relations}
     if a.floor_json is not None:

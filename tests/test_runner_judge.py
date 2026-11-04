@@ -274,6 +274,59 @@ def test_train_done_and_test_missing_checks_the_train_mode(stages, tmp_path, png
     assert read_summary(work, "test")["judge"]["p"]["global"] == read_summary(work, "train")["judge"]["p"]["global"]
 
 
+def test_missing_or_broken_part_summary_stops_for_three_axis_and_keeps_files(stages, tmp_path, png):
+    work = new_work(tmp_path)
+    assert run_assets(stages, tmp_path, png, work, THREE).returncode == 0
+    for part in ("train", "test"):
+        original = summary_path(work, part).read_bytes()
+        for broken in (None, b"{ not json", b"[1]"):
+            if broken is None:
+                summary_path(work, part).unlink()
+            else:
+                summary_path(work, part).write_bytes(broken)
+            before = tree_digest(work)
+            result = run_assets(stages, tmp_path, png, work, THREE)
+            assert result.returncode == 2 and "STOP:" in result.stderr and "missing or unreadable" in result.stderr, (part, broken)
+            assert tree_digest(work) == before
+        summary_path(work, part).write_bytes(original)
+    assert run_assets(stages, tmp_path, png, work, THREE).returncode == 0
+
+
+def test_legacy_rerun_without_part_summary_keeps_the_old_unchecked_skip(stages, tmp_path, png):
+    work = new_work(tmp_path)
+    assert run_assets(stages, tmp_path, png, work, LEGACY).returncode == 0
+    summary_path(work, "train").unlink()
+    result = run_assets(stages, tmp_path, png, work, LEGACY)
+    assert "skip relations" in result.stderr and "missing or unreadable" not in result.stderr
+
+
+@pytest.mark.parametrize("args,field", [([*THREE, "--margin", "0.1"], "judge.margin"), ([*THREE, "--floor-quantile", "0.5"], "judge.quantile")])
+def test_three_axis_rerun_with_changed_margin_or_quantile_stops(stages, tmp_path, png, args, field):
+    work = new_work(tmp_path)
+    assert run_assets(stages, tmp_path, png, work, THREE).returncode == 0
+    before = tree_digest(work)
+    result = run_assets(stages, tmp_path, png, work, args)
+    assert result.returncode == 2 and field in result.stderr
+    assert tree_digest(work) == before
+    assert run_assets(stages, tmp_path, png, work, THREE).returncode == 0
+
+
+def test_user_floor_json_of_a_three_axis_summary_sets_the_expected_mode(stages, tmp_path, png):
+    """adv:5: r01 의 SCREEN_ARGS 에 three-axis summary 의 --floor-json 만 있고 --judge 가 없으면 그 summary 의 모드를 기대 모드로 쓴다(재실행이 STOP 하지 않는다)."""
+    source = new_work(tmp_path, "source")
+    assert run_assets(stages, tmp_path, png, source, THREE, tag="a").returncode == 0
+    args = ["--floor-json", str(summary_path(source, "train"))]
+    work = new_work(tmp_path, "work")
+    first = run_assets(stages, tmp_path, png, work, args, tag="b")
+    assert first.returncode == 0, first.stderr[-3000:]
+    assert read_summary(work, "train")["judge"]["mode"] == "three-axis"
+    before = tree_digest(work)
+    again = run_assets(stages, tmp_path, png, work, args, tag="b")
+    assert again.returncode == 0 and "skip relations" in again.stderr and "STOP" not in again.stderr, again.stderr[-3000:]
+    assert tree_digest(work) == before
+    assert run_assets(stages, tmp_path, png, work, ["--judge", "legacy", *args], tag="b").returncode == 2  # 명시한 모드가 다르면 여전히 멈춘다
+
+
 def test_explicit_floor_that_differs_from_the_finished_train_summary_stops(stages, tmp_path, png):
     work = new_work(tmp_path)
     assert run_assets(stages, tmp_path, png, work, [*THREE, "--judge-floor-p", "0.5", "--judge-floor-u", "0.4"]).returncode == 0

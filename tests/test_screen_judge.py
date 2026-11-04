@@ -94,7 +94,7 @@ def test_floors_are_recorded_per_pair_and_in_the_judge_block(world):
     assert judge["schema"] == "dl1_judge_v1" and judge["mode"] == "three-axis" and judge["margin"] == MARGIN and judge["quantile"] is None
     assert judge["p"] == {"global": 0.5, "per_group": {"-": 0.5}, "source": "calibrated", "n_values": 7}
     assert judge["u"] == {"global": 0.5, "per_group": {"-": 0.5}, "source": "calibrated", "n_values": 7}
-    assert set(judge["cases"]) == {"case_1", "case_2", "case_3", "size_differs_out_of_support"} and set(judge["auc"]) == {"axis_p", "axis_u", "n_pairs_with_value"}
+    assert set(judge["cases"]) == {"case_1", "case_2", "case_2_capped", "case_3", "size_differs_out_of_support"} and set(judge["auc"]) == {"axis_p", "axis_u", "n_pairs_with_value"}
     assert result["summary"]["floor"]["global"] is not None  # similarity floor 도 계산되면 기록한다(L5)
 
 
@@ -266,6 +266,48 @@ def test_incremental_rejects_explicit_judge_floors_and_quantile(rounds):
         rounds(judge_floor_p=0.5)
     with pytest.raises(ValueError, match="exclusive with floor and floor_spec"):
         rounds(floor_quantile=0.5)
+
+
+def test_three_axis_incremental_without_floor_json_is_rejected(rounds, world, tmp_path):
+    with pytest.raises(ValueError, match=r"three-axis incremental screening needs --floor-json \(round 1 criteria\)"):
+        world(R2_AXES, names=NAMES, old=tuple(R1), built=world.build(NAMES), base_split=rounds.base_split, base_relations=rounds.base_relations,
+              judge="three-axis", floor=0.5)
+    manifest, _, split_path = world.build(NAMES)
+    base_split = tmp_path / "base_split.json"
+    base_split.write_text(json.dumps(rounds.base_split))
+    with pytest.raises(SystemExit) as stopped:
+        main([*cli_base(manifest, split_path), "--out", str(tmp_path / "inc.csv"), "--judge", "three-axis", "--floor", "0.5",
+              "--base-split", str(base_split), "--base-relations", str(rounds.base_relations)])
+    assert stopped.value.code == 2 and not (tmp_path / "inc.csv").exists()
+
+
+# ---- 경계 비교는 정확한 십진 비교다 (adv:1) ----------------------------------------------------------------------------
+@pytest.mark.parametrize("p, expected", [(0.47, "unknown"), (0.469999, "different"), (0.52, "unknown"), (0.5199999, "unknown")])
+def test_p_boundary_is_decimal_exact(p, expected):
+    # 0.52 - 0.05 = 0.47000000000000003 (float): float 비교면 P = 0.47 이 different 로 떨어진다
+    axes = {"axis_p": p, "axis_u": 0.9, "size_tag": "same", "size_delta_unit_px_y": 0, "size_delta_unit_px_x": 0}
+    tier, reason, _ = judge_verdict(axes, "CNT", False, 0.52, 0.5, 0.05)
+    assert tier == expected
+    assert reason == {"unknown": "near_boundary" if p < 0.52 else "close_to_same_lineage", "different": "below_pattern_floor"}[expected]
+
+
+@pytest.mark.parametrize("u, expected", [(0.1, "close_to_same_lineage"), (0.09999, "pattern_same_usage_differs")])
+def test_u_boundary_is_decimal_exact(u, expected):
+    axes = {"axis_p": 0.9, "axis_u": u, "size_tag": "same", "size_delta_unit_px_y": 0, "size_delta_unit_px_x": 0}
+    assert judge_verdict(axes, "CNT", False, 0.5, 0.1, 0.05)[1] == expected
+
+
+# ---- cap 으로 unknown 이 된 쌍은 case 2 가 아니다 (adv:3) ------------------------------------------------------------------
+def test_capped_pairs_lose_judge_case_and_are_counted_separately(world):
+    groups = {"A1": "g1", "A2": "g1", "A3": "g1", "A4": "g1", "B1": "g1", "B2": "g2"}
+    low = {"A1": 0.10, "A2": 0.20, "A3": 0.25, "A4": 0.30}
+    axes = {**SAME, **{(a, "B1"): {"axis_p": 0.1, "axis_u": 0.1} for a in low}, **{(a, "B2"): {"axis_p": v, "axis_u": 0.1} for a, v in low.items()}}
+    result = world(axes, groups=groups, margin=MARGIN)
+    pairs = by_pair(result)
+    assert [verdict(pairs[(a, "B2")]) for a in ("A1", "A2", "A3")] == [("unknown", "cross_group_capped", None)] * 3
+    assert verdict(pairs[("A4", "B2")]) == ("different", "below_pattern_floor", 2)
+    cases = result["summary"]["judge"]["cases"]
+    assert cases["case_2_capped"] == 3 and cases["case_2"] == sum(p["tier"] == "different" for p in result["pairs"]) == 5
 
 
 # ---- load_floor_spec ----------------------------------------------------------------------------------------------

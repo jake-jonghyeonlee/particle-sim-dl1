@@ -299,7 +299,9 @@ def test_round_folder_boundary_is_accepted(bundles, tmp_path, folder):
 def test_loader_refuses_an_empty_products_sidecar(bundles, tmp_path):
     from psdl1.screen_relations import load_screening_layers
     copy = _tampered(tmp_path, bundles, "loader-empty", _empty_sidecar)
-    with pytest.raises(ValueError, match=r"screening-layers\.json is corrupt: no products"):
+    with pytest.raises(ValueError, match=r"screening-layers\.json is corrupt: no products in .*screening-layers\.json"):
+        load_screening_layers(copy / "manifest.json", {"L1"}, 1)
+    with pytest.raises(ValueError, match=str(copy).replace("\\", "\\\\")):
         load_screening_layers(copy / "manifest.json", {"L1"}, 1)
 
 
