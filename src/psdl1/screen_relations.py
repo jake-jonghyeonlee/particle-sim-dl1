@@ -419,6 +419,22 @@ def pair_metric_columns(rows, anchor):
             "cnt_similarity": cnt[0]["boundary_f1"] if cnt else None}
 
 
+def pair_axes(rows, anchor, sa, sb):
+    """판정 세 축 입력값(PLAN v1.1 A1). 어떤 출력에도 쓰지 않는 순수 계산이다.
+    axis_p = binding 행 중 status=both 이고 boundary_f1 이 유한한 행의 평균, axis_p_layer = LAYER anchor 일 때 layer 행의 같은 평균(진단),
+    axis_u = usage_jaccard_electrodes 와 같은 값, size_* = 원본 frame shape 의 축별 비교(delta 는 (B−A)/2 원본 px, 홀수 차이는 x.5 float)."""
+    def mean(kind):
+        values = [r["boundary_f1"] for r in rows if r["kind"] == kind and r["status"] == "both" and r["boundary_f1"] is not None and np.isfinite(r["boundary_f1"])]
+        return round(float(np.mean(values)), 6) if values else None
+    ratio = [round(min(a, b) / max(a, b), 6) for a, b in zip(sa["full_shape"], sb["full_shape"])]
+    delta = [(b - a) / 2 for a, b in zip(sa["full_shape"], sb["full_shape"])]
+    delta = [int(d) if d == int(d) else d for d in delta]
+    return {"axis_p": mean("binding"), "axis_p_layer": mean("layer") if anchor == "LAYER" else None,
+            "axis_u": pair_metric_columns(rows, anchor)["usage_jaccard_electrodes"],
+            "size_ratio_y": ratio[0], "size_ratio_x": ratio[1], "size_delta_unit_px_y": delta[0], "size_delta_unit_px_x": delta[1],
+            "size_tag": "same" if ratio == [1.0, 1.0] else "size_differs"}
+
+
 def auc(higher, lower):
     """무작위로 뽑은 higher 쪽 값이 lower 쪽 값보다 클 확률(동점은 절반). 1에 가까울수록 두 집단이 잘 갈린다."""
     if not higher or not lower:
@@ -557,6 +573,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                                         presence_fraction=presence_fraction, use_layers=on_layer)
                 pairs[-1]["metric_rows"] = rows
                 pairs[-1].update(pair_metric_columns(rows, columns["metrics_anchor"]))
+                pairs[-1]["judge_axes"] = pair_axes(rows, columns["metrics_anchor"], signatures[a], signatures[b])
     if incremental:
         new_of = {part: sorted(set(split[part]) - old_of[part]) for part in partitions}
         expected = {part: len(new_of[part]) * (len(new_of[part]) - 1) // 2 + len(new_of[part]) * len(old_of[part]) for part in partitions}
