@@ -327,6 +327,36 @@ def test_user_floor_json_of_a_three_axis_summary_sets_the_expected_mode(stages, 
     assert run_assets(stages, tmp_path, png, work, ["--judge", "legacy", *args], tag="b").returncode == 2  # 명시한 모드가 다르면 여전히 멈춘다
 
 
+@pytest.mark.parametrize("source_args,field,value", [([*THREE, "--margin", "0.1"], "margin", 0.1), ([*THREE, "--floor-quantile", "0.5"], "quantile", 0.5)])
+def test_judge_three_axis_with_floor_json_expects_the_summary_margin_and_quantile(stages, tmp_path, png, source_args, field, value):
+    """blk:1: --judge three-axis 와 --floor-json 을 같이 줘도 기대값은 summary 의 margin·quantile 이다. 두 번째 실행은 STOP 없이 건너뛴다."""
+    source = new_work(tmp_path, "source")
+    assert run_assets(stages, tmp_path, png, source, source_args, tag="a").returncode == 0
+    assert read_summary(source, "train")["judge"][field] == value
+    args = [*THREE, "--floor-json", str(summary_path(source, "train"))]
+    work = new_work(tmp_path, "work")
+    first = run_assets(stages, tmp_path, png, work, args, tag="b")
+    assert first.returncode == 0, first.stderr[-3000:]
+    before = tree_digest(work)
+    again = run_assets(stages, tmp_path, png, work, args, tag="b")
+    assert again.returncode == 0 and "skip relations" in again.stderr and "STOP" not in again.stderr, again.stderr[-3000:]
+    assert tree_digest(work) == before
+    assert run_assets(stages, tmp_path, png, work, ["--judge", "legacy", *args[2:]], tag="b").returncode == 2  # legacy 를 명시하면 three-axis summary 와 맞지 않아 멈춘다
+
+
+@pytest.mark.parametrize("rnd", [None, 1, 2])
+@pytest.mark.parametrize("args", [["--mar", "0.1"], ["--marg=0.1"], ["--margi", "0.1"]])
+def test_margin_abbreviations_stop_before_anything_starts(stages, tmp_path, rnd, args, capsys):
+    g = stage_globals(stages, "psdl1_assets.py")
+    g.update(WORK=str(tmp_path / "w"), ROUND=rnd, SCREEN_ARGS=[*THREE, *args])
+    with pytest.raises(SystemExit) as stopped:
+        g["stage"]()
+    err = capsys.readouterr().err
+    assert stopped.value.code == 2 and "STOP:" in err and "--margin" in err and " start " not in err and not (tmp_path / "w").exists()
+    g.update(ROUND=None, SCREEN_ARGS=[*THREE, "--margin", "0.1"])
+    g["_check_screen_args"]()
+
+
 def test_explicit_floor_that_differs_from_the_finished_train_summary_stops(stages, tmp_path, png):
     work = new_work(tmp_path)
     assert run_assets(stages, tmp_path, png, work, [*THREE, "--judge-floor-p", "0.5", "--judge-floor-u", "0.4"]).returncode == 0

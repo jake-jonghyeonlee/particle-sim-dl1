@@ -151,6 +151,14 @@ def test_different_near_boundary_review_uses_p_and_the_p_floor(world):
     assert "different_near_boundary" not in pairs[("A2", "B1")]["review"]
 
 
+def test_different_near_boundary_review_is_decimal_exact(world):
+    # 0.5 - 0.05 - 0.15 은 float 로 0.30000000000000004 라 0.3 이 경계 밖으로 밀리지만, 십진으로는 정확히 경계 위다
+    axes = {**SAME, ("A1", "B1"): {"axis_p": 0.3, "axis_u": 0.1}, ("A2", "B1"): {"axis_p": 0.29, "axis_u": 0.1}}
+    pairs = by_pair(world(axes, margin=0.05))
+    assert verdict(pairs[("A1", "B1")])[0] == "different" and "different_near_boundary" in pairs[("A1", "B1")]["review"]
+    assert "different_near_boundary" not in pairs[("A2", "B1")]["review"]
+
+
 def test_no_same_lineage_pair_names_the_axis_that_needs_an_explicit_floor(world):
     with pytest.raises(ValueError, match=r"axis_p.*--judge-floor-p"):
         world({}, names=["A1", "B1"], judge="three-axis")

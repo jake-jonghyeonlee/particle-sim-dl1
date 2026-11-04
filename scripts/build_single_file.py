@@ -606,7 +606,7 @@ def _check_relations_reuse(relations, expect, incremental):
             train = summary
         elif not incremental and expect["mode"] == "three-axis" and train is not None:
             want = _judge_expectation(train, "three-axis")
-            want.pop("quantile")  # test 구획은 quantile 을 받지 않는다(저장값 None)
+            want.pop("quantile")  # test 구획은 --floor-quantile 인수를 받지 않는다(사용자 floor-json 이면 그 summary 의 quantile 이 저장될 수 있어 비교하지 않는다)
         problem = _judge_problem(summary, want)
         if problem:
             _stop(f"{path} {problem}. The files are kept; restore SCREEN_ARGS, or move {relations} away (and any later rounds built on it) to switch modes")
@@ -739,6 +739,10 @@ def _check_screen_args():
     """SCREEN_ARGS 의 예약 인자를 시작 전에 검사한다. ROUND 2 이상은 --floor 를 받지 않고(r01 floor 를 고정한다) 증분 인자도 예약한다."""
     reserved = ("--out", "--manifest", "--split", "--partitions", "--bindings-out")
     judge_mode, judge_floor_p, judge_floor_u = _judge_args(SCREEN_ARGS)  # --judge 계열을 먼저 식별한다(접두어 약어는 여기서 멈춘다)
+    for arg in SCREEN_ARGS:  # --margin 의 약어(--mar 등)는 값을 읽을 수 없어 기대값이 틀리므로 시작 전에 멈춘다
+        name = str(arg).split("=", 1)[0]
+        if name != "--margin" and len(name) >= 5 and "--margin".startswith(name):
+            _stop(f"SCREEN_ARGS has {name}: write the full name --margin")
     if ROUND is not None and ROUND >= 2:
         if judge_floor_p is not None or judge_floor_u is not None:
             _stop("SCREEN_ARGS must not contain --judge-floor-p or --judge-floor-u: ROUND >= 2 always uses the round-1 criteria "
@@ -823,8 +827,9 @@ def stage():
         judge_expect = _judge_expectation(base, judge_mode)
     else:
         given = None
-        if judge_mode is None and _floor_json_arg(SCREEN_ARGS) is not None:
+        if judge_mode in (None, "three-axis") and _floor_json_arg(SCREEN_ARGS) is not None:
             # 사용자 --floor-json 의 summary 모드를 기대 모드로 쓴다(screen_relations 도 같은 방식으로 모드를 잇는다). 읽을 수 없으면 screen_relations 가 거부한다.
+            # --judge three-axis 를 같이 줘도 summary 의 margin·quantile 이 기대값이다(screen 은 floor_spec 의 값을 그대로 저장한다).
             try:
                 given = json.loads(Path(_floor_json_arg(SCREEN_ARGS)).read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -931,7 +936,7 @@ def stage():
                 # test 구획은 train 의 p·u 기준(global)을 그대로 받는다. similarity floor 는 train 에 있을 때만 넘긴다. quantile 은 넘기지 않는다.
                 train_expect = _judge_expectation(train_summary, judge_mode)
                 floor = []
-                train_expect.pop("quantile")  # test 구획은 quantile 을 받지 않는다(저장값 None)
+                train_expect.pop("quantile")  # test 구획은 --floor-quantile 인수를 받지 않는다(사용자 floor-json 이면 그 summary 의 quantile 이 저장될 수 있어 비교하지 않는다)
                 if not _has_floor_json(SCREEN_ARGS):
                     for flag, axis, given in (("--judge-floor-p", "p", judge_floor_p), ("--judge-floor-u", "u", judge_floor_u)):
                         if given is None:

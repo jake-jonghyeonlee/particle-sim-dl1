@@ -792,8 +792,14 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
             p["review"].append(p["reason"])
         if p.get("flag") == "weakest_same_lineage":
             p["review"].append("weakest_same_lineage")
-        if p["tier"] == "different" and strength(p) >= p[strength_floor] - margin - review_band:
-            p["review"].append("different_near_boundary")
+        if p["tier"] == "different":
+            if judge == "legacy":
+                near = strength(p) >= p[strength_floor] - margin - review_band
+            else:  # three-axis 는 판정 경계와 같은 십진 정확 비교를 쓴다(표시용)
+                exact = lambda value: Fraction(repr(float(value)))
+                near = exact(strength(p)) >= exact(p[strength_floor]) - exact(margin) - exact(review_band)
+            if near:
+                p["review"].append("different_near_boundary")
         p["review"] += [f for f in p["alignment_flag"].split(";") if f in {"ambiguous_alignment", "alignment_unreliable", "low_overlap", "no_anchor"}]
     floor_info = {"global": global_floor, "groups": group_floor, "margin": margin}
     if floor_spec is not None:
