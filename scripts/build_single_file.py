@@ -457,12 +457,136 @@ def _user_floor_source(args):
     return False
 
 
-def _screen(manifest, split_path, part, out_dir, extra, drop_quantile=False):
-    """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다. drop_quantile 이면 --floor-quantile 을 빼고 넘긴다."""
+JUDGE_ARGS = ("--judge", "--judge-floor-p", "--judge-floor-u")
+JUDGE_MODES = ("legacy", "three-axis")
+
+
+def _judge_args(args):
+    """SCREEN_ARGS 의 --judge 계열을 식별한다: (mode 또는 None, floor_p 또는 None, floor_u 또는 None). 공백형·= 형을 모두 읽고 마지막 값을 쓴다.
+    정확한 이름이 아니고 이 셋 중 하나의 접두어인 토큰(--jud, --judge-floor, --judge-f 등)은 전체 이름을 쓰라며 멈춘다."""
+    mode = floor_p = floor_u = None
+    for i, arg in enumerate(args):
+        text = str(arg)
+        name = text.split("=", 1)[0]
+        if name in JUDGE_ARGS:
+            if "=" in text:
+                value = text.split("=", 1)[1]
+            elif i + 1 < len(args):
+                value = str(args[i + 1])
+            else:
+                _stop(f"SCREEN_ARGS has {name} without a value")
+            if name == "--judge":
+                if value not in JUDGE_MODES:
+                    _stop(f"SCREEN_ARGS has --judge {value}: choose from {', '.join(JUDGE_MODES)}")
+                mode = value
+                continue
+            try:
+                number = float(value)
+            except ValueError:
+                number = None
+            if number is None or not 0.0 <= number <= 1.0:
+                _stop(f"SCREEN_ARGS has {name} {value}: a number in [0, 1] is required")
+            if name == "--judge-floor-p":
+                floor_p = number
+            else:
+                floor_u = number
+        elif name.startswith("--") and len(name) > 2 and any(flag.startswith(name) for flag in JUDGE_ARGS):
+            _stop(f"SCREEN_ARGS has {name}: write the full name (--judge, --judge-floor-p or --judge-floor-u)")
+    return mode, floor_p, floor_u
+
+
+def _has_floor_json(args):
+    """SCREEN_ARGS 에 --floor-json(약어 포함)이 있는가."""
+    for arg in args:
+        name = str(arg).split("=", 1)[0]
+        if name.startswith("--floor-") and "--floor-json".startswith(name):
+            return True
+    return False
+
+
+def _summary_judge_mode(summary):
+    """요약 dict 의 판정 모드: judge 블록이 없으면 legacy, three-axis 블록이면 그 mode, 그 밖은 None."""
+    judge = summary.get("judge")
+    if judge is None:
+        return "legacy"
+    return judge.get("mode") if isinstance(judge, dict) else None
+
+
+def _judge_expectation(summary, mode):
+    """기준 요약(summary)에서 요청 모드와 고정 기준(three-axis 의 p·u global, margin)을 읽는다. 읽을 수 없으면 멈춘다."""
+    expect = {"mode": mode}
+    if mode != "three-axis":
+        return expect
+    judge = summary.get("judge")
+    try:
+        for axis in ("p", "u"):
+            value = judge[axis]["global"]
+            if type(value) not in (int, float) or value != value or value in (float("inf"), float("-inf")):
+                raise ValueError(f"judge.{axis}.global is not a finite number")
+            expect[axis] = float(value)
+        expect["margin"] = judge.get("margin")
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        _stop(f"the round-1 train summary has no usable three-axis judge block ({type(exc).__name__}: {exc}); not using it as the fixed criteria")
+    return expect
+
+
+def _judge_problem(summary, expect):
+    """기존 요약이 요청 모드·고정 기준과 맞으면 None, 아니면 이유를 돌려준다."""
+    mode = _summary_judge_mode(summary)
+    if mode != expect["mode"]:
+        return f"was made with the {mode or 'unknown'} judge, but this run asks for {expect['mode']}"
+    if mode != "three-axis":
+        return None
+    judge = summary["judge"]
+    for axis in ("p", "u"):
+        want = expect.get(axis)
+        block = judge.get(axis)
+        got = block.get("global") if isinstance(block, dict) else None
+        if want is not None and got != want:
+            return f"has judge.{axis}.global = {got}, but this run fixes {want}"
+    if expect.get("margin") is not None and judge.get("margin") != expect["margin"]:
+        return f"has judge.margin = {judge.get('margin')}, but this run fixes {expect['margin']}"
+    return None
+
+
+def _check_relations_reuse(relations, expect, incremental):
+    """합친 relations.csv 를 건너뛰기 전에, 있는 구획 요약이 요청 모드·고정 기준과 맞는지 본다. 다르면 파일을 보존한 채 멈춘다."""
+    train = None
+    for part in ("train", "test"):
+        path = relations / part / "relations.csv.summary.json"
+        if not path.is_file():
+            continue
+        try:
+            summary = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(summary, dict):
+            continue
+        want = dict(expect)
+        if part == "train":
+            train = summary
+        elif not incremental and expect["mode"] == "three-axis" and train is not None:
+            want = _judge_expectation(train, "three-axis")
+        problem = _judge_problem(summary, want)
+        if problem:
+            _stop(f"{path} {problem}. The files are kept; restore SCREEN_ARGS, or move {relations} away (and any later rounds built on it) to switch modes")
+
+
+def _screen(manifest, split_path, part, out_dir, extra, drop_quantile=False, expect=None):
+    """한 구획을 스크리닝한다. 세 산출물이 모두 있으면 건너뛰고, 일부만 있으면 멈춘다. 요약(summary) dict 를 돌려준다. drop_quantile 이면 --floor-quantile 을 빼고 넘긴다.
+    expect(모드·고정 기준)가 있으면 기존 결과를 건너뛰기 전에 비교하고, 다르면 파일을 보존한 채 멈춘다."""
     csv = out_dir / "relations.csv"
     outputs = [csv, csv.with_name(csv.name + ".review.html"), csv.with_name(csv.name + ".summary.json")]
     found = [p for p in outputs + [csv.with_name(csv.name + ".scores.csv"), csv.with_name(csv.name + ".bindings.csv")] if p.exists()]
     if all(p.exists() for p in outputs):
+        if expect is not None:
+            try:
+                old = json.loads(outputs[2].read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                old = None
+            problem = _judge_problem(old, expect) if isinstance(old, dict) else None
+            if problem:
+                _stop(f"{outputs[2]} {problem}. The files are kept; restore SCREEN_ARGS, or move {out_dir.parent} away (and any later rounds built on it) to switch modes")
         _skip(f"screen_relations {part}", csv)
     elif found:
         _stop("screen_relations left partial output: " + ", ".join(str(p) for p in found) + f". Move {out_dir} away and run again")
@@ -574,7 +698,11 @@ def _split(manifest, split_path, previous=None):
 def _check_screen_args():
     """SCREEN_ARGS 의 예약 인자를 시작 전에 검사한다. ROUND 2 이상은 --floor 를 받지 않고(r01 floor 를 고정한다) 증분 인자도 예약한다."""
     reserved = ("--out", "--manifest", "--split", "--partitions", "--bindings-out")
+    judge_mode, judge_floor_p, judge_floor_u = _judge_args(SCREEN_ARGS)  # --judge 계열을 먼저 식별한다(접두어 약어는 여기서 멈춘다)
     if ROUND is not None and ROUND >= 2:
+        if judge_floor_p is not None or judge_floor_u is not None:
+            _stop("SCREEN_ARGS must not contain --judge-floor-p or --judge-floor-u: ROUND >= 2 always uses the round-1 criteria "
+                  "(--floor-json from WORK/rounds/r01), so a new floor would change them between rounds. Remove it")
         if _floor_quantile_arg(SCREEN_ARGS):
             _stop("SCREEN_ARGS must not contain --floor-quantile: ROUND >= 2 always uses the round-1 floor (--floor-json from WORK/rounds/r01), "
                   "so a new quantile would change the floor between rounds. Remove it")
@@ -588,6 +716,10 @@ def _check_screen_args():
         _floor_arg(SCREEN_ARGS)  # --floor 약어는 시작 전에 멈춘다
         if _floor_quantile_arg(SCREEN_ARGS) and _user_floor_source(SCREEN_ARGS):
             _stop("SCREEN_ARGS has --floor-quantile together with --floor or --floor-json: the quantile computes the floor, so use only one")
+        if (judge_floor_p is not None or judge_floor_u is not None) and (judge_mode or "legacy") != "three-axis":
+            _stop("SCREEN_ARGS has --judge-floor-p or --judge-floor-u without --judge three-axis")
+        if (judge_floor_p is not None or judge_floor_u is not None) and _has_floor_json(SCREEN_ARGS):
+            _stop("SCREEN_ARGS has --judge-floor-p or --judge-floor-u together with --floor-json: use only one")
 
 
 def _merge_step(prev, export, export_new):
@@ -629,6 +761,33 @@ def stage():
         _require([prev / "export" / "manifest.json", prev / "export" / "bundle-integrity.json", prev / "inputs" / "split.json",
                   prev / "relations" / "relations.csv", first / "relations" / "train" / "relations.csv.summary.json"],
                  f"ROUND = {ROUND} needs the finished round {ROUND - 1} (and round 1's floor)")
+    judge_mode, judge_floor_p, judge_floor_u = _judge_args(SCREEN_ARGS)
+    if incremental:
+        # r01 의 판정 모드가 이후 라운드의 모드를 정한다. --judge 를 생략하면 잇고, 다르게 명시하면 멈춘다.
+        floor_summary = first / "relations" / "train" / "relations.csv.summary.json"
+        try:
+            base = json.loads(floor_summary.read_text(encoding="utf-8"))
+            if not isinstance(base, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as exc:
+            _stop(f"cannot read round 1's train summary {floor_summary} ({exc})")
+        base_mode = _summary_judge_mode(base)
+        if base_mode not in JUDGE_MODES:
+            _stop(f"round 1's train summary {floor_summary} has an unknown judge block; not continuing")
+        if judge_mode is not None and judge_mode != base_mode:
+            _stop(f"SCREEN_ARGS has --judge {judge_mode}, but round 1 was made with the {base_mode} judge ({floor_summary}). "
+                  f"The judge mode is fixed in round 1: use --judge {base_mode} (or omit it), or start over from a new WORK")
+        if judge_mode is None and base_mode == "three-axis":
+            _say(f"--judge is not in SCREEN_ARGS: inheriting {base_mode} from round 1 ({floor_summary})")
+        judge_mode = base_mode
+        judge_expect = _judge_expectation(base, judge_mode)
+    else:
+        judge_mode = judge_mode or "legacy"
+        judge_expect = {"mode": judge_mode}
+        if judge_mode == "three-axis":
+            for axis, value in (("p", judge_floor_p), ("u", judge_floor_u)):
+                if value is not None:
+                    judge_expect[axis] = value
     _boot()
     work.mkdir(parents=True, exist_ok=True)
     inputs, export, reports, relations = work / "inputs", work / "export", work / "reports", work / "relations"
@@ -683,17 +842,18 @@ def stage():
     # f. relations. held-out 이 train 기준값(floor)에 섞이지 않도록 train 과 test 를 따로 만들어 합친다.
     review = []
     if csv.is_file():
+        _check_relations_reuse(relations, judge_expect, incremental)
         _skip("relations", csv)
     elif incremental:
         # 새 제품이 낀 쌍만 스크리닝한다. 기준(floor)은 r01 train 요약에서 고정한다. 앞 라운드의 합친 파일(사용자 수정 포함)이 바이트 그대로 앞부분이 된다.
         train_dir, test_dir = relations / "train", relations / "test"
         carried = ["--base-split", prev / "inputs" / "split.json", "--base-relations", prev / "relations" / "relations.csv",
                    "--floor-json", first / "relations" / "train" / "relations.csv.summary.json"]
-        _screen(manifest, split_path, "train", train_dir, carried)
+        _screen(manifest, split_path, "train", train_dir, carried, expect=judge_expect)
         deltas = [train_dir / "relations.csv"]
         review.append(train_dir / "relations.csv.review.html")
         if split.get("test"):
-            _screen(manifest, split_path, "test", test_dir, carried)
+            _screen(manifest, split_path, "test", test_dir, carried, expect=judge_expect)
             deltas.append(test_dir / "relations.csv")
             review.append(test_dir / "relations.csv.review.html")
         else:
@@ -703,12 +863,24 @@ def stage():
         _say(f"wrote merged relations: {csv} ({count} pairs; the previous round's file is its first bytes)")
     else:
         train_dir, test_dir = relations / "train", relations / "test"
-        train_summary = _screen(manifest, split_path, "train", train_dir, [])
+        train_summary = _screen(manifest, split_path, "train", train_dir, [], expect=judge_expect)
         parts = [train_dir / "relations.csv"]
         review.append(train_dir / "relations.csv.review.html")
         if split.get("test"):
-            floor = [] if _user_floor_source(SCREEN_ARGS) else ["--floor", repr(train_summary["floor"]["global"])]
-            _screen(manifest, split_path, "test", test_dir, floor, drop_quantile=True)
+            if judge_mode == "three-axis":
+                # test 구획은 train 의 p·u 기준(global)을 그대로 받는다. similarity floor 는 train 에 있을 때만 넘긴다. quantile 은 넘기지 않는다.
+                train_expect = _judge_expectation(train_summary, judge_mode)
+                floor = []
+                if not _has_floor_json(SCREEN_ARGS):
+                    for flag, axis, given in (("--judge-floor-p", "p", judge_floor_p), ("--judge-floor-u", "u", judge_floor_u)):
+                        if given is None:
+                            floor += [flag, repr(train_expect[axis])]
+                if not _user_floor_source(SCREEN_ARGS) and (train_summary.get("floor") or {}).get("global") is not None:
+                    floor += ["--floor", repr(train_summary["floor"]["global"])]
+            else:
+                train_expect = judge_expect
+                floor = [] if _user_floor_source(SCREEN_ARGS) else ["--floor", repr(train_summary["floor"]["global"])]
+            _screen(manifest, split_path, "test", test_dir, floor, drop_quantile=True, expect=train_expect)
             parts.append(test_dir / "relations.csv")
             review.append(test_dir / "relations.csv.review.html")
         else:
