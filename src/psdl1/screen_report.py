@@ -59,6 +59,11 @@ def num(value, digits=3):
     return "–" if value is None else f"{value:.{digits}f}"
 
 
+def floor_text(value):
+    """similarity floor 표시. three-axis 에서 같은 계열이 없으면 floor 가 None 이다."""
+    return "—" if value is None else f"{value:.3f}"
+
+
 def data_uri(image):
     buffer = io.BytesIO()
     image.save(buffer, "PNG", optimize=True)
@@ -288,8 +293,8 @@ def key_lines(p, primary, diff_names):
     warn = ' class="warn"' if layer_flags else ""
     name = primary["name"]
     low, high = primary["same_min"], primary["same_max"]
-    verdict = (f'현재 {TIER_TEXT[p["tier"]]} · 기준 {p["floor"]:.3f}' if name == "similarity"
-               else f'현재 판정(similarity 기준) {TIER_TEXT[p["tier"]]} · similarity floor {p["floor"]:.3f}')
+    verdict = (f'현재 {TIER_TEXT[p["tier"]]} · 기준 {floor_text(p["floor"])}' if name == "similarity"
+               else f'현재 판정(similarity 기준) {TIER_TEXT[p["tier"]]} · similarity floor {floor_text(p["floor"])}')
     second = f'{esc(name)} = {num(p[name])} (같은 계열 {num(low)}–{num(high)}, 다른 계열 중앙값 {num(primary["other_median"])}) · {verdict}'
     third = ", ".join(esc(n) for n in diff_names) or "비교할 층 없음"
     return (f'<ol class="key"><li{warn}><b>정렬 신뢰</b> {first}</li><li><b>주 지표</b> {second}</li><li><b>차이 큰 층</b> {third}</li></ol>')
@@ -308,7 +313,7 @@ def card_html(p, sig, top_layers, primary):
         diff_names = [k for k, _, _ in sorted(p["result"]["bindings"], key=lambda item: (-item[2], item[0]))[:3]]
     group = "" if p["group_a"] == "-" and p["group_b"] == "-" else f'<span class="badge">그룹 {esc(p["group_a"])}/{esc(p["group_b"])}</span>'
     badges = (f'<div class="line"><b>유사도</b><span class="badge">유사도 {p["similarity"]:.3f}</span><span class="badge">Layer 유사도 {num(p["similarity_layer"])}</span>'
-              f'<span class="badge">기준 {p["floor"]:.3f}</span><span class="badge">현재: {TIER_TEXT[p["tier"]]}</span>{group}</div>'
+              f'<span class="badge">기준 {floor_text(p["floor"])}</span><span class="badge">현재: {TIER_TEXT[p["tier"]]}</span>{group}</div>'
               f'<div class="line"><b>사용 일치</b><span class="badge" title="전극 합집합의 사용 일치(Jaccard)">usage_jaccard {p["usage_jaccard"]:.2f}</span>'
               f'<span class="badge" title="CNT 를 빼고 사용 문턱을 적용한 binding 의 사용 일치">usage_jaccard_electrodes {num(p["usage_jaccard_electrodes"], 2)}</span></div>')
     folded = f'<details class="all"><summary>모든 값 보기</summary>{badges}{alignment_lines(p)}{binding_table(p)}</details>'
@@ -346,7 +351,7 @@ def distribution_svg(result):
                 for k, v in enumerate(values):
                     jitter = ((k * 0.6180339887) % 1.0) * (lane - 8)
                     out.append(f'<circle class="{css}" cx="{left + width * min(max(v, 0.0), 1.0):.1f}" cy="{base + 4 + jitter:.1f}" r="2.2"/>')
-        if name == "similarity":
+        if name == "similarity" and summary["floor"]["global"] is not None:
             floor = summary["floor"]
             out.append(f'<line class="floor" x1="{left + width * floor["global"]:.1f}" y1="{top - 4}" x2="{left + width * floor["global"]:.1f}" y2="{top + 2 * lane}"><title>floor(global) {floor["global"]:.3f}</title></line>')
             for group, value in sorted(floor["per_group"].items()):
@@ -362,11 +367,11 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
 
     top_bindings 는 옛 인수 호환용으로 받기만 한다: 옛 '거리 상위 binding 겹침 타일'은 카드의 binding 지표 표와 층별(없으면 binding별) A | B | 차이 타일이 대신한다."""
     pairs = result["pairs"]
-    chosen = sorted((p for p in pairs if p["review"]), key=lambda p: (abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
+    chosen = sorted((p for p in pairs if p["review"]), key=lambda p: (0.0 if p["floor"] is None else abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
     summary = result["summary"]
     counts = "".join(f'<li>{esc(r)}: {n}쌍 — {esc(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
     table = "".join(f'<tr><td>{i}</td><td>{esc(p["product_a"])} ↔ {esc(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
-                    f'<td class="n">{p["floor"]:.3f}</td><td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
+                    f'<td class="n">{floor_text(p["floor"])}</td><td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
     primary = primary_context(result)
     summary["review"]["primary_metric"] = {key: primary[key] for key in ("name", "auc", "n", "reason", "n_same", "n_other")}  # 새 키만 추가한다
     cards = "".join(card_html(p, result["signatures"], top_layers, primary) for p in chosen[:top_pairs])
@@ -380,7 +385,7 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
             f'{distribution_svg(result)}'
             f'<ul class="sub">{counts or "<li>검토 대상이 없습니다.</li>"}</ul>'
             f'<div class="legend"><span><i style="background:var(--a)"></i>A만</span><span><i style="background:var(--b)"></i>B만</span><span><i style="background:var(--both)"></i>둘 다</span>'
-            f'<span>기준(같은 계열 최저 유사도) {summary["floor"]["global"]:.3f}</span></div>'
+            f'<span>기준(같은 계열 최저 유사도) {floor_text(summary["floor"]["global"])}</span></div>'
             f'<h2>검토 대상 전체</h2><table><tr><th>#</th><th>쌍</th><th>현재 판정</th><th>유사도</th><th>기준</th><th>이유</th><th>이미지</th></tr>{table}</table>'
             + (f'<p class="sub">카드는 {top_pairs}쌍까지만 그렸습니다. 나머지 {omitted}쌍은 위 표와 scores.csv로 보세요(--review-pairs로 늘릴 수 있음).</p>' if omitted else "")
             + f'<h2>카드</h2>{cards or "<p>검토할 쌍이 없습니다.</p>"}</body></html>')

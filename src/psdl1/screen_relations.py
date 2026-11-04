@@ -42,6 +42,12 @@ SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "li
                 "metrics_anchor", "similarity_layer", "layer_shift_y_um", "layer_shift_x_um", "layer_align_dice", "layer_align_second_dice",
                 "layer_align_decided", "layer_align_disagreeing", "layer_align_flag",
                 "usage_jaccard_electrodes", "electrode_similarity", "pattern_similarity", "cnt_similarity", "layer_align_decided_dice")
+# three-axis 판정에서만 scores.csv 끝에 붙는 열(legacy 는 SCORE_FIELDS 그대로)
+JUDGE_SCORE_FIELDS = ("axis_p", "axis_p_layer", "axis_u", "size_ratio_y", "size_ratio_x", "size_delta_unit_px_y", "size_delta_unit_px_x", "size_tag",
+                      "judge_case", "judge_p_floor", "judge_u_floor")
+JUDGE_MODES = ("legacy", "three-axis")
+JUDGE_SCHEMA = "dl1_judge_v1"
+JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
 
 
 def block_reduce(mask, factor, how):
@@ -459,10 +465,37 @@ def load_floor_spec(path):
     document = json.loads(Path(path).read_text(encoding="utf-8"))
     floor = document.get("floor") if isinstance(document, dict) else None
     number = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-    if not isinstance(floor, dict) or not number(floor.get("global")) or not isinstance(floor.get("per_group"), dict) \
+    judge = document.get("judge") if isinstance(document, dict) else None
+    if judge is None:  # legacy summary: 지금 규칙 그대로
+        if not isinstance(floor, dict) or not number(floor.get("global")) or not isinstance(floor.get("per_group"), dict) \
+                or any(not isinstance(k, str) or not number(v) for k, v in floor["per_group"].items()):
+            raise ValueError(f"{path} is not a screening summary with floor.global and floor.per_group")
+        return {"global": float(floor["global"]), "groups": {k: float(v) for k, v in floor["per_group"].items()}}
+    # three-axis summary: similarity floor.global 은 null 일 수 있다(같은 계열이 없었던 실행)
+    if not isinstance(floor, dict) or not (floor.get("global") is None or number(floor["global"])) or not isinstance(floor.get("per_group"), dict) \
             or any(not isinstance(k, str) or not number(v) for k, v in floor["per_group"].items()):
-        raise ValueError(f"{path} is not a screening summary with floor.global and floor.per_group")
-    return {"global": float(floor["global"]), "groups": {k: float(v) for k, v in floor["per_group"].items()}}
+        raise ValueError(f"{path} is not a screening summary with floor.global (number or null) and floor.per_group")
+
+    def bad(why):
+        return ValueError(f"{path} has an invalid judge block: {why}")
+    if not isinstance(judge, dict) or judge.get("schema") != JUDGE_SCHEMA or judge.get("mode") != "three-axis":
+        raise bad(f"schema {JUDGE_SCHEMA} and mode three-axis are required")
+    if not number(judge.get("margin")):
+        raise bad("margin must be a finite number")
+    if not (judge.get("quantile") is None or number(judge["quantile"])):
+        raise bad("quantile must be a finite number or null")
+    axes = {}
+    for axis in ("p", "u"):
+        block = judge.get(axis)
+        if not isinstance(block, dict) or not number(block.get("global")) or not isinstance(block.get("per_group"), dict) \
+                or any(not isinstance(k, str) or not number(v) for k, v in block["per_group"].items()):
+            raise bad(f"{axis} needs a finite global and a per_group map of finite numbers")
+        if not isinstance(block.get("source"), str) or isinstance(block.get("n_values"), bool) or not isinstance(block.get("n_values"), int) or block["n_values"] < 0:
+            raise bad(f"{axis} needs a string source and an integer n_values >= 0")
+        axes[axis] = {"global": float(block["global"]), "groups": {k: float(v) for k, v in block["per_group"].items()}, "source": block["source"],
+                      "n_values": block["n_values"]}
+    return {"global": None if floor["global"] is None else float(floor["global"]), "groups": {k: float(v) for k, v in floor["per_group"].items()},
+            "judge": {"margin": float(judge["margin"]), "quantile": None if judge.get("quantile") is None else float(judge["quantile"]), **axes}}
 
 
 def read_base_relations(path, product_ids):
@@ -501,13 +534,157 @@ def floor_index(q, n):
     return math.floor(Fraction(repr(float(q))) * (n - 1))
 
 
-def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=0.05, floor=None, cross_group_fraction=0.2,
+def make_pick(floor_quantile):
+    def pick(values):  # 정렬한 값의 lower index. q=None 이면 최솟값
+        ordered = sorted(values)
+        return ordered[0 if floor_quantile is None else floor_index(floor_quantile, len(ordered))]
+    return pick
+
+
+def judge_pairs_legacy(pairs, group_of, *, floor, floor_spec, pick, margin, min_group_pairs):
+    """기존 similarity 판정(이동만 했다: 동작·순서 불변). 쌍마다 floor·tier·reason 을 채우고 (global_floor, group_floor) 를 돌려준다."""
+    same = [p for p in pairs if p["same_lineage"]]
+    global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (pick([p["similarity"] for p in same]) if same else None)
+    if global_floor is None:
+        raise ValueError("no same-lineage pair to calibrate with; pass an explicit --floor")
+    group_floor = {}
+    if floor_spec is not None:
+        group_floor = {g: v for g, v in floor_spec["groups"].items() if g in set(group_of.values())}
+    for g in sorted(set(group_of.values())):
+        within = [p["similarity"] for p in same if p["group_a"] == g and p["group_b"] == g]
+        if floor is None and floor_spec is None and len(within) >= min_group_pairs:
+            group_floor[g] = pick(within)
+    for p in pairs:
+        p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
+        if p["same_lineage"]:
+            p["tier"], p["reason"] = "similar", "same_lineage"
+        elif p["similarity"] < p["floor"] - margin:
+            p["tier"], p["reason"] = "different", "below_same_lineage_floor"
+        elif p["similarity"] >= p["floor"]:
+            p["tier"], p["reason"] = "unknown", "close_to_same_lineage"  # 이름만 다른 같은 회로일 수 있다
+        else:
+            p["tier"], p["reason"] = "unknown", "near_boundary"
+    return global_floor, group_floor
+
+
+def size_supported(metrics_anchor, axes):
+    """PLAN v1.2 G-size 지원 범위: metrics_anchor 가 LAYER 이고 max|size_delta_unit_px| <= JUDGE_SIZE_SUPPORT_PX."""
+    return metrics_anchor == "LAYER" and max(abs(axes["size_delta_unit_px_y"]), abs(axes["size_delta_unit_px_x"])) <= JUDGE_SIZE_SUPPORT_PX
+
+
+def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin):
+    """three-axis 판정표(PLAN v1.1 A2·X2, v1.2 G-size)의 초기 (tier, reason, judge_case). cross-group cap 은 이 뒤에 따로 적용한다."""
+    differs = axes["size_tag"] == "size_differs"
+    if same_lineage:
+        return "similar", "same_lineage", 3 if differs else None
+    p, u = axes["axis_p"], axes["axis_u"]
+    if p is None:
+        return "unknown", "no_pattern_value", None
+    if p < p_floor - margin:
+        if differs and not size_supported(metrics_anchor, axes):
+            return "unknown", "size_differs_out_of_support", 3
+        return "different", "below_pattern_floor", 2
+    if p < p_floor:
+        return "unknown", "near_boundary", None
+    if u is None:
+        return "unknown", "pattern_same_usage_unknown", None
+    if u < u_floor:
+        return "unknown", "pattern_same_usage_differs", 1
+    return "unknown", "close_to_same_lineage", 3 if differs else None
+
+
+def judge_axis_floor(axis, name, explicit, spec, same, group_of, pick, min_group_pairs):
+    """한 축(p 또는 u)의 기준값. 증분이면 저장값, --judge-floor-<axis> 가 있으면 그 값(그룹 기준 없음), 아니면 같은 계열 유효 값으로 보정한다."""
+    values = [p["judge_axes"][name] for p in same if p["judge_axes"][name] is not None]
+    if spec is not None:
+        return {"global": spec["global"], "per_group": {g: v for g, v in spec["groups"].items() if g in set(group_of.values())},
+                "source": spec["source"], "n_values": spec["n_values"]}
+    if explicit is not None:
+        return {"global": float(explicit), "per_group": {}, "source": "explicit", "n_values": len(values)}
+    if not values:
+        raise ValueError(f"no same-lineage pair with a valid {name} value to calibrate with; pass --judge-floor-{axis}")
+    per_group = {}
+    for g in sorted(set(group_of.values())):
+        within = [p["judge_axes"][name] for p in same if p["group_a"] == g and p["group_b"] == g and p["judge_axes"][name] is not None]
+        if len(within) >= min_group_pairs:
+            per_group[g] = pick(within)
+    return {"global": pick(values), "per_group": per_group, "source": "calibrated", "n_values": len(values)}
+
+
+def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, min_group_pairs, judge_floor_p, judge_floor_u):
+    """three-axis 판정. 쌍마다 축 값·기준·tier·reason·judge_case 를 채우고 (similarity global, similarity groups, {"p": ..., "u": ...}) 를 돌려준다.
+    similarity floor 는 계산되면 기록하고 없어도 오류가 아니다(L5)."""
+    same = [p for p in pairs if p["same_lineage"]]
+    spec_judge = None if floor_spec is None else floor_spec["judge"]
+    axes_floor = {axis: judge_axis_floor(axis, name, explicit, None if spec_judge is None else spec_judge[axis], same, group_of, pick, min_group_pairs)
+                  for axis, name, explicit in (("p", "axis_p", judge_floor_p), ("u", "axis_u", judge_floor_u))}
+    global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (pick([p["similarity"] for p in same]) if same else None)
+    group_floor = {}
+    if floor_spec is not None:
+        group_floor = {g: v for g, v in floor_spec["groups"].items() if g in set(group_of.values())}
+    for g in sorted(set(group_of.values())):
+        within = [p["similarity"] for p in same if p["group_a"] == g and p["group_b"] == g]
+        if floor is None and floor_spec is None and len(within) >= min_group_pairs:
+            group_floor[g] = pick(within)
+
+    def floor_of(info, p):
+        return info["per_group"].get(p["group_a"], info["global"]) if p["group_a"] == p["group_b"] else info["global"]
+    for p in pairs:
+        axes = p["judge_axes"]
+        p.update({key: axes[key] for key in JUDGE_SCORE_FIELDS if key in axes})
+        p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
+        p["judge_p_floor"], p["judge_u_floor"] = floor_of(axes_floor["p"], p), floor_of(axes_floor["u"], p)
+        p["tier"], p["reason"], p["judge_case"] = judge_verdict(axes, p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin)
+    return global_floor, group_floor, axes_floor
+
+
+def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge):
+    """summary.json 의 judge 블록(스키마 dl1_judge_v1, three-axis 에서만)."""
+    cross = [p for p in pairs if not p["same_lineage"]]
+    same = [p for p in pairs if p["same_lineage"]]
+    names = ("axis_p", "axis_u")
+    quantile = floor_quantile if spec_judge is None else spec_judge["quantile"]
+    return {"schema": JUDGE_SCHEMA, "mode": "three-axis", "margin": margin, "quantile": quantile, "p": axes_floor["p"], "u": axes_floor["u"],
+            "cases": {"case_1": sum(p["judge_case"] == 1 for p in pairs), "case_2": sum(p["judge_case"] == 2 for p in pairs),
+                      "case_3": sum(p["judge_case"] == 3 for p in pairs),
+                      "size_differs_out_of_support": sum(p["reason"] == "size_differs_out_of_support" for p in pairs)},
+            "auc": {**{name: auc([p[name] for p in same if p[name] is not None], [p[name] for p in cross if p[name] is not None]) for name in names},
+                    "n_pairs_with_value": {name: sum(p[name] is not None for p in pairs) for name in names}}}
+
+
+def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=None, floor=None, cross_group_fraction=0.2,
            min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None,
            align_min_overlap=screen_align.ALIGN_MIN_OVERLAP, align_min_support=screen_align.ALIGN_MIN_SUPPORT, align_min_dice=screen_align.ALIGN_MIN_DICE,
-           presence_fraction=PRESENCE_FRACTION, floor_quantile=None):
+           presence_fraction=PRESENCE_FRACTION, floor_quantile=None, judge=None, judge_floor_p=None, judge_floor_u=None):
     """base_split과 base_relations를 함께 주면 증분 모드: 새 제품이 낀 쌍(새×새, 새×기존)만 계산한다. floor_spec은 load_floor_spec() 결과다.
     align_*는 Layer 정렬(scores.csv 의 새 컬럼)에만 쓰이고 tier·floor 판정은 바꾸지 않는다.
-    floor_quantile=q 이면 같은 계열 유사도를 정렬한 index floor(q*(n-1)) 의 값을 floor 로 쓴다(None 이면 최솟값). floor·floor_spec 과 배타다."""
+    floor_quantile=q 이면 같은 계열 유사도를 정렬한 index floor(q*(n-1)) 의 값을 floor 로 쓴다(None 이면 최솟값). floor·floor_spec 과 배타다.
+    judge: "legacy"(기본, similarity 판정) | "three-axis"(P·U 판정). None 이면 비증분은 legacy, 증분(floor_spec)은 base summary 의 모드를 잇고 다르면 거부한다.
+    margin=None 이면 0.05, 단 three-axis 증분은 base summary 에 저장된 margin 을 쓰고 다른 값을 주면 거부한다. judge_floor_p/u 는 three-axis 의 축별 명시 기준이다."""
+    if judge is not None and judge not in JUDGE_MODES:
+        raise ValueError(f"judge must be one of {JUDGE_MODES}")
+    spec_judge = None if floor_spec is None else floor_spec.get("judge")
+    if floor_spec is not None:
+        base_mode = "three-axis" if spec_judge is not None else "legacy"
+        if judge is not None and judge != base_mode:
+            raise ValueError("judge mode differs from the base round summary")
+        judge = base_mode
+    elif judge is None:
+        judge = "legacy"
+    if judge_floor_p is not None or judge_floor_u is not None:
+        if judge == "legacy":
+            raise ValueError("judge_floor_p and judge_floor_u need the three-axis judge")
+        if floor_spec is not None:
+            raise ValueError("judge_floor_p and judge_floor_u are exclusive with floor_spec")
+        for value in (judge_floor_p, judge_floor_u):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1):
+                raise ValueError("judge_floor_p and judge_floor_u in [0,1] required")
+    if spec_judge is not None:
+        if margin is not None and margin != spec_judge["margin"]:
+            raise ValueError("margin differs from the base round summary")
+        margin = spec_judge["margin"]
+    if margin is None:
+        margin = 0.05
     if floor_quantile is not None:
         if isinstance(floor_quantile, bool) or not isinstance(floor_quantile, (int, float)) or not 0 <= floor_quantile <= 1:
             raise ValueError("floor_quantile in [0,1] required")
@@ -581,36 +758,22 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         if counts != expected:
             raise ValueError(f"delta pair count {counts} differs from the expected n(n-1)/2 + n*m {expected}")
     same = [p for p in pairs if p["same_lineage"]]
-    def pick(values):  # 정렬한 값의 lower index. q=None 이면 최솟값
-        ordered = sorted(values)
-        return ordered[0 if floor_quantile is None else floor_index(floor_quantile, len(ordered))]
-
-    global_floor = floor if floor is not None else floor_spec["global"] if floor_spec is not None else (pick([p["similarity"] for p in same]) if same else None)
-    if global_floor is None:
-        raise ValueError("no same-lineage pair to calibrate with; pass an explicit --floor")
-    group_floor = {}
-    if floor_spec is not None:
-        group_floor = {g: v for g, v in floor_spec["groups"].items() if g in set(group_of.values())}
-    for g in sorted(set(group_of.values())):
-        within = [p["similarity"] for p in same if p["group_a"] == g and p["group_b"] == g]
-        if floor is None and floor_spec is None and len(within) >= min_group_pairs:
-            group_floor[g] = pick(within)
-    for p in pairs:
-        p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
-        if p["same_lineage"]:
-            p["tier"], p["reason"] = "similar", "same_lineage"
-        elif p["similarity"] < p["floor"] - margin:
-            p["tier"], p["reason"] = "different", "below_same_lineage_floor"
-        elif p["similarity"] >= p["floor"]:
-            p["tier"], p["reason"] = "unknown", "close_to_same_lineage"  # 이름만 다른 같은 회로일 수 있다
-        else:
-            p["tier"], p["reason"] = "unknown", "near_boundary"
+    pick = make_pick(floor_quantile)
+    axes_floor = None
+    if judge == "legacy":
+        global_floor, group_floor = judge_pairs_legacy(pairs, group_of, floor=floor, floor_spec=floor_spec, pick=pick, margin=margin, min_group_pairs=min_group_pairs)
+        strength, strength_floor = (lambda p: p["similarity"]), "floor"
+    else:  # 이 뒤의 cap·weakest·review 는 similarity 대신 P 와 P 기준값을 쓴다
+        global_floor, group_floor, axes_floor = judge_pairs_three_axis(pairs, group_of, floor=floor, floor_spec=floor_spec, pick=pick, margin=margin,
+                                                                       min_group_pairs=min_group_pairs, judge_floor_p=judge_floor_p, judge_floor_u=judge_floor_u)
+        strength, strength_floor = (lambda p: p["axis_p"]), "judge_p_floor"
     within_different = sum(p["tier"] == "different" and p["group_a"] == p["group_b"] for p in pairs)
     allowed = math.ceil(cross_group_fraction * within_different)
-    cross = sorted((p for p in pairs if p["tier"] == "different" and p["group_a"] != p["group_b"]), key=lambda p: (-p["similarity"], p["product_a"], p["product_b"]))
+    cross = sorted((p for p in pairs if p["tier"] == "different" and p["group_a"] != p["group_b"]), key=lambda p: (-strength(p), p["product_a"], p["product_b"]))
     for p in cross[allowed:]:
         p["tier"], p["reason"] = "unknown", "cross_group_capped"  # 쉬운 쌍이라 일부만 쓴다
-    weakest = sorted(same, key=lambda p: p["similarity"])[:max(1, math.ceil(0.2 * len(same)))] if same else []
+    ranked = same if judge == "legacy" else [p for p in same if p["axis_p"] is not None]
+    weakest = sorted(ranked, key=strength)[:max(1, math.ceil(0.2 * len(ranked)))] if ranked else []
     for p in weakest:
         p["flag"] = "weakest_same_lineage"
     for p in pairs:  # 사람이 봐야 하는 쌍과 그 이유를 모두 모은다
@@ -619,7 +782,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
             p["review"].append(p["reason"])
         if p.get("flag") == "weakest_same_lineage":
             p["review"].append("weakest_same_lineage")
-        if p["tier"] == "different" and p["similarity"] >= p["floor"] - margin - review_band:
+        if p["tier"] == "different" and strength(p) >= p[strength_floor] - margin - review_band:
             p["review"].append("different_near_boundary")
         p["review"] += [f for f in p["alignment_flag"].split(";") if f in {"ambiguous_alignment", "alignment_unreliable", "low_overlap", "no_anchor"}]
     floor_info = {"global": global_floor, "groups": group_floor, "margin": margin}
@@ -642,6 +805,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                         "new_products": new_of, "delta_pairs": counts, "expected_delta_pairs": expected})
     if floor_spec is not None:
         summary["floor"]["source"] = "base_summary"
+    if judge == "three-axis":
+        summary["judge"] = judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge)
     if floor_quantile is not None:
         summary["floor"]["quantile"] = floor_quantile
         summary["floor"]["quantile_method"] = "lower_index"
@@ -698,7 +863,7 @@ def write_csvs(result, out, scores_path, bindings_path=None):
             for row in p["metric_rows"]:  # 쌍 안의 행은 (kind, key) 순이다
                 writer.writerow({"product_a": p["product_a"], "product_b": p["product_b"], "partition": p["partition"], "metrics_anchor": p["metrics_anchor"], **row})
     with open(scores_path, "w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, SCORE_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(stream, SCORE_FIELDS + (JUDGE_SCORE_FIELDS if "judge" in result["summary"] else ()), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(sorted(pairs, key=lambda p: (-p["similarity"], p["product_a"], p["product_b"])))
     with open(out, "w", newline="", encoding="utf-8") as stream:
@@ -726,7 +891,12 @@ def main(argv=None):
     ap.add_argument("--anchor", default="auto", choices=("auto", "CNT", "ELECTRODES"), help="mask used to align a pair; auto = CNT union, else the electrode union")
     ap.add_argument("--max-shift", type=float, default=0.35, help="search radius around the centred position, as a fraction of the larger frame side")
     ap.add_argument("--candidates", type=int, default=5, help="alignment candidates (correlation peaks) verified with the full similarity")
-    ap.add_argument("--margin", type=float, default=0.05, help="a cross-lineage pair is 'different' only this far below the weakest same-lineage similarity")
+    ap.add_argument("--margin", type=float, default=None, help="a cross-lineage pair is 'different' only this far below the weakest same-lineage similarity (default 0.05; "
+                    "a three-axis incremental run uses the margin stored in the base summary and rejects a different value)")
+    ap.add_argument("--judge", choices=JUDGE_MODES, default=None, help="judging mode: legacy (similarity) or three-axis (pattern P, usage U, size). Omitted = legacy; "
+                    "with --floor-json it inherits the base summary's mode and a different explicit value is rejected")
+    ap.add_argument("--judge-floor-p", type=float, help="three-axis: explicit pattern (P) floor instead of calibrating it on the same-lineage pairs (exclusive with --floor-json)")
+    ap.add_argument("--judge-floor-u", type=float, help="three-axis: explicit usage (U) floor instead of calibrating it on the same-lineage pairs (exclusive with --floor-json)")
     ap.add_argument("--floor", type=float, help="explicit similarity floor instead of the weakest same-lineage pair")
     ap.add_argument("--floor-quantile", type=float, help="use the lower-index quantile q in [0,1] of the same-lineage similarities as the floor instead of the minimum (exclusive with --floor and --floor-json)")
     ap.add_argument("--cross-group-fraction", type=float, default=0.2, help="cross-group 'different' pairs kept, as a fraction of within-group ones")
@@ -748,6 +918,8 @@ def main(argv=None):
             ap.error(f"{flag} must be 0 or more")
     if a.floor_json is not None and a.floor is not None:
         ap.error("--floor and --floor-json are exclusive")
+    if a.floor_json is not None and (a.judge_floor_p is not None or a.judge_floor_u is not None):
+        ap.error("--judge-floor-p and --judge-floor-u are exclusive with --floor-json")
     if a.floor_quantile is not None:
         if a.floor is not None or a.floor_json is not None:
             ap.error("--floor-quantile is exclusive with --floor and --floor-json")
@@ -772,7 +944,8 @@ def main(argv=None):
             raise FileExistsError(f"refusing to overwrite {path}; choose a new path")
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
                     floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band,
-                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, floor_quantile=a.floor_quantile, **extra)
+                    align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, floor_quantile=a.floor_quantile,
+                    judge=a.judge, judge_floor_p=a.judge_floor_p, judge_floor_u=a.judge_floor_u, **extra)
     write_csvs(result, out, scores, bindings)
     # 쓰기 순서: bindings·scores → relations → review → summary(필수 3개는 마지막이라 중단되면 부분 출력 검사가 잡는다)
     page = render_review(result, a.review_pairs, a.review_bindings, a.review_layers)
