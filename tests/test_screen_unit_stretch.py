@@ -73,4 +73,12 @@ def test_tier_formula_boundaries():
     assert tier(0.5, 1.0, size_tag="size_differs", in_support=True)[0] == "different"
     assert tier(0.5, 1.0, size_tag="size_differs", in_support=False) == ("unknown", "size_differs_out_of_support")
     assert tier(0.5, 1.0, size_tag="same", in_support=False)[0] == "different"  # 같은 크기 쌍은 G-size 의 영향이 없다
+    assert tier(0.3, 1.0)[1] == "below_pattern_floor"
+    from psdl1.screen_relations import judge_verdict
+    for p, floor in ((0.47, 0.52), (0.4699, 0.52), (0.52, 0.52), (0.5199, 0.52)):  # 0.52 - 0.05 = 0.47000000000000003 경계
+        for size_tag in ("same", "size_differs"):
+            axes = {"axis_p": p, "axis_u": 1.0, "size_tag": size_tag, "size_delta_unit_px_y": 0, "size_delta_unit_px_x": 0}
+            expected = judge_verdict(axes, "LAYER", False, floor, 0.0, 0.05)
+            assert mus.tier(p, floor, margin=0.05, size_tag=size_tag, in_support=True) == expected[:2], (p, floor, size_tag)
+    assert mus.tier(0.47, 0.52)[0] == "unknown"
     assert mus.supported("LAYER", 7, -7) and not mus.supported("LAYER", 8, 0) and not mus.supported("ELECTRODES", 0, 0)

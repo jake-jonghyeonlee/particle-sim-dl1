@@ -9,6 +9,7 @@ import argparse
 import math
 import sys
 import time
+from fractions import Fraction
 
 import numpy as np
 
@@ -110,11 +111,12 @@ def tier(p, p_floor, margin=MARGIN_P, size_tag="same", in_support=True):
     size_differs 이고 지원 범위 밖이면 different 대신 unknown(size_differs_out_of_support)."""
     if p is None:
         return "unknown", "no_pattern_value"
-    if p < p_floor - margin:
+    exact = lambda value: Fraction(repr(float(value)))  # src judge_verdict 와 같은 십진 정확 비교(0.52 - 0.05 = 0.47000000000000003 오차 방지)
+    if exact(p) < exact(p_floor) - exact(margin):
         if size_tag == "size_differs" and not in_support:
             return "unknown", "size_differs_out_of_support"
-        return "different", "below_same_lineage_floor"
-    return "unknown", "close_to_same_lineage" if p >= p_floor else "near_boundary"
+        return "different", "below_pattern_floor"
+    return "unknown", "close_to_same_lineage" if exact(p) >= exact(p_floor) else "near_boundary"
 
 
 def classify(records, base):

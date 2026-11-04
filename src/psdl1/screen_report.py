@@ -360,7 +360,7 @@ def distribution_svg(result):
         top = 20 + row * (2 * lane + gap)
         groups = [[p[name] for p in pairs if p["same_lineage"] and p[name] is not None], [p[name] for p in pairs if not p["same_lineage"] and p[name] is not None]]
         n = len(groups[0]) + len(groups[1])
-        value_auc = auc.get(name)
+        value_auc = judge["auc"].get(name) if name in ("axis_p", "axis_u") else auc.get(name)
         out.append(f'<g data-metric="{name}"><text x="4" y="{top + lane}">{esc(name)}</text>'
                    f'<text class="muted" x="{left + width + 8}" y="{top + lane - 2}">AUC {num(value_auc)}</text><text class="muted" x="{left + width + 8}" y="{top + lane + 12}">n={n}'
                    f'{" (히스토그램)" if n > DENSE_POINTS else ""}</text>')
@@ -398,10 +398,14 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
 
     top_bindings 는 옛 인수 호환용으로 받기만 한다: 옛 '거리 상위 binding 겹침 타일'은 카드의 binding 지표 표와 층별(없으면 binding별) A | B | 차이 타일이 대신한다."""
     pairs = result["pairs"]
-    chosen = sorted((p for p in pairs if p["review"]), key=lambda p: (0.0 if p["floor"] is None else abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"]))
+    three = is_three_axis(result)
+    if three:  # P 와 p 기준(그룹 기준이 있으면 그 값)의 거리 순. P 값이 없는 쌍은 맨 뒤
+        order = lambda p: (p["axis_p"] is None, 0.0 if p["axis_p"] is None else abs(p["axis_p"] - p["judge_p_floor"]), p["product_a"], p["product_b"])
+    else:
+        order = lambda p: (0.0 if p["floor"] is None else abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"])
+    chosen = sorted((p for p in pairs if p["review"]), key=order)
     summary = result["summary"]
     counts = "".join(f'<li>{esc(r)}: {n}쌍 — {esc(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
-    three = is_three_axis(result)
     axis_cells = lambda p: (f'<td class="n">{num(p["axis_p"], 2)}</td><td class="n">{num(p["axis_u"], 2)}</td><td class="n">{"—" if p["judge_case"] is None else p["judge_case"]}</td>' if three else "")
     table = "".join(f'<tr><td>{i}</td><td>{esc(p["product_a"])} ↔ {esc(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
                     f'<td class="n">{floor_text(p["floor"])}</td>{axis_cells(p)}<td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
@@ -413,7 +417,7 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
     cards = "".join(card_html(p, result["signatures"], top_layers, primary) for p in chosen[:top_pairs])
     omitted = len(chosen) - min(len(chosen), top_pairs)
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
-            f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다(경계에 가까운 순). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
+            f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다({"P 가 p 기준에 가까운 순, P 값이 없는 쌍은 맨 뒤" if three else "경계에 가까운 순"}). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
             f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하고, 틀린 자동 줄은 지우세요.</p>'
             f'{primary_line(primary)}{judge_note}'
             f'<p class="sub">용어: L1 Dice(첫 층) = 첫 층만의 Dice(정렬 신뢰 판정 기준), 결정 층 Dice = 정렬을 정한 층의 Dice, 2순위 Dice 는 결정 층 기준입니다.</p>'

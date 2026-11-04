@@ -45,6 +45,30 @@ def test_three_axis_figure_has_p_and_u_rows_with_floor_lines(world):
         assert f"floor(global) {judge[key]['global']:.3f}" in group and '<line class="floor"' in group
 
 
+def test_three_axis_axis_rows_show_the_judge_auc(world):
+    result = world(AXES, margin=MARGIN)
+    svg = report.distribution_svg(result)
+    judge_auc = result["summary"]["judge"]["auc"]
+    for axis in ("axis_p", "axis_u"):
+        group = svg[svg.index(f'data-metric="{axis}"'):]
+        group = group[:group.index("</g>")]
+        assert f"AUC {report.num(judge_auc[axis])}" in group
+    assert judge_auc["axis_p"] is not None and f"AUC {report.num(None)}" not in svg[svg.index('data-metric="axis_p"'):svg.index('data-metric="axis_u"')]
+
+
+def test_three_axis_review_list_is_ordered_by_distance_of_p_from_the_p_floor(world):
+    result = world(AXES, margin=MARGIN)
+    page = render_review(result, top_pairs=60)
+    table = page[page.index("<h2>검토 대상 전체</h2>"):page.index("<h2>카드</h2>")]
+    shown = re.findall(r"<tr><td>\d+</td><td>(\w+) ↔ (\w+)</td>", table)
+    reviewed = [p for p in result["pairs"] if p["review"]]
+    expected = [(p["product_a"], p["product_b"]) for p in sorted(
+        reviewed, key=lambda p: (p["axis_p"] is None, 0.0 if p["axis_p"] is None else abs(p["axis_p"] - p["judge_p_floor"]), p["product_a"], p["product_b"]))]
+    assert shown == expected and len(shown) > 2
+    assert shown[-1] == ("A1", "B1")  # P 값이 없는 쌍은 맨 뒤
+    assert "P 가 p 기준에 가까운 순" in page
+
+
 def test_three_axis_group_floor_is_a_dashed_line_in_the_axis_rows(world):
     groups = {"A1": "g1", "A2": "g1", "A3": "g1", "A4": "g1", "B1": "g1", "B2": "g1"}
     result = world(AXES, groups=groups, margin=MARGIN)
