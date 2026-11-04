@@ -225,8 +225,25 @@ def _nested_path(copy):
     _write_sidecar(copy, doc)
 
 
+def _renamed_mask(name, rename, first_only=False):
+    def mutate(copy):
+        doc = _sidecar(copy)
+        for layer in doc["products"]["M"]["layers"][:1 if first_only else None]:
+            moved = rename(layer["mask"])
+            (copy / layer["mask"]).rename(copy / moved)
+            layer["mask"] = moved
+        _write_sidecar(copy, doc)
+    mutate.__name__ = name
+    return mutate
+
+
+_empty_stem = _renamed_mask("_empty_stem", lambda p: "screening_layers/.npy", first_only=True)
+_upper_extension = _renamed_mask("_upper_extension", lambda p: p[:-4] + ".NPY")
+_no_extension = _renamed_mask("_no_extension", lambda p: p[:-4])
+
+
 @pytest.mark.parametrize("mutation", [
-    _flip_npy, _wrong_dtype, _wrong_shape, _bad_hash, _extra_file, _unknown_product, _wrong_frame, _escape,
+    _empty_stem, _upper_extension, _no_extension, _flip_npy, _wrong_dtype, _wrong_shape, _bad_hash, _extra_file, _unknown_product, _wrong_frame, _escape,
     _absolute, _case_duplicate, _bad_version, _drop_sidecar_json, _drop_layer_entry, _empty_products, _nested_path])
 def test_verify_rejects_tampered_sidecar_even_when_resealed(tmp_path, mutation):
     out = _export(tmp_path, "a")

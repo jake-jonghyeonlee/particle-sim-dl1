@@ -207,6 +207,45 @@ def _other_dir(copy):
     (copy / "screening-layers.json").write_text(json.dumps(doc, sort_keys=True, indent=2) + "\n")
 
 
+def _rename_masks(copy, rename, first_only=False):
+    """Move mask files with their sidecar paths; rename(path) gives the new relative path."""
+    doc = _sidecar(copy)
+    for entry in doc["products"].values():
+        for layer in entry["layers"]:
+            if first_only and layer is not _first_layer(doc):
+                continue
+            moved = rename(layer["mask"])
+            (copy / moved).parent.mkdir(parents=True, exist_ok=True)
+            (copy / layer["mask"]).rename(copy / moved)
+            layer["mask"] = moved
+    (copy / "screening-layers.json").write_text(json.dumps(doc, sort_keys=True, indent=2) + "\n")
+
+
+def _first_layer(doc):
+    return next(iter(doc["products"].values()))["layers"][0]
+
+
+def _verify_layout(copy):
+    files = {p: "0" for p in _files(copy) if p.startswith("screening_layers/") or p == "screening-layers.json"}
+    importer._verify_screening_layers(copy, files, json.loads((copy / "manifest.json").read_text()), layout="merged")
+
+
+def _empty_stem(copy):
+    _rename_masks(copy, lambda p: p.rsplit("/", 1)[0] + "/.npy", first_only=True)
+
+
+def _upper_extension(copy):
+    _rename_masks(copy, lambda p: p[:-4] + ".NPY")
+
+
+def _no_extension(copy):
+    _rename_masks(copy, lambda p: p[:-4])
+
+
+def _round_without_zero_pad(copy):
+    _rename_masks(copy, lambda p: p.replace("/r01/", "/r1/"))
+
+
 def _rewrite_report_field(key, value):
     def mutate(copy):
         doc = _report(copy)
@@ -230,6 +269,10 @@ def _empty_sidecar(copy):
     (_json_path, "not under screening_layers/rNN"),
     (_other_dir, "not under screening_layers/rNN"),
     (_empty_sidecar, "has no products"),
+    (_empty_stem, "not under screening_layers/rNN"),
+    (_upper_extension, "not under screening_layers/rNN"),
+    (_no_extension, "not under screening_layers/rNN"),
+    (_round_without_zero_pad, "not under screening_layers/rNN"),
     (_rewrite_report_field("path", ["x"]), "invalid merge report screening layer entry"),
     (_rewrite_report_field("path", 7), "invalid merge report screening layer entry"),
     (_rewrite_report_field("sha256", 7), "invalid merge report screening layer entry"),
@@ -244,6 +287,20 @@ def test_resealed_sidecar_tampering_is_rejected(bundles, tmp_path, mutate, match
     copy = _tampered(tmp_path, bundles, mutate.__name__, mutate)
     with pytest.raises(ValueError, match=match):
         mb.verify_merged_bundle(copy)
+
+
+@pytest.mark.parametrize("folder", ["r00", "r01", "r001"])
+def test_round_folder_boundary_is_accepted(bundles, tmp_path, folder):
+    copy = _tampered(tmp_path, bundles, "round-" + folder,
+                     lambda c: _rename_masks(c, lambda p: p.replace("/r01/", f"/{folder}/")))
+    _verify_layout(copy)
+
+
+def test_loader_refuses_an_empty_products_sidecar(bundles, tmp_path):
+    from psdl1.screen_relations import load_screening_layers
+    copy = _tampered(tmp_path, bundles, "loader-empty", _empty_sidecar)
+    with pytest.raises(ValueError, match=r"screening-layers\.json is corrupt: no products"):
+        load_screening_layers(copy / "manifest.json", {"L1"}, 1)
 
 
 def test_unsealed_sidecar_change_is_rejected(bundles, tmp_path):

@@ -511,7 +511,8 @@ def _write_screening_layers(stage, root, model, policy):
 def _verify_screening_layers(root, files, manifest, layout="import"):
     """Sidecar links: schema, containment, product/frame, case-unique names, bool/shape, geometry hash.
 
-    layout "import": masks sit flat in screening_layers/<file>.npy. "merged": screening_layers/rNN/<file>.npy.
+    layout "import": masks sit flat in screening_layers/<stem>.npy. "merged": screening_layers/rNN/<stem>.npy (NN two or more digits).
+    <stem> has one or more characters; the extension is lowercase .npy.
     """
     if layout not in {"import", "merged"}:
         raise ValueError("unknown screening layers layout")
@@ -551,7 +552,7 @@ def _verify_screening_layers(root, files, manifest, layout="import"):
                         mask_path in referenced or files.get(mask_path) is None):
                     raise ValueError("invalid or duplicate screening layer mask path")
                 tail = mask_path[len(SCREENING_LAYERS_DIR) + 1:]
-                if layout == "import" and ("/" in tail or not tail.endswith(".npy")):
+                if layout == "import" and not re.fullmatch(r"[^/]+\.npy", tail):
                     raise ValueError("invalid or duplicate screening layer mask path")
                 if layout == "merged" and not re.fullmatch(r"r[0-9]{2,}/[^/]+\.npy", tail):
                     raise ValueError(f"merged screening layer is not under {SCREENING_LAYERS_DIR}/rNN/: {mask_path}")

@@ -211,7 +211,7 @@ def compare(sa, sb, *, anchor="auto", max_shift=0.35, candidates=5, tolerance=1)
 def load_screening_layers(manifest, needed, factor, originals=None):
     """manifest 폴더의 screening-layers.json 에서 `needed` 제품의 Layer 를 읽어 {product_id: {casefold 층 이름: 래스터(bool)}} 로 돌려준다.
 
-    사이드카 파일이 없으면 {} (모든 제품에 Layer 없음). 파일이 있는데 손상됐으면 ValueError 다: 스키마, 경로 containment, manifest 의 product_id·frame 연결,
+    사이드카 파일이 없으면 {} (모든 제품에 Layer 없음). 파일이 있는데 손상됐으면(빈 products 포함) ValueError 다: 스키마, 경로 containment, manifest 의 product_id·frame 연결,
     casefold 중복 층 이름, npy 의 dtype bool·shape==frame, mask_sha256. 마스크는 필요한 제품만 읽고 `block_reduce(any, factor)` 로 줄여 보관한다.
     `originals` dict 를 주면 원본 해상도 마스크를 비트로 묶어 {product_id: {이름: packed}} 로 채운다."""
     root = Path(manifest).parent
@@ -229,6 +229,8 @@ def load_screening_layers(manifest, needed, factor, originals=None):
         raise bad("fields")
     if document["schema_version"] != SCREENING_LAYERS_SCHEMA_VERSION:
         raise bad("unsupported schema_version")
+    if not document["products"]:
+        raise bad("no products")
     loaded, seen_paths = {}, set()
     for product_id, entry in document["products"].items():
         frame = frames.get(product_id)
