@@ -568,7 +568,7 @@ MODEL-A,MODEL-C,different
 2. 카드마다 맨 위 3줄만 본다: ① **정렬 신뢰**(Layer 정렬이면 L1 Dice와 플래그, 빨간 줄은 플래그가 있다는 뜻) ② **주 지표**(이 쌍의 값, 같은 계열 범위, 다른 계열 중앙값, 현재 판정과 기준) ③ **차이 큰 층**(층별 A | B | 차이 타일의 위쪽 3개 이름).
 3. 나머지 값은 카드 아래 "모든 값 보기"를 펼친다. 매번 볼 필요는 없다.
 
-**판정은 바뀌지 않는다.** `tier`(similar/different/unknown)와 `relations.csv`는 지금까지와 같은 `similarity`와 floor로 정해지고, Layer 정렬이나 새 지표는 판정에 들어가지 않는다. 새 값은 모두 `scores.csv`·`bindings.csv`·검토 자료의 판단 자료다. 같은 입력에서 Layer 사이드카가 있든 없든 `relations.csv`는 바이트 동일해야 하고, 합성 자료(3000×3000, N=10·30)에서 그렇게 나왔다.
+**판정은 바뀌지 않는다**(기본 `--judge legacy`. 세 축 판정은 아래 "세 축 판정"에서 켠다). `tier`(similar/different/unknown)와 `relations.csv`는 지금까지와 같은 `similarity`와 floor로 정해지고, Layer 정렬이나 새 지표는 판정에 들어가지 않는다. 새 값은 모두 `scores.csv`·`bindings.csv`·검토 자료의 판단 자료다. 같은 입력에서 Layer 사이드카가 있든 없든 `relations.csv`는 바이트 동일해야 하고, 합성 자료(3000×3000, N=10·30)에서 그렇게 나왔다.
 
 - **비교 단위**: (role, layer)별 요소 마스크와 CNT 합집합이다. 프레임에 맞춰 줄이면 프레임 크기가 다른 제품의 물리 크기가 달라지므로, **모든 제품을 같은 정수 배율(`--factor`, 기본 8)로 줄인 물리 래스터**에서 비교한다(래스터 해상도 = 픽셀 피치 × 배율, 제품 사이 픽셀 피치는 같아야 한다). 얇은 선이 남도록 any 방식으로 줄인다.
 - **정렬**: 단위 이미지의 중심이 제품마다 달라서 제품 쌍마다 먼저 맞춘다. 기준 마스크(CNT 합집합. 비었거나 프레임 대부분을 덮어 위치 정보가 없으면 전극 합집합, `--anchor`로 지정 가능)의 교차상관으로 두 프레임 중심 맞춤 주변 `--max-shift`(기본 0.35, 큰 변 대비) 안에서 후보 이동량 `--candidates`(기본 5)개를 찾는다. 후보마다 **모든 층에 같은 이동**을 적용해 두 프레임이 겹치는 영역(ROI)에서 층별 거리를 구하고 전체 유사도가 가장 큰 후보를 쓴다. 회전·뒤집힘·크기 보정은 하지 않는다. manifest에는 CNT 파일별 마스크가 아니라 합집합만 있어서 `pcnt`만 따로 기준으로 쓸 수는 없다.
@@ -627,6 +627,28 @@ MODEL-A,MODEL-C,different
 
   N=10·30 두 점으로 적합한 시간은 `T ≈ c·N + p·쌍 수`이고, 사이드카가 있으면 쌍당 약 +0.12 s(정렬+지표), 제품당 약 +0.4 s(사이드카 읽기)다. 외삽(N=200, 19 900쌍, 선형 가정이라 오차 범위를 주지 못한다)은 사이드카 있음 약 77분·RSS 약 7.4 GiB, 없음 약 37분이다. **Layer가 없어도** 새 지표(원본 해상도 면적·경계) 계산 때문에 이전 버전보다 쌍당 약 0.08 s 더 걸린다. 디스크는 사이드카가 제품당 약 86 MiB(3000²에서 층 한 장 약 9 MB, 층 10장)이고 N=200이면 사이드카만 약 17 GiB, 번들 전체 약 37 GiB다. 내보내기는 사이드카가 있으면 제품당 약 +3.4 s 느리다(N=200 전체 약 36분, 없으면 약 25분).
 - 쌍은 같은 구획 안에서만 만든다. 같은 계열이 두 구획에 걸치면 분할 검사에서 거부한다.
+- **세 축 판정(`--judge three-axis`)**: 위 판정(`similarity` 하나)은 프레임 크기가 다른 같은 설계를 `different` 로 밀 수 있다. 세 축 판정은 패턴·사용·크기를 따로 본다. 기본은 아니며 `--judge three-axis` 로만 켠다.
+  - **인수**: `--judge {legacy,three-axis}`. 생략하면 비증분은 legacy 이고, 증분(`--floor-json`)은 base summary 의 모드를 잇는다. base 와 다르게 명시하면 `judge mode differs from the base round summary` 로 거부한다. `--judge-floor-p`·`--judge-floor-u` 는 축별 기준값(0~1)을 직접 준다. three-axis 에서만 쓰며 `--floor-json` 과 함께 쓸 수 없다(`--judge-floor-p and --judge-floor-u are exclusive with --floor-json`). three-axis 증분은 `--floor-json` 이 필수다(`three-axis incremental screening needs --floor-json (round 1 criteria)`).
+  - **세 축**: **P**(`axis_p`) = `bindings.csv` 의 `kind=binding` 행 중 `status=both` 이고 `boundary_f1` 이 유한한 행의 평균이다. 유효 행이 없으면 빈칸이다. **U**(`axis_u`) = `usage_jaccard_electrodes` 와 같은 값이다. **S** = 원본 프레임 크기로 계산한 unit 크기 비율(`size_ratio_y`, `size_ratio_x`)과 차(`size_delta_unit_px_y`, `size_delta_unit_px_x`, (B−A)/2 원본 px)다. 두 축 비율이 모두 1 이면 `size_tag=same`, 아니면 `size_differs`다. **S 는 판정에 쓰지 않는다**(아래 G-size 의 지원 범위 확인만 한다). 진단값 `axis_p_layer` 는 `metrics_anchor=LAYER` 쌍의 layer 행 평균이다.
+  - **기준값**: P·U 기준(`p_floor`, `u_floor`)은 축마다 같은 계열 쌍의 유효 값에서 보정한다(기본 최솟값, `--floor-quantile` 이면 lower index). 같은 계열의 유효 값이 1개 이상이면 전체 기준을 만들고, 군 안에 유효 값이 `min_group_pairs`(3) 개 이상이면 군별 기준도 만든다. 보정할 값이 없는 축은 `no same-lineage pair with a valid axis_p value to calibrate with; pass --judge-floor-p` 처럼 그 축의 `--judge-floor-<축>` 을 요구한다. 우선순위: ① `--floor-json`(증분)이 있으면 저장값만 쓴다. ② `--judge-floor-p`/`-u` 는 축별로 따로 줄 수 있고 그 축의 전체 기준을 덮으며 그 축은 군별 기준을 만들지 않는다. ③ 나머지 축은 보정한다. 기존 `similarity` 기준은 계산되면 기록하되 같은 계열이 없어도 요구하지 않는다.
+  - **판정표**: 같은 계열 쌍은 크기와 관계없이 `similar`(`same_lineage`)다. 다른 계열 쌍의 초기 tier 는 **P 로 정하고 U 는 사유만 가른다.** 그 뒤 기존 그룹 cap(`cross_group_capped`)을 적용한다. 경계는 정확한 십진 비교다(`P = p_floor − margin` 은 unknown 이고 그보다 작아야 different).
+
+    | 조건(다른 계열 쌍) | tier | reason | `judge_case` |
+    |---|---|---|---|
+    | P 빈칸 | unknown | `no_pattern_value` | 빈칸 |
+    | P < `p_floor − margin` (G-size 지원 범위 안, 또는 크기 같음) | different | `below_pattern_floor` | 2 |
+    | P < `p_floor − margin` 이고 크기 다름이며 지원 범위 밖 | unknown | `size_differs_out_of_support` | 3 |
+    | `p_floor − margin` ≤ P < `p_floor` | unknown | `near_boundary` | 빈칸 |
+    | P ≥ `p_floor`, U 빈칸 | unknown | `pattern_same_usage_unknown` | 빈칸 |
+    | P ≥ `p_floor`, U < `u_floor` | unknown | `pattern_same_usage_differs` | 1 |
+    | P ≥ `p_floor`, U ≥ `u_floor` | unknown | `close_to_same_lineage` | 크기 다름이면 3, 같으면 빈칸 |
+
+    `judge_case` 는 그 쌍이 어느 경우였는지 남긴다(1 = 패턴은 같고 사용이 다름, 2 = 패턴이 달라 different, 3 = 크기만 다름). cap 으로 unknown 이 된 쌍은 `judge_case` 를 비우고 summary 의 `judge.cases.case_2_capped` 로 센다.
+  - **G-size**(`JUDGE_SIZE_SUPPORT_PX = 7`): 크기가 다른 쌍에서 P 는 정렬이 `LAYER` 이고 `max(|size_delta_unit_px_y|, |size_delta_unit_px_x|) ≤ 7` 일 때만 믿는다(T2 측정). 지원 범위 밖(`metrics_anchor ≠ LAYER` 이거나 |ΔU| > 7)이면 P 가 낮아도 `different` 로 두지 않고 `unknown`/`size_differs_out_of_support` 로 둔다. 크기가 같은 쌍과 같은 계열 쌍에는 영향이 없다.
+  - **새 출력**(three-axis 에서만): `scores.csv` 끝에 열 11개 `axis_p, axis_p_layer, axis_u, size_ratio_y, size_ratio_x, size_delta_unit_px_y, size_delta_unit_px_x, size_tag, judge_case, judge_p_floor, judge_u_floor`. `summary.json` 의 `judge`(`schema: dl1_judge_v1`, `mode`, `margin`, `quantile`, `p`·`u`(`global`, `per_group`, `source`: `calibrated`|`explicit`, `n_values`), `cases`(`case_1`, `case_2`, `case_2_capped`, `case_3`, `size_differs_out_of_support`), `auc`(`axis_p`, `axis_u`, `n_pairs_with_value`)). 새 reason 은 위 표의 `below_pattern_floor`, `pattern_same_usage_differs`, `pattern_same_usage_unknown`, `no_pattern_value`, `size_differs_out_of_support` 다. unknown 쌍 중 `close_to_same_lineage`·`near_boundary`·`pattern_same_usage_differs`·`size_differs_out_of_support`·`pattern_same_usage_unknown`·`no_pattern_value` 는 검토 목록에 들어간다.
+  - **review.html**: 카드 ② 줄 아래에 둘째 줄(`P … (기준 …) · U … (기준 …) · S 비율 크기 다름/같음 · 경우 N → 판정`)이 생긴다. 분포에 `axis_p`·`axis_u` 행(기준 선 포함)이, 전체 표에 P·U·경우 열이 더해진다. 위쪽에 판정 모드와 G-size 안내가 붙는다.
+  - **legacy 는 바이트 불변**: 기본 실행(또는 `--judge legacy`)의 다섯 출력은 세 축 기능이 없던 때와 바이트 동일하다. 새 열·키·reason·HTML 요소는 three-axis 에서만 나온다.
+  - **한계**: ΔU 가 8 px 이상이거나 Layer 정렬이 없는 크기 차 쌍은 G-size 로 `unknown` 이 된다. 크기가 다르고 실제로 다른 제품인 쌍이 `different` 에서 빠지므로 negative 가 줄 수 있다. 몇 쌍이 그렇게 빠졌는지는 `judge.cases.size_differs_out_of_support` 로 확인한다. T2 측정(합성 제품, `scripts/measure_unit_stretch.py`) 요약: LAYER 정렬에서 ΔU 0–7 px 은 P 하락이 최대 0.015 였다. 기존(anchor) 정렬은 ΔU 5–7 px 의 일부 위상에서 P 가 1.0 에서 0.93–0.95 로 떨어져 `different` 가 됐다. ΔU 12 px 이상은 두 경로 모두 대부분 `different` 로 밀렸다.
 - 이 값은 정답이 아니라 판단을 돕는 지표다. 검토 자료를 보고 확정한 쌍을 `relations.csv`에 직접 고쳐 넣는다. `summary.json`의 `separation_auc_same_vs_other_lineage`는 유사도, 전극 사용 일치도, 형상 중 무엇이 계열을 잘 가르는지 보여 준다(1에 가까울수록 잘 갈림).
 - 같은 계열이 1개뿐이어서 기준을 못 잡으면 `--floor`로 직접 정한다. 점수는 나중에 정도(degree)를 쓰는 학습으로 넘어갈 때 다시 계산하지 않도록 `scores.csv`에 모두 남는다.
 
@@ -774,7 +796,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 | `METADATA` | 모델별 `lineage_id`·`design_version`(metadata JSON 내용) |
 | `STACK_ORDER` | 층 순서 dict 또는 `None`(`None` 이면 CNT 는 이미지로만 내보낸다) |
 | `SPLIT_SEED`, `VALIDATION_FRACTION`, `TEST_FRACTION` | 자동 split 설정(기본 0, 0.2, 0.2) |
-| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`). `--out`·`--manifest`·`--split`·`--partitions`·`--bindings-out` 는 약어(`--partition` 등)까지 쓰지 않는다(쓰면 시작 전에 멈춤). `--floor` 는 전체 이름으로만 쓴다. `["--floor-quantile", "0.2"]` 처럼 train 의 floor 를 같은 계보 유사도의 분위수(lower index)로 계산하게 할 수 있다(공백형과 `--floor-quantile=0.2` 형 모두). 이 인자는 **train 구획에만** 전달하고 test 구획은 계산된 train floor 를 쓴다. `--floor`·`--floor-json` 과 함께 쓰거나 약어(`--floor-q` 등)로 쓰면 시작 전에 멈춘다. `ROUND >= 2` 에서는 쓸 수 없어 멈춘다(floor 는 r01 값 고정) |
+| `SCREEN_ARGS` | `screen_relations` 추가 인자(예: `["--groups", "/data/groups.json"]`). `--out`·`--manifest`·`--split`·`--partitions`·`--bindings-out` 는 약어(`--partition` 등)까지 쓰지 않는다(쓰면 시작 전에 멈춤). `--floor` 는 전체 이름으로만 쓴다. `["--floor-quantile", "0.2"]` 처럼 train 의 floor 를 같은 계보 유사도의 분위수(lower index)로 계산하게 할 수 있다(공백형과 `--floor-quantile=0.2` 형 모두). 이 인자는 **train 구획에만** 전달하고 test 구획은 계산된 train floor 를 쓴다. `--floor`·`--floor-json` 과 함께 쓰거나 약어(`--floor-q` 등)로 쓰면 시작 전에 멈춘다. `ROUND >= 2` 에서는 쓸 수 없어 멈춘다(floor 는 r01 값 고정). 세 축 판정(6.2b)은 `["--judge", "three-axis"]`(또는 `--judge=three-axis`)로 켜고 `--judge-floor-p`·`--judge-floor-u` 는 정확한 이름(공백형·`=` 형)으로만 쓴다. `--margin` 은 전체 이름으로만 쓴다 |
 
 **psdl1_train.py** — 시작할 때 `WORK/export/manifest.json`, `WORK/inputs/split.json`, `WORK/relations/relations.csv` 가 없으면 "psdl1_assets.py 를 먼저 실행" 오류로 멈춘다. 순서: (a) `PRETRAIN` 이면 `pretrain` → `WORK/pretrain/` → (b) `WORK/train/dl1.pt` 가 있으면 멈춤(이 확인은 pretrain 보다 먼저 한다) → (c) `train` → `WORK/train/`(사전학습했으면 `--weights WORK/pretrain/backbone.pt` 자동) → (d) `EVALUATE` 이고 split 에 **test** 제품이 있으면 `evaluate` → `WORK/train/evaluation.json`(`evaluate` 는 test 구획만 쓴다. test 가 없으면 이유를 로그에 남기고 건너뜀). `WORK/train/` 을 옮기면 평가 결과도 함께 움직인다.
 
@@ -807,6 +829,13 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 
 **relations 기준값**: held-out(test)이 train 라벨의 기준(floor)에 섞이지 않도록 train 구획의 global floor 를 먼저 구하고, test 구획은 그 값을 `--floor` 로 받아 판정한다. `--groups` 를 쓰면 group 별 floor 는 train 안에서만 쓰이고 test 로 넘어가지 않는다(`--floor` 를 주면 `screen_relations` 가 group floor 를 계산하지 않는다). train 구획에 같은 계보 쌍이 없으면 `SCREEN_ARGS` 에 `--floor <값>` 이 필요하다. `SCREEN_ARGS` 에 `--floor` 가 있으면 두 구획에 같은 값을 쓴다. `SCREEN_ARGS` 에 `--floor-quantile` 이 있으면 train 의 global floor(그리고 `--groups` 의 group floor)를 그 분위수로 계산하고, test 는 계산된 global floor 를 `--floor` 로 받는다. validation 은 train·evaluate 가 쓰지 않으므로 스크리닝하지 않는다.
 
+**세 축 판정(`--judge three-axis`)과 실행기**
+- **인수 식별**: 실행기는 `--judge`, `--judge-floor-p`, `--judge-floor-u` 를 정확한 이름으로 먼저 읽는다. 이 셋 중 하나의 접두어인 토큰(`--jud`, `--judge-floor`, `--judge-f` 등)은 `SCREEN_ARGS has <토큰>: write the full name (--judge, --judge-floor-p or --judge-floor-u)` 로 멈춘다. `--judge` 값이 `legacy`·`three-axis` 가 아니면 `SCREEN_ARGS has --judge <값>: choose from legacy, three-axis`, `--judge-floor-*` 값이 0~1 이 아니면 `SCREEN_ARGS has <이름> <값>: a number in [0, 1] is required` 로 멈춘다.
+- **`--margin` 약어**: 증분 기준 검사가 `--margin` 값을 읽어야 하므로 `--margin` 의 약어(`--mar` 처럼 5자 이상)는 모든 ROUND 에서 `SCREEN_ARGS has <토큰>: write the full name --margin` 으로 멈춘다. legacy 도 같다.
+- **조합 검사**: `--judge-floor-p`·`--judge-floor-u` 를 `--judge three-axis` 없이 쓰면 `SCREEN_ARGS has --judge-floor-p or --judge-floor-u without --judge three-axis`, `--floor-json` 과 함께 쓰면 `… together with --floor-json: use only one` 로 멈춘다. `ROUND >= 2` 에서는 `SCREEN_ARGS must not contain --judge-floor-p or --judge-floor-u: ROUND >= 2 always uses the round-1 criteria …` 로 멈춘다.
+- **test 구획에 넘기는 값**: train 구획이 끝나면 실행기가 train summary 의 `judge.p.global`·`judge.u.global` 을 test 구획에 `--judge-floor-p`·`--judge-floor-u` 로 넘긴다(사용자가 준 축과 `--floor-json` 이 있으면 넘기지 않는다). train 의 similarity floor(`floor.global`)가 있고 `SCREEN_ARGS` 에 사용자 floor 가 없을 때만 `--floor` 도 넘긴다. `--floor-quantile` 은 test 에 넘기지 않는다. 그래서 같은 계보가 train 에 없어도(similarity floor 없음) 다섯 출력이 만들어지고 report 는 floor 를 "—" 로 쓴다.
+- **재사용 전 검사**: `relations/relations.csv` 나 구획 결과를 건너뛰기 **전에** 기존 summary 의 판정 모드(`judge` 유무)와 고정 기준(`judge.p.global`, `judge.u.global`, `judge.margin`, `judge.quantile`)을 이번 요청과 비교한다. 다르면 파일을 지우지 않고 `<summary 경로> was made with the legacy judge, but this run asks for three-axis. The files are kept; restore SCREEN_ARGS, or move <relations 폴더> away (and any later rounds built on it) to switch modes` 같은 문구로 멈춘다(기준값이 다를 때는 `has judge.margin = 0.05, but this run fixes 0.1` 처럼 값을 보인다). three-axis 요청인데 구획 폴더의 summary 가 없거나 깨졌으면 `… is missing or unreadable, so its judge mode cannot be checked. The files are kept; …` 로 멈춘다. legacy → three-axis 재실행과 그 반대, train 만 끝난 경우, 전부 끝난 경우 모두 이 검사를 거친다.
+
 학습 파일은 CUDA 를 확인하지 않는다. 얇은 선 경고를 승인했다면 `TRAIN_ARGS` 에 `"--allow-grid-check-failure"` 를 넣는다.
 
 ### 6.8 증분 라운드 (새 제품만 더하는 학습)
@@ -819,6 +848,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 - 앞 라운드의 split 배정은 바뀌지 않는다. 새 제품만 배정한다. 같은 계보(lineage)의 옛 제품이 있으면 그 구획으로 간다. 새 계보는 목표 비율에 맞춰 validation/test/train 에 나눈다.
 - 새 제품이 낀 쌍(새×새, 새×기존)만 스크리닝한다. 기존×기존 쌍은 앞 라운드 결과를 쓴다.
 - 판정 기준(floor)은 r01 train 구획의 `relations.csv.summary.json` 값으로 고정한다. 라운드마다 다시 계산하지 않는다.
+- **세 축 판정(`--judge three-axis`)은 r01 부터 켠다.** r01 의 판정 모드가 이후 라운드의 모드를 정한다. 라운드 ≥ 2 는 r01 summary 의 `judge` 블록(P·U 기준, `margin`, `quantile`)을 그대로 쓰고 다시 보정하지 않는다. 증분 스크리닝은 `--floor-json` 이 필수다.
 - 학습은 앞 라운드 `dl1.pt` 에서 이어 배운다(warm start). epoch 는 짧게, 학습률은 낮게 준다. 옛 관계는 모두 다시 학습한다(full replay). `NEW_EDGE_REPEAT` 로 새 negative 쌍을 더 자주 보게 할 수 있다.
 - 라운드 k 의 `relations.csv` 는 라운드 k-1 의 합친 `relations.csv`(사용자 수정 포함)를 **바이트 그대로 앞에** 두고 이번 라운드 delta 행을 뒤에 붙인 파일이다.
 
@@ -850,6 +880,7 @@ PNG 에서 학습까지 전 과정을 `.py` 파일 3개로 나눠 실행한다. 
 
 - `psdl1_assets.py`: `PNG_ROOT` 와 `METADATA` 에 **새 모델만** 적는다. 옛 모델 ID 를 다시 적으면 병합이 중복 ID 로 거부한다. `GRID`·`STACK_ORDER` 는 앞 라운드와 같아야 한다(병합은 `candidate_grid`·`cnt_mode`·`schema_version` 이 다르면 거부한다). `SPLIT_SEED`·`VALIDATION_FRACTION`·`TEST_FRACTION` 은 새 계보의 배정에만 쓰인다.
 - `SCREEN_ARGS`: `--floor`(전체·`=` 형태·약어 모두)를 쓸 수 없다(`--floor-json` 을 실행기가 r01 summary 로 채운다). `--base-split`·`--base-relations`·`--floor-json` 도 쓰지 않는다. 라운드 1 이하(`None`, `1`)는 지금과 같이 `--floor` 를 쓸 수 있다.
+- `SCREEN_ARGS`(판정 모드): 라운드 ≥ 2 에서 `--judge` 를 생략하면 r01 summary 의 모드를 잇고 로그에 `--judge is not in SCREEN_ARGS: inheriting three-axis from round 1 (<summary>)` 를 남긴다. r01 과 다른 값을 쓰면 `SCREEN_ARGS has --judge <값>, but round 1 was made with the <모드> judge (<summary>). The judge mode is fixed in round 1: use --judge <모드> (or omit it), or start over from a new WORK` 로 멈춘다. `--judge-floor-p`·`--judge-floor-u`·`--floor-quantile` 은 쓸 수 없다(r01 기준 고정). `--margin` 을 주면 r01 에 저장된 값과 같아야 하고, 다르면 `margin differs from the base round summary` 로 거부한다.
 - `psdl1_train.py`: 아래 세 값은 라운드 ≥ 2 에서만 쓴다. `ROUND_EPOCHS`·`WARM_START_LR` 가 `None` 이면 `TRAIN_ARGS` 의 `--epochs`·`--lr` 를 그대로 쓴다.
 
 | 항목 | 기본 | 뜻 |
@@ -895,6 +926,7 @@ mv "$WORK/inputs" "$WORK/export" "$WORK/reports" "$WORK/relations" "$WORK/train"
 - `evaluation.json` 은 경로가 아니라 체크포인트 해시(`checkpoint_weights_hash`)로 `dl1.pt` 와 맞춘다. 같이 옮겨도 계속 유효하다.
 - 평면 WORK 로 학습한 `dl1.pt` 에는 `round` 기록이 없다. 실행기는 `round` 기록이 없는 부모를 받아 준다. 기록이 있는데 `k-1` 이 아니면 멈춘다.
 - `WORK/logs/` 는 옮기지 않아도 된다.
+- 옮긴 r01 이 legacy 판정인데 세 축 판정을 쓰려면 r01 의 `relations/` 를 다른 이름으로 옮기고 `SCREEN_ARGS` 에 `--judge three-axis` 를 넣어 `ROUND = 1` 로 `psdl1_assets.py` 를 다시 실행한다. export 는 재사용되고 relations 만 다시 만들어진다. 옮기지 않고 실행하면 재사용 전 검사(6.7)가 모드 불일치로 멈춘다. 라운드 ≥ 2 를 이미 만들었다면 그 라운드도 새로 만들어야 한다.
 
 #### 중단과 복구
 
@@ -984,6 +1016,8 @@ R1=$WORK/rounds/r01; R2=$WORK/rounds/r02
 - 증분 스크리닝의 그룹(`--groups`) 간 `different` 쌍 상한(`--cross-group-fraction`)은 **delta 쌍만으로** 계산한다. 앞 라운드의 쌍 수는 세지 않는다.
 - 라운드 비교는 쿼리별로 두 `evaluation.json` 을 맞춘다. 이전 체크포인트를 새 데이터로 다시 평가하지 않는다. 라운드마다 후보 풀이 커지므로 recall 하락이 모두 망각은 아니다. 쿼리마다 후보 수가 같이 기록되고, 경고(`possible_forgetting`, `candidate_pool_grew`, `same_input_hash`, `queries_lost_metric`, `queries_missing_from_current`)를 먼저 읽는다.
 - 모델 설정(`GRID`, backbone, `use_unit_size`, `model_kwargs`)은 부모와 같아야 한다. 다르면 학습이 optimizer 전에 거부한다.
+- 세 축 판정(`--judge three-axis`)의 증분은 r01 train summary 를 `--floor-json` 으로 줘야 한다(없으면 `three-axis incremental screening needs --floor-json (round 1 criteria)`). legacy 증분의 `--floor` 로는 쓸 수 없다. 모드와 기준(P·U·`margin`)은 r01 에서 고정되어 라운드 ≥ 2 에서 바꿀 수 없다.
+- 세 축 판정의 G-size 한계(ΔU 8 px 이상, Layer 없는 크기 차 쌍은 `size_differs_out_of_support` 로 unknown)는 증분의 `layer_missing` 쌍에도 적용된다. 개수는 summary 의 `judge.cases.size_differs_out_of_support` 로 확인한다(6.2b).
 - `screen_relations` 의 `--flo` 는 `--floor` 와 `--floor-json` 에 모두 맞아 argparse 가 모호하다며 거부한다. 전체 이름을 쓴다.
 - 병합 묶음의 `--verify` 는 hash 무결성과 manifest 전체 검증이다. `import_png` 의 진단 증거(`import-report.json`)는 병합본에 없다. 자세한 뜻은 `docs/data_contract.md` 의 Merged round bundles 에 있다.
 
