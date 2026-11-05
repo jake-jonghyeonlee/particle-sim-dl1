@@ -32,8 +32,14 @@ def pair(a, b, u=0.95, anchor="LAYER", delta=38):
             "tile_status": "not_run", "judge_size_u_floor": U_FLOOR}
 
 
+def frame_center(sa, sb):
+    """compare·layer 정렬이 두 프레임 중심을 맞출 때의 이동(screen() 이 judge_tile_stage 에 넘기는 shifts 의 기준)."""
+    return ((sa["shape"][0] - sb["shape"][0]) // 2, (sa["shape"][1] - sb["shape"][1]) // 2)
+
+
 def stage(pairs, signatures, shifts=None, **size):
-    shifts = {(p["product_a"], p["product_b"]): (0, 0) for p in pairs} if shifts is None else shifts
+    """shifts 를 안 주면 두 프레임의 중심 정렬 이동(= 원점 이동 0)을 쓴다."""
+    shifts = {(p["product_a"], p["product_b"]): frame_center(signatures[p["product_a"]], signatures[p["product_b"]]) for p in pairs} if shifts is None else shifts
     sr.judge_tile_stage(pairs, signatures, shifts, {**SIZE, **size}, MARGIN_V)
     return pairs
 
@@ -45,7 +51,7 @@ def verdict_of(p):
 # ---- 같은 설계에서 간격만 늘린 쌍 ----------------------------------------------------------------------------------------
 @pytest.mark.parametrize("layered", [True, False])
 def test_stretched_same_design_is_tiled_and_not_different(layered):
-    sa, sb = product(480, DESIGN), product(518, DESIGN)  # ΔU 38 px, CD 고정
+    sa, sb = product(560, DESIGN), product(598, DESIGN)  # ΔU 38 px, CD 고정
     if layered:
         sa, sb = with_layers(sa), with_layers(sb)
     p = stage([pair("A", "B", anchor="LAYER" if layered else "CNT")], {"A": sa, "B": sb})[0]
@@ -54,11 +60,11 @@ def test_stretched_same_design_is_tiled_and_not_different(layered):
     assert p["tile_p"] >= 0.95 and p["tile_p"] > single
     assert p["tier"] != "different" and p["reason"] in {"close_to_same_lineage", "near_boundary_tiled"}
     assert p["axis_p_eff"] == p["tile_p"] and p["axis_p"] == 0.2  # 판정은 tile_p, scores 의 axis_p 는 단일 P 그대로
-    assert p["tile_count"] > 4 and p["tile_size_y_cells"] == 12
+    assert p["tile_count"] > 4 and p["tile_size_y_cells"] == 7
 
 
 def test_layer_anchor_without_common_layers_falls_back_to_bindings():
-    sa, sb = product(480, DESIGN), product(518, DESIGN)
+    sa, sb = product(560, DESIGN), product(598, DESIGN)
     sa["layers"], sb["layers"] = {"X": {"mask": sa["rasters"][KEYS[0]]["mask"]}}, {"Y": {"mask": sb["rasters"][KEYS[0]]["mask"]}}
     p = stage([pair("A", "B")], {"A": sa, "B": sb})[0]
     assert p["tile_source"] == "binding" and p["tile_status"] == "ok"
@@ -67,7 +73,7 @@ def test_layer_anchor_without_common_layers_falls_back_to_bindings():
 
 
 def test_binding_source_includes_cnt_but_p_keys_do_not():
-    sa, sb = product(480, DESIGN), product(518, DESIGN)
+    sa, sb = product(560, DESIGN), product(598, DESIGN)
     for sig in (sa, sb):
         sig["rasters"][sr.CNT] = {"mask": np.zeros_like(sig["valid"])}
     sources_, source, keys = sr.tile_inputs(sa, sb, "CNT")
@@ -78,7 +84,7 @@ def test_binding_source_includes_cnt_but_p_keys_do_not():
 @pytest.mark.parametrize("seed", [11, 21, 31])
 def test_different_pattern_never_becomes_close(seed):
     other = {KEYS[0]: design(seed), KEYS[1]: design(seed + 1)}
-    sa, sb = with_layers(product(480, DESIGN)), with_layers(product(518, other))
+    sa, sb = with_layers(product(560, DESIGN)), with_layers(product(598, other))
     p = stage([pair("A", "B")], {"A": sa, "B": sb})[0]
     assert p["tile_p"] is None or p["tile_p"] < 0.40
     assert p["reason"] in {"size_differs_out_of_support", "size_differs_below_pattern_floor_tiled"} and p["tier"] in {"different", "unknown"}
@@ -87,12 +93,12 @@ def test_different_pattern_never_becomes_close(seed):
 
 
 def test_tile_failure_statuses_keep_unknown_out_of_support_and_tell_the_cause():
-    sa, sb = product(480, DESIGN), product(518, DESIGN)
-    far = product(560, DESIGN)  # ΔU 80 px > 60
-    p = stage([pair("A", "B", delta=80)], {"A": sa, "B": far})[0]
+    sa, sb = product(560, DESIGN), product(598, DESIGN)
+    far = product(642, DESIGN)  # ΔU 82 px > 지원 상한 40
+    p = stage([pair("A", "B", delta=82)], {"A": sa, "B": far})[0]
     assert p["tile_status"] == "out_of_support" and p["tile_p"] is None and verdict_of(p) == ("unknown", "size_differs_out_of_support", 3)
     assert p["axis_p_eff"] == 0.2
-    tiny = product(480, DESIGN)
+    tiny = product(560, DESIGN)
     tiny["full_shape"] = (900, 900)
     q = stage([pair("A", "B")], {"A": tiny, "B": sb})[0]
     assert q["tile_status"] == "geometry_unsupported" and verdict_of(q) == ("unknown", "size_differs_out_of_support", 3)
@@ -100,7 +106,7 @@ def test_tile_failure_statuses_keep_unknown_out_of_support_and_tell_the_cause():
 
 # ---- 대상이 아닌 쌍·cap ---------------------------------------------------------------------------------------------
 def test_pairs_that_are_not_not_run_are_untouched():
-    sigs = {"A": product(480, DESIGN), "B": product(518, DESIGN)}
+    sigs = {"A": product(560, DESIGN), "B": product(598, DESIGN)}
     below, other = pair("A", "B", u=0.5), pair("A", "B")
     below.update(tile_status="usage_below_floor", tier="different", reason="size_differs_usage_below_floor", judge_case=2)
     other["tile_status"] = "not_candidate"
@@ -110,7 +116,7 @@ def test_pairs_that_are_not_not_run_are_untouched():
 
 
 def test_cap_tiles_the_highest_u_first_and_marks_the_rest_capped():
-    sigs = {n: product(u, DESIGN) for n, u in (("A", 480), ("B", 518), ("C", 520))}
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600))}
     low, high = pair("A", "B", u=0.8), pair("A", "C", u=0.99)
     stage([low, high], sigs, max_pairs=1)
     assert high["tile_status"] == "ok" and low["tile_status"] == "capped"
@@ -118,32 +124,58 @@ def test_cap_tiles_the_highest_u_first_and_marks_the_rest_capped():
 
 
 def test_cap_ties_break_on_product_names():
-    sigs = {n: product(u, DESIGN) for n, u in (("A", 480), ("B", 518), ("C", 520))}
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600))}
     first, second = pair("A", "B", u=0.9), pair("A", "C", u=0.9)
     stage([second, first], sigs, max_pairs=1)  # 입력 순서와 상관없다
     assert first["tile_status"] == "ok" and second["tile_status"] == "capped"
 
 
 def test_max_pairs_zero_leaves_everything_not_run():
-    sigs = {n: product(u, DESIGN) for n, u in (("A", 480), ("B", 518))}
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598))}
     p = stage([pair("A", "B")], sigs, max_pairs=0)[0]
     assert p["tile_status"] == "not_run" and p.get("tile_p") is None and "tile_source" not in p and verdict_of(p) == ("unknown", "size_differs_out_of_support", 3)
 
 
 # ---- shift 약속 ----------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("shift", [(0, 0), (3, -2), (-4, 5)])
-def test_shift_promise_is_b_origin_to_a_origin(shift):
-    """B[y, x] == A[y + dy, x + dx] (roi_box·compare·layer 정렬과 같은 약속)인 쌍에서 같은 shift 를 주면 tile_p 가 1 이다."""
-    sa = product(480, DESIGN)
+def test_tile_module_takes_the_origin_shift(shift):
+    """tile_pattern_axis 의 shift 는 원점 이동이다: B[y, x] == A[y + dy, x + dx] 인 같은 크기 쌍에 같은 shift 를 주면 tile_p 가 1 이다."""
+    sa = product(560, DESIGN)
     sb = {**sa, "rasters": {k: {"mask": np.roll(r["mask"], (-shift[0], -shift[1]), axis=(0, 1))} for k, r in sa["rasters"].items()}}
     out = st.tile_pattern_axis(sa, sb, shift, sources(sa, sb), KEYS)
     assert out["tile_status"] == "ok" and out["tile_p"] >= 0.99
-    p = stage([pair("A", "B", delta=0)], {"A": sa, "B": sb}, shifts={("A", "B"): shift})[0]
-    assert p["tile_p"] >= 0.99
     # 부호를 뒤집으면 탐색 반경 밖이라 맞지 않는다: 약속이 방향까지 의미가 있다
     flipped = st.tile_pattern_axis(sa, sb, (-shift[0], -shift[1]), sources(sa, sb), KEYS)
     if max(abs(shift[0]), abs(shift[1])) > 2:
         assert flipped["tile_p"] is None or flipped["tile_p"] < 0.99
+
+
+@pytest.mark.parametrize("size_b,residual", [(560, (0, 0)), (560, (3, -2)), (598, (0, 0)), (598, (2, -1)), (578, (-2, 1))])
+def test_judge_tile_stage_converts_the_frame_center_shift_to_the_origin_shift(size_b, residual):
+    """screen() 이 넘기는 shifts 는 compare·layer 정렬의 프레임 중심 정렬 이동이다(크기가 다르면 원점 이동과 (A−B 래스터 shape)//2 만큼 다르다).
+    B 가 A 와 residual 만큼 어긋난 같은 설계(크기가 다를 수 있다)일 때, 중심 정렬 이동 + residual 을 주면 tile_p 가 높다."""
+    sa, sb = product(560, DESIGN), product(size_b, DESIGN)
+    sb = {**sb, "rasters": {k: {"mask": np.roll(r["mask"], (-residual[0], -residual[1]), axis=(0, 1))} for k, r in sb["rasters"].items()}}
+    center = frame_center(sa, sb)
+    assert (center != (0, 0)) == (size_b != 560)
+    shift = (center[0] + residual[0], center[1] + residual[1])
+    p = stage([pair("A", "B", delta=size_b - 560)], {"A": sa, "B": sb}, shifts={("A", "B"): shift})[0]
+    assert p["tile_status"] == "ok" and p["tile_p"] >= 0.95
+    if size_b != 560:  # 변환이 없었다면 원점 이동으로 center 가 들어가 맞지 않는다
+        assert st.origin_shift(sa, sb, shift) == residual
+        raw = st.tile_pattern_axis(sa, sb, shift, sources(sa, sb), KEYS)
+        assert raw["tile_p"] is None or raw["tile_p"] < p["tile_p"]
+
+
+def test_judge_tile_stage_passes_the_origin_shift_to_tile_pattern_axis(monkeypatch):
+    seen = []
+    original = st.tile_pattern_axis
+    monkeypatch.setattr(st, "tile_pattern_axis", lambda sa, sb, shift, *a, **k: seen.append(shift) or original(sa, sb, shift, *a, **k))
+    sa, sb = product(560, DESIGN), product(598, DESIGN)
+    center = frame_center(sa, sb)
+    assert center != (0, 0)
+    stage([pair("A", "B")], {"A": sa, "B": sb}, shifts={("A", "B"): (center[0] + 2, center[1] - 1)})
+    assert seen == [(2, -1)]
 
 
 def test_screen_uses_the_same_shift_as_the_selected_shift_of_the_report():
@@ -156,13 +188,13 @@ def test_screen_uses_the_same_shift_as_the_selected_shift_of_the_report():
 
 # ---- 결정성·통계 ---------------------------------------------------------------------------------------------------
 def test_same_input_gives_the_same_pairs():
-    sigs = {n: with_layers(product(u, DESIGN)) for n, u in (("A", 480), ("B", 518), ("C", 520))}
+    sigs = {n: with_layers(product(u, DESIGN)) for n, u in (("A", 560), ("B", 598), ("C", 600))}
     runs = [stage([pair("A", "B", u=0.8), pair("A", "C", u=0.99)], sigs, max_pairs=1) for _ in range(2)]
     assert runs[0] == runs[1]
 
 
 def test_stats_and_cases_match_the_scores_columns():
-    sigs = {n: product(u, DESIGN) for n, u in (("A", 480), ("B", 518), ("C", 520), ("D", 521))}
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600), ("D", 601))}
     pairs = [pair("A", "B", u=0.9), pair("A", "C", u=0.99), pair("A", "D", u=0.8)]
     below = pair("B", "C", u=0.5)
     below.update(tile_status="usage_below_floor", tier="different", reason="size_differs_usage_below_floor", judge_case=2)

@@ -1,10 +1,12 @@
 """unit 크기가 다른 제품 쌍을 tile 단위로 맞춰 패턴 점수 tile_p 를 낸다(스크리닝 전용, numpy 만 쓴다. screen() 에는 아직 연결하지 않는다).
 
 좌표·이동 약속은 screen_align 과 같다: 래스터 이동 (dy, dx) 에서 B[y, x] 가 A[y + dy, x + dx] 에 놓인다. 칸 = factor×factor 원본 px.
+이 모듈이 받는 shift 는 원점 이동(두 프레임의 원점 = unit 0 시작에서의 이동)이다. compare·layer 정렬의 이동은 프레임 중심을 맞춘 기준이라
+크기가 다른 쌍에서는 (A 래스터 shape − B 래스터 shape)//2 만큼 다르므로 origin_shift 로 바꿔서 넘긴다(screen_relations.judge_tile_stage).
 
 구조
   unit_geometry   축마다 U_px = (길이 − 1000)/2. 원본 px 경계 500, 500+U, 500+2U 를 한 번만 floor(px/factor) 로 양자화해 공유 경계 배열을 만든다.
-  tile_plan       ΔU(B−A)로 tile 폭 T, 탐색 반경 R, tile 목록을 정한다. 범위를 벗어나면 이유 상태를 돌려준다.
+  tile_plan       ΔU(B−A)로 tile 폭 T = U_min/(2·ΔU)(최소 7 칸), 탐색 반경(unit·tile 모두 3 고정), tile 목록을 정한다. ΔU 가 MAX_DELTA_U_PX(40) 를 넘거나 범위를 벗어나면 이유 상태를 돌려준다.
   match_tile      compare(layer_align) 규칙의 tile 매처: 고정 Ω, Dice 우선 층 순서, 모호함·낮은 점수·탐색 경계는 거부(→ 기하 예측으로 대체).
   align_tiles     unit 이동 → tile 이동 → G1(이웃 tile 단차 상자) 반복.
   warp_raster     tile 마다 B 를 그 이동으로 잘라 A 좌표에 놓는다.
@@ -26,9 +28,12 @@ from .screen_relations import boundary_f1
 FACTOR = 8
 TOLERANCE = 1
 MARGIN_PX = 500
-MAX_DELTA_U_PX = 60
+MAX_DELTA_U_PX = 40  # 지원 범위(합성 게이트 근거: scripts/measure_unit_stretch.py --tile). 이 위는 out_of_support
 S_MAX_CELLS = 2
-TILE_MIN_CELLS = 8
+TILE_MIN_CELLS = 7  # 게이트에서 확인한 가장 좁은 tile 폭(U 560, ΔU 40)
+TILE_DIVISOR = 2  # tile 폭 = U_min / (2·ΔU): tile 안 늘어남 차가 0.5 칸 이하
+UNIT_RADIUS_CELLS = 3  # 기하 예측이 정확해서 unit·tile 탐색 반경은 ΔU 와 무관한 작은 고정값(경계에 닿은 후보는 search_bound 로 거부하므로 실효 ±2)
+TILE_RADIUS_CELLS = 3
 MAX_TILES = 1024
 MIN_DICE = 0.3
 EPSILON = Fraction(1, 100)
@@ -36,6 +41,7 @@ COVERAGE_MIN = 0.9
 PRESENCE_FRACTION = 0.01
 MIN_SUPPORT_DIVISOR = 16
 MIN_SUPPORT_FLOOR = 4
+LAYER_SUPPORT_CAP = 16
 TILE_STATUSES = ("ok", "geometry_unsupported", "tile_too_small", "out_of_support", "too_many_tiles", "unit_align_failed", "low_coverage")
 
 
@@ -111,7 +117,7 @@ def unit_regions(geometry):
 def tile_plan(geometry_a, geometry_b, factor, tolerance):
     """tile 계획. factor ≠ 8 이거나 tolerance ≠ 1 이면 ValueError. 그 밖의 지원 밖은 status 로 돌려준다(tile_status 값).
 
-    키: status, delta_u_px (y, x; B−A), tile_cells (Ty, Tx 명목 폭), s_max_cells, radius_cells (Ry, Rx), units, tiles
+    키: status, delta_u_px (y, x; B−A), tile_cells (Ty, Tx 명목 폭), s_max_cells, radius_cells (tile 탐색 반경 Ry, Rx), unit_radius_cells (unit 탐색 반경), units, tiles
     (dict: unit_index, tile_index, region), geometry_a, geometry_b."""
     if factor != FACTOR or tolerance != TOLERANCE:
         raise ValueError(f"screen_tile supports only factor {FACTOR} and tolerance {TOLERANCE}, got factor={factor!r} tolerance={tolerance!r}")
@@ -123,7 +129,8 @@ def tile_plan(geometry_a, geometry_b, factor, tolerance):
     delta = tuple(geometry_b["u_px"][ax] - geometry_a["u_px"][ax] for ax in (0, 1))
     plan["delta_u_px"] = delta
     plan["units"] = unit_regions(geometry_a)
-    plan["radius_cells"] = tuple(-(-abs(delta[ax]) // factor) + 2 for ax in (0, 1))
+    plan["unit_radius_cells"] = (UNIT_RADIUS_CELLS, UNIT_RADIUS_CELLS)
+    plan["radius_cells"] = (TILE_RADIUS_CELLS, TILE_RADIUS_CELLS)
     if max(abs(delta[0]), abs(delta[1])) > MAX_DELTA_U_PX:
         plan["status"] = "out_of_support"
         return plan
@@ -132,7 +139,7 @@ def tile_plan(geometry_a, geometry_b, factor, tolerance):
         u_min_px = min(geometry_a["u_px"][ax], geometry_b["u_px"][ax])
         u_min_cells = min(g["bounds"][ax][k + 1] - g["bounds"][ax][k] for g in (geometry_a, geometry_b) for k in (0, 1))
         cap = u_min_cells // 2
-        t = cap if delta[ax] == 0 else min(u_min_px // abs(delta[ax]), cap)
+        t = cap if delta[ax] == 0 else min(u_min_px // (TILE_DIVISOR * abs(delta[ax])), cap)
         tile.append(t)
     plan["tile_cells"] = tuple(tile)
     if min(tile) < TILE_MIN_CELLS:
@@ -172,11 +179,23 @@ def _unit_prediction(plan, shift, q, axis_cells):
 # --------------------------------------------------------------------------- 매처
 
 def min_support_cells(region):
+    """고정 Ω 의 최소 칸 수(영역 면적 기반)."""
     y0, y1, x0, x1 = region
     return max(MIN_SUPPORT_FLOOR, ((y1 - y0) * (x1 - x0)) // MIN_SUPPORT_DIVISOR)
 
 
-def match_tile(layers, valid_a, valid_b, region, pred, radius, *, min_support, min_dice=MIN_DICE, epsilon=EPSILON):
+def min_layer_support_cells(region):
+    """층 전경의 최소 칸 수. 면적 기반 하한이되 screen_align 기본(ALIGN_MIN_SUPPORT 16)을 넘지 않는다: 큰 unit 의 가는 배선도 층으로 센다."""
+    return min(LAYER_SUPPORT_CAP, min_support_cells(region))
+
+
+def origin_shift(sa, sb, shift):
+    """screen() 의 이동(compare·layer 정렬: 두 프레임 중심을 맞춘 기준)을 tile 모듈이 쓰는 원점 이동(unit 0 시작에서의 이동)으로 바꾼다.
+    중심 정렬은 compare 의 center = (A 래스터 shape − B 래스터 shape)//2 이다."""
+    return tuple(int(shift[ax]) - (int(sa["shape"][ax]) - int(sb["shape"][ax])) // 2 for ax in (0, 1))
+
+
+def match_tile(layers, valid_a, valid_b, region, pred, radius, *, min_support, min_layer_support=None, min_dice=MIN_DICE, epsilon=EPSILON):
     """영역 하나의 이동을 기하 예측 pred ± radius 안에서 고른다(compare 규칙).
 
     layers: {이름: (A bool, B bool)} 래스터(같은 격자). 고정 Ω = 영역의 A valid ∧ 모든 후보 이동에서 B valid. Dice = 2I/(a+b)(Fraction),
@@ -187,6 +206,7 @@ def match_tile(layers, valid_a, valid_b, region, pred, radius, *, min_support, m
     ry, rx = int(radius[0]), int(radius[1])
     h, w = y1 - y0, x1 - x0
     out = {"applied": False, "delta": None, "reason": None, "omega_cells": 0, "dice": None, "layer": None}
+    layer_support = min_support if min_layer_support is None else min_layer_support
     omega = _crop(valid_a, y0, y1, x0, x1)
     wide = _crop(valid_b, y0 - py - ry, y1 - py + ry, x0 - px - rx, x1 - px + rx)
     cands = [(ey, ex) for ey in range(-ry, ry + 1) for ex in range(-rx, rx + 1)]
@@ -202,7 +222,7 @@ def match_tile(layers, valid_a, valid_b, region, pred, radius, *, min_support, m
         a_arr = _crop(la, y0, y1, x0, x1) & omega
         a = int(np.count_nonzero(a_arr))
         wb = _crop(lb, y0 - py - ry, y1 - py + ry, x0 - px - rx, x1 - px + rx)
-        if a < min_support or int(np.count_nonzero(wb[ry:ry + h, rx:rx + w] & omega)) < min_support:
+        if a < layer_support or int(np.count_nonzero(wb[ry:ry + h, rx:rx + w] & omega)) < layer_support:
             continue
         table = {}
         for ey, ex in cands:
@@ -280,12 +300,14 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
     if plan["status"] != "ok":
         raise ValueError(f"plan status is {plan['status']}")
     ry, rx = plan["radius_cells"]
+    uy_r, ux_r = plan["unit_radius_cells"]
     unit_shift, unit_failed, unit_center = {}, {}, {}
     for q in sorted(plan["units"]):
         y0, y1, x0, x1 = plan["units"][q]
         center = ((y0 + y1) // 2, (x0 + x1) // 2)
         pred = _unit_prediction(plan, shift, q, center)
-        res = match_tile(layers, valid_a, valid_b, plan["units"][q], pred, (ry, rx), min_support=min_support_cells(plan["units"][q]), min_dice=min_dice)
+        res = match_tile(layers, valid_a, valid_b, plan["units"][q], pred, (uy_r, ux_r), min_support=min_support_cells(plan["units"][q]),
+                         min_layer_support=min_layer_support_cells(plan["units"][q]), min_dice=min_dice)
         unit_center[q] = center
         if res["applied"]:
             unit_shift[q] = (pred[0] + res["delta"][0], pred[1] + res["delta"][1])
@@ -300,7 +322,8 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
         center = ((y0 + y1) // 2, (x0 + x1) // 2)
         pred = tuple(unit_shift[q][ax] + _geo_term(plan, ax, q[ax], center[ax]) - _geo_term(plan, ax, q[ax], unit_center[q][ax]) for ax in (0, 1))
         preds.append(pred)
-        res = match_tile(layers, valid_a, valid_b, t["region"], pred, (ry, rx), min_support=min_support_cells(t["region"]), min_dice=min_dice)
+        res = match_tile(layers, valid_a, valid_b, t["region"], pred, (ry, rx), min_support=min_support_cells(t["region"]),
+                         min_layer_support=min_layer_support_cells(t["region"]), min_dice=min_dice)
         reasons.append(res["reason"])
         applied.append(bool(res["applied"]))
         offsets.append((pred[0] + res["delta"][0], pred[1] + res["delta"][1]) if res["applied"] else pred)

@@ -712,7 +712,8 @@ def tile_inputs(sa, sb, metrics_anchor):
 def judge_tile_stage(pairs, signatures, shifts, size, margin):
     """1차 판정 뒤 tile_status == not_run 인 쌍(B 통과)에 tile 정렬을 돌려 tile_p 로 판정표를 다시 적용한다.
     (−U, product_a, product_b) 순으로 앞 max_pairs 개만 돌리고 나머지는 capped, max_pairs 0 이면 모두 not_run 으로 둔다.
-    shifts[(a, b)] = metrics_anchor 위치의 래스터 이동(B[y,x] → A[y+dy,x+dx]). screen_tile 약속과 같다."""
+    shifts[(a, b)] = metrics_anchor 위치의 래스터 이동(B[y,x] → A[y+dy,x+dx]). compare·layer 정렬처럼 두 프레임 중심을 맞춘 기준이므로
+    screen_tile 이 쓰는 원점 이동으로 바꿔서(screen_tile.origin_shift) 넘긴다."""
     from . import screen_tile  # screen_tile 이 이 모듈의 boundary_f1 을 가져오므로 늦게 가져온다
     if size["max_pairs"] == 0:
         return
@@ -723,7 +724,8 @@ def judge_tile_stage(pairs, signatures, shifts, size, margin):
             continue
         sa, sb = signatures[p["product_a"]], signatures[p["product_b"]]
         sources, source, binding_keys = tile_inputs(sa, sb, p["metrics_anchor"])
-        out = screen_tile.tile_pattern_axis(sa, sb, shifts[(p["product_a"], p["product_b"])], sources, binding_keys, factor=size["factor"], tolerance=size["tolerance"])
+        shift = screen_tile.origin_shift(sa, sb, shifts[(p["product_a"], p["product_b"])])
+        out = screen_tile.tile_pattern_axis(sa, sb, shift, sources, binding_keys, factor=size["factor"], tolerance=size["tolerance"])
         p.update(out)
         p["tile_source"] = source
         p["tier"], p["reason"], p["judge_case"] = judge_verdict(p["judge_axes"], p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,

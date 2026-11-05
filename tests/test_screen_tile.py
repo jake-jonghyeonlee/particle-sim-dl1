@@ -35,7 +35,7 @@ def product(u_px, designs):
                     y, x = y0 + int(round(fy * ly)), x0 + int(round(fx * lx))
                     m[y:y + h, x:x + w] = True
         rasters[key] = {"mask": m}
-    return {"rasters": rasters, "valid": np.ones((cells, cells), dtype=bool), "full_shape": (length, length), "factor": 8}
+    return {"rasters": rasters, "valid": np.ones((cells, cells), dtype=bool), "shape": (cells, cells), "full_shape": (length, length), "factor": 8}
 
 
 def sources(sa, sb):
@@ -72,13 +72,29 @@ def plan_of(ua, ub):
 
 
 def test_tile_width_follows_the_delta_u_and_limits():
-    p = plan_of(552, 590)
-    assert p["status"] == "ok" and p["tile_cells"] == (14, 14) and p["radius_cells"] == (7, 7) and p["s_max_cells"] == 2
-    assert plan_of(480, 540)["status"] == "ok" and plan_of(480, 540)["tile_cells"] == (8, 8)
-    assert plan_of(472, 532)["status"] == "tile_too_small"
+    p = plan_of(552, 590)  # M13·WF3 형: tile 폭 = U_min // (2·ΔU) = 552 // 76
+    assert p["status"] == "ok" and p["tile_cells"] == (7, 7) and p["s_max_cells"] == 2
+    assert p["radius_cells"] == (3, 3) and p["unit_radius_cells"] == (3, 3)  # 반경은 ΔU 와 무관한 고정값
+    assert plan_of(560, 600)["status"] == "ok" and plan_of(560, 600)["tile_cells"] == (7, 7)  # 지원 상한 ΔU 40
+    assert plan_of(552, 592)["status"] == "tile_too_small"  # 552 // 80 = 6 칸 < 7
+    assert plan_of(560, 601)["status"] == "out_of_support"
     assert plan_of(480, 541)["status"] == "out_of_support"
     same = plan_of(552, 552)
-    assert same["status"] == "ok" and same["tile_cells"] == (34, 34) and same["radius_cells"] == (2, 2)
+    assert same["status"] == "ok" and same["tile_cells"] == (34, 34) and same["radius_cells"] == (3, 3)
+
+
+def test_layer_support_is_capped_but_omega_support_follows_the_area():
+    big, small = (0, 125, 0, 125), (0, 20, 0, 20)
+    assert st.min_support_cells(big) == 976 and st.min_layer_support_cells(big) == 16  # 큰 unit 의 가는 배선도 층 전경으로 센다
+    assert st.min_support_cells(small) == 25 and st.min_layer_support_cells(small) == 16
+    assert st.min_support_cells((0, 6, 0, 6)) == 4 == st.min_layer_support_cells((0, 6, 0, 6))
+
+
+def test_origin_shift_removes_the_frame_center_alignment():
+    sa, sb = {"shape": (375, 375)}, {"shape": (385, 383)}
+    assert st.origin_shift(sa, sb, (-5, -4)) == (0, 0)  # 중심 정렬 이동 = (A − B)//2 = (−5, −4)
+    assert st.origin_shift(sa, sb, (-3, 1)) == (2, 5)
+    assert st.origin_shift(sa, sa, (3, -2)) == (3, -2)  # 같은 크기면 그대로
 
 
 def test_tile_plan_rejects_other_factor_or_tolerance():
@@ -91,9 +107,9 @@ def test_tile_plan_rejects_other_factor_or_tolerance():
 
 def test_too_many_tiles(monkeypatch):
     monkeypatch.setattr(st, "MAX_TILES", 100)
-    p = plan_of(480, 540)
+    p = plan_of(560, 600)
     assert p["status"] == "too_many_tiles" and p["tile_count"] > 100
-    sa, sb = product(480, DESIGN), product(540, DESIGN)
+    sa, sb = product(560, DESIGN), product(600, DESIGN)
     assert st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)["tile_status"] == "too_many_tiles"
 
 
@@ -119,17 +135,17 @@ def test_x3_same_product_tile_p_equals_single_shift_unit_p():
 
 
 def test_stretched_spacing_tile_p_is_high_and_beats_single_shift():
-    sa, sb = product(480, DESIGN), product(518, DESIGN)
+    sa, sb = product(560, DESIGN), product(598, DESIGN)
     out = st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)
     single = st.single_shift_unit_p(sa, sb, (0, 0), KEYS)
-    assert out["tile_status"] == "ok" and out["tile_size_y_cells"] == 12 and out["tile_count"] > 4
+    assert out["tile_status"] == "ok" and out["tile_size_y_cells"] == 7 and out["tile_count"] > 4
     assert out["tile_p"] >= 0.95 and out["tile_p"] > single
 
 
 @pytest.mark.parametrize("seed", [11, 21, 31, 41, 51, 61])
 def test_x4_different_pattern_stays_in_envelope_and_does_not_beat_single_p(seed):
     other = {KEYS[0]: design(seed), KEYS[1]: design(seed + 1)}
-    sa, sb = product(480, DESIGN), product(518, other)
+    sa, sb = product(560, DESIGN), product(598, other)
     out = st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)
     single = st.single_shift_unit_p(sa, sb, (0, 0), KEYS)
     ry, rx = out["tile_radius_y_cells"], out["tile_radius_x_cells"]
@@ -241,7 +257,7 @@ def test_unit_align_failed_when_no_unit_can_be_matched():
 
 
 def test_same_input_gives_the_same_output():
-    sa, sb = product(480, DESIGN), product(518, DESIGN)
+    sa, sb = product(560, DESIGN), product(598, DESIGN)
     first = st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)
     second = st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)
     assert first == second and "tile_seconds" not in first
