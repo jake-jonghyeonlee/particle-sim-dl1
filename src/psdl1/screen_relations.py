@@ -358,6 +358,16 @@ def original_area(ctx, item, side):
     return int(np.count_nonzero(mask if omega is None else mask & omega))
 
 
+def boundary_f1(a, b, omega, tolerance):
+    """Ω 안 두 마스크의 안쪽 경계 정밀도·재현율·F1(반올림 전 값). 어느 한쪽 경계가 비면 None."""
+    edge_a, edge_b = screen_align.inner_boundary(a, omega), screen_align.inner_boundary(b, omega)
+    if not (edge_a.any() and edge_b.any()):
+        return None
+    precision = np.count_nonzero(edge_a & dilate(edge_b, tolerance)) / np.count_nonzero(edge_a)
+    recall = np.count_nonzero(edge_b & dilate(edge_a, tolerance)) / np.count_nonzero(edge_b)
+    return precision, recall, 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+
+
 def metric_row(ctx, kind, key, item_a, item_b):
     """binding 하나의 지표 행(PLAN_v1.2 X4 표). 양쪽 모두 문턱에 못 미치면 None."""
     area_a, area_b = original_area(ctx, item_a, 0), original_area(ctx, item_b, 1)
@@ -383,12 +393,10 @@ def metric_row(ctx, kind, key, item_a, item_b):
     row["dice"] = round(2 * int(np.count_nonzero(a & b)) / (int(np.count_nonzero(a)) + int(np.count_nonzero(b))), 6)
     row["fill_f1"] = round(1.0 - float(tolerant_distance({"mask": a, "dilated": item_a["dilated"][ctx["a_slice"]] & omega},
                                                          {"mask": b, "dilated": item_b["dilated"][ctx["b_slice"]] & omega})), 6)
-    edge_a, edge_b = screen_align.inner_boundary(a, omega), screen_align.inner_boundary(b, omega)
-    if edge_a.any() and edge_b.any():
-        precision = np.count_nonzero(edge_a & dilate(edge_b, ctx["tolerance"])) / np.count_nonzero(edge_a)
-        recall = np.count_nonzero(edge_b & dilate(edge_a, ctx["tolerance"])) / np.count_nonzero(edge_b)
-        row.update(boundary_precision=round(float(precision), 6), boundary_recall=round(float(recall), 6),
-                   boundary_f1=round(float(0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)), 6))
+    edges = boundary_f1(a, b, omega, ctx["tolerance"])
+    if edges is not None:
+        precision, recall, f1 = edges
+        row.update(boundary_precision=round(float(precision), 6), boundary_recall=round(float(recall), 6), boundary_f1=round(float(f1), 6))
     return row
 
 
