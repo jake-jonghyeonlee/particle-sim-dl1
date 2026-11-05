@@ -4,6 +4,7 @@
 (rescale 하지 않는다). 공개 함수(product_signature, compare, layer_columns, pair_metric_rows, pair_axes)만 쓴다.
 
 실행: PYTHONPATH=$PWD/src python scripts/measure_unit_stretch.py [--unit 1000] [--phases 0-7] [--quick]
+dl1-size/T4·T4b: --tile 이면 tile 정렬 합성 게이트(같은 설계·거짓 일치 B′·지원 범위)를 잰다.
 """
 import argparse
 import math
@@ -13,9 +14,10 @@ from fractions import Fraction
 
 import numpy as np
 
-from psdl1 import screen_align
+from psdl1 import screen_align, screen_tile
 from psdl1.schema import Element, Product
-from psdl1.screen_relations import (block_reduce, compare, layer_columns, layer_item, pair_axes, pair_metric_rows, product_signature)
+from psdl1.screen_relations import (block_reduce, compare, judge_verdict, layer_columns, layer_item, pair_axes, pair_metric_rows, product_signature,
+                                    tile_inputs)
 
 UNIT = 1000
 MARGIN = 500
@@ -31,49 +33,98 @@ PATHS = ("anchor", "layer")
 LAYERS = ("M1", "M2", "M3")
 
 
-def fill(mask, y0, y1, x0, x1):
-    mask[max(0, int(y0)):max(0, int(y1)), max(0, int(x0)):max(0, int(x1))] = True
+def fill(mask, y0, y1, x0, x1, value=True):
+    mask[max(0, int(y0)):max(0, int(y1)), max(0, int(x0)):max(0, int(x1))] = value
 
 
-def draw_unit(m, oy, ox, uy, ux):
+# unit 안 배선·판·점의 위치 비율. 기본이 A 설계이고 MIXED 는 같은 요소를 다른 비율에 놓은 다른 패턴이다.
+POS = {"gate_y": (0.2, 0.6), "stub_x": 0.5, "data_x": (0.3, 0.7), "pixel": ((0.4, 0.5, 100), (0.8, 0.8, 60)), "cnt": ((0.2, 0.3), (0.6, 0.7))}
+MIXED = {"gate_y": (0.35, 0.75), "stub_x": 0.35, "data_x": (0.2, 0.8), "pixel": ((0.65, 0.3, 100), (0.25, 0.6, 60)), "cnt": ((0.45, 0.2), (0.8, 0.45))}
+VARIANTS = ("mixed", "half", "drift", "seam")  # 거짓 일치 검증의 다른 패턴 B′ 변형(build 의 variant 인수)
+DRIFT_BLOCK, DRIFT_REACH, DRIFT_STEP = 128, 16, 8  # px. 국소 이동은 block 마다 ±2 칸(16 px) 안에서 8 px(1 칸)씩 누적된다
+
+
+def draw_unit(m, oy, ox, uy, ux, pos=POS):
     """unit 하나(원점 oy, ox · 크기 uy × ux)의 배선. 위치는 unit 크기의 비율이고 선폭·패드는 고정이다."""
     r = lambda f, size: int(round(f * size))
-    for f in (0.2, 0.6):  # gate/M1: 가로 배선 + 왼쪽 패드
+    for f in pos["gate_y"]:  # gate/M1: 가로 배선 + 왼쪽 패드
         y = oy + r(f, uy)
         fill(m["gate/M1"], y, y + CD, ox + r(0.1, ux), ox + r(0.9, ux))
         fill(m["gate/M1"], y - 14, y + CD + 14, ox + r(0.1, ux), ox + r(0.1, ux) + 40)
-    x = ox + r(0.5, ux)  # gate/M2: 세로 stub
+    x = ox + r(pos["stub_x"], ux)  # gate/M2: 세로 stub
     fill(m["gate/M2"], oy + r(0.2, uy), oy + r(0.8, uy), x, x + CD)
-    for f in (0.3, 0.7):  # data/M2: 세로 배선 + 위쪽 패드
+    for f in pos["data_x"]:  # data/M2: 세로 배선 + 위쪽 패드
         x = ox + r(f, ux)
         fill(m["data/M2"], oy + r(0.1, uy), oy + r(0.9, uy), x, x + CD)
         fill(m["data/M2"], oy + r(0.1, uy), oy + r(0.1, uy) + 40, x - 14, x + CD + 14)
-    for (fy, fx, size) in ((0.4, 0.5, 100), (0.8, 0.8, 60)):  # pixel/M3: 고정 크기 판
+    for (fy, fx, size) in pos["pixel"]:  # pixel/M3: 고정 크기 판
         y, x = oy + r(fy, uy), ox + r(fx, ux)
         fill(m["pixel/M3"], y, y + size, x, x + size)
-    for (fy, fx) in ((0.2, 0.3), (0.6, 0.7)):  # CNT: 고정 크기 점
+    for (fy, fx) in pos["cnt"]:  # CNT: 고정 크기 점
         y, x = oy + r(fy, uy), ox + r(fx, ux)
         fill(m["cnt"], y - 4, y + 56, x - 4, x + 16)
 
 
-def build(name, uy, ux, offset=0):
-    """2×2 unit 제품. offset 은 내용을 프레임 안에서 (offset, offset) px 옮긴다(프레임 크기는 그대로 2*U+2*MARGIN)."""
+def draw_half(m, oy, ox, uy, ux):
+    """A 설계를 unit 안에서 반 unit 순환 이동한 다른 패턴(배선이 unit 경계에서 접혀 이어진다)."""
+    tmp = {k: np.zeros((uy, ux), dtype=bool) for k in m}
+    draw_unit(tmp, 0, 0, uy, ux)
+    for k in m:
+        m[k][oy:oy + uy, ox:ox + ux] |= np.roll(tmp[k], (uy // 2, ux // 2), axis=(0, 1))
+
+
+def seam(m, oy, ox, uy, ux):
+    """이음새 변형: unit 사이 버스를 3배 굵게 하고, 버스를 두 곳에서 끊는다(선폭과 연결이 A 와 다르다)."""
+    fill(m["gate/M1"], oy + uy - 18, oy + uy + 18, ox, ox + 2 * ux)
+    fill(m["data/M2"], oy, oy + 2 * uy, ox + ux - 18, ox + ux + 18)
+    for f in (0.5, 1.5):
+        fill(m["gate/M1"], oy + uy - 20, oy + uy + 20, ox + int(f * ux) - 12, ox + int(f * ux) + 12, False)
+        fill(m["data/M2"], oy + int(f * uy) - 12, oy + int(f * uy) + 12, ox + ux - 20, ox + ux + 20, False)
+
+
+def drift(m, seed=5):
+    """국소 이동 누적 변형: block 마다 모든 층을 같은 (dy, dx) 만큼 옮긴다. 이동은 이웃 block 과 한 걸음(1 칸)씩만 달라 ±2 칸을 넘지 않는다."""
+    rng = np.random.RandomState(seed)
+    shape = next(iter(m.values())).shape
+    padded = {k: np.pad(v, DRIFT_REACH) for k, v in m.items()}
+    out = {k: np.zeros_like(v) for k, v in m.items()}
+    dy = dx = 0
+    for y0 in range(0, shape[0], DRIFT_BLOCK):
+        for x0 in range(0, shape[1], DRIFT_BLOCK):
+            dy = int(np.clip(dy + DRIFT_STEP * rng.randint(-1, 2), -DRIFT_REACH, DRIFT_REACH))
+            dx = int(np.clip(dx + DRIFT_STEP * rng.randint(-1, 2), -DRIFT_REACH, DRIFT_REACH))
+            y1, x1 = min(y0 + DRIFT_BLOCK, shape[0]), min(x0 + DRIFT_BLOCK, shape[1])
+            for k in m:
+                out[k][y0:y1, x0:x1] = padded[k][DRIFT_REACH + y0 + dy:DRIFT_REACH + y1 + dy, DRIFT_REACH + x0 + dx:DRIFT_REACH + x1 + dx]
+    return out
+
+
+def build(name, uy, ux, offset=0, variant=None):
+    """2×2 unit 제품. offset 은 내용을 프레임 안에서 (offset, offset) px 옮긴다(프레임 크기는 그대로 2*U+2*MARGIN).
+    variant: None = A 설계, VARIANTS = 다른 패턴 B′(같은 binding 집합을 쓴다)."""
     shape = (2 * uy + 2 * MARGIN, 2 * ux + 2 * MARGIN)
     m = {k: np.zeros(shape, dtype=bool) for k in ("gate/M1", "gate/M2", "data/M2", "pixel/M3", "cnt")}
     oy, ox = MARGIN + offset, MARGIN + offset
     for i in range(2):
         for j in range(2):
-            draw_unit(m, oy + i * uy, ox + j * ux, uy, ux)
+            if variant == "half":
+                draw_half(m, oy + i * uy, ox + j * ux, uy, ux)
+            else:
+                draw_unit(m, oy + i * uy, ox + j * ux, uy, ux, MIXED if variant == "mixed" else POS)
     fill(m["gate/M1"], oy + uy - 6, oy + uy + 6, ox, ox + 2 * ux)  # unit 사이 가로 버스: ΔU 만큼 길어진다
     fill(m["data/M2"], oy, oy + 2 * uy, ox + ux - 6, ox + ux + 6)  # unit 사이 세로 버스
+    if variant == "seam":
+        seam(m, oy, ox, uy, ux)
+    if variant == "drift":
+        m = drift(m)
     elements = tuple(Element(*key.split("/"), m[key]) for key in ("gate/M1", "gate/M2", "data/M2", "pixel/M3"))
     product = Product(name, (shape[0] * 0.1, shape[1] * 0.1), elements, m["cnt"].astype(np.float32), lineage_id="L", design_version="v")
     layer_masks = {"m1": m["gate/M1"], "m2": m["gate/M2"] | m["data/M2"], "m3": m["pixel/M3"]}
     return product, layer_masks
 
 
-def signature(name, uy, ux, offset=0):
-    product, layer_masks = build(name, uy, ux, offset)
+def signature(name, uy, ux, offset=0, variant=None):
+    product, layer_masks = build(name, uy, ux, offset, variant)
     sig = product_signature(product, FACTOR, TOLERANCE)
     rasters = {k: block_reduce(v, FACTOR, "any") for k, v in layer_masks.items()}
     sig["layers"] = {k: layer_item(rasters[k], screen_align.pack_mask(layer_masks[k]), sig["full_shape"], TOLERANCE) for k in layer_masks}
@@ -185,6 +236,224 @@ def table(records):
     return "\n".join(lines)
 
 
+# ---- dl1-size/T4: tile 합성 게이트 --------------------------------------------------------------------------------------
+TILE_UNITS = (560, 1000)
+TILE_DELTAS = (8, 12, 20, 30, 38, 40, 41, 50, 60)  # 41 이상은 지원 범위 밖(out_of_support)이어야 한다
+TILE_PHASES = (0, 4)
+FALSE_DELTAS = (8, 20, 30, 38, 40, 60)
+FALSE_AXES = ("x", "xy")
+JUDGE_P_FLOOR, JUDGE_U_FLOOR, JUDGE_SIZE_U_FLOOR = 0.45, 0.9, 0.75  # 실제 screen() 실행 인수와 같다
+FALSE_P = 0.35  # P_var0(ΔU=0 에서 같은 변형을 단일 이동으로 잰 unit 영역 P)가 이보다 낮은 변형은 모든 ΔU 에서 tier == different 또는 tile_p None 이어야 한다
+RECORD_P = 0.40  # P_var0 가 FALSE_P–RECORD_P 이면 기록만 한다
+FALSE_SLACK = 0.07  # tile_p ≤ P_var0 + FALSE_SLACK: tile 정렬이 원래 차이보다 더 맞추지 않는다. 0.05 는 ΔU 8 에서도 mixed 가 +0.061 이라 못 지킨다(반경과 무관한 우연 수준 변동, 아래 표)
+SHIFT_TOL_CELLS = 16  # 입력 이동(compare·layer 정렬)이 참값에서 이만큼 넘게 어긋난 쌍(주기 구조에서 한 unit 옆에 맞춘 경우)은 (a) 에서 tile 성공을 요구하지 않는다
+
+
+def tile_pair(sa, ra, sb, rb, path):
+    """measure_pair + 같은 이동으로 tile 정렬. tile_p·단일 unit 영역 P·시간·실제 판정 헬퍼 결과·같은 조합 2회 동일 여부를 채운다."""
+    out = measure_pair(sa, ra, sb, rb, path)
+    sources, source, keys = tile_inputs(sa, sb, out["anchor"])
+    start = time.perf_counter()
+    origin = screen_tile.origin_shift(sa, sb, out["shift"])  # screen() 의 judge_tile_stage 와 같은 변환(중심 정렬 이동 → 원점 이동)
+    first = screen_tile.tile_pattern_axis(sa, sb, origin, sources, keys, factor=FACTOR, tolerance=TOLERANCE)
+    out["origin_shift"] = origin
+    out["seconds"] = time.perf_counter() - start
+    out["repeat_equal"] = first == screen_tile.tile_pattern_axis(sa, sb, origin, sources, keys, factor=FACTOR, tolerance=TOLERANCE)
+    out.update(first)
+    out["tile_source"], out["n_layers"] = source, len(sources)
+    out["single_p"] = screen_tile.single_shift_unit_p(sa, sb, origin, keys)
+    # 단일 P 가 낮아 tile 로 넘어온 쌍의 판정(실제 judge_verdict). 단일 P 가 이미 높은 쌍은 tile 을 거치지 않으므로 P 를 0 으로 눌러 tile 행을 강제로 본다.
+    forced = {**out, "axis_p": 0.0}
+    out["tier"], out["reason"], _ = judge_verdict(forced, out["anchor"], False, JUDGE_P_FLOOR, JUDGE_U_FLOOR, MARGIN_P, size_u_floor=JUDGE_SIZE_U_FLOOR, tile_p=out["tile_p"])
+    return out
+
+
+def tile_measure(units=TILE_UNITS, deltas=TILE_DELTAS, phases=TILE_PHASES, axes=AXES, paths=PATHS, progress=None):
+    """(a) 같은 설계. U·ΔU·축·위상·경로마다 tile_p 를 재고, 같은 (U, 경로, 위상)의 ΔU=0 쌍 tile_p 를 P0 로 붙인다."""
+    records = []
+    for unit in units:
+        sa, ra = signature("A", unit, unit, 0)
+        for delta in (0,) + tuple(deltas):
+            for axis in (AXES[:1] if delta == 0 else axes):
+                uy, ux = dims(unit, delta, axis)
+                for phase in phases:
+                    sb, rb = signature("B", uy, ux, phase)
+                    for path in paths:
+                        rec = tile_pair(sa, ra, sb, rb, path)
+                        rec.update(unit=unit, delta=delta, axis="-" if delta == 0 else axis, phase=phase, path=path, variant=None)
+                        rec["shift_error"] = max(abs(rec["origin_shift"][ax] + phase / FACTOR) for ax in (0, 1))  # 합성 B 는 내용이 phase px 아래·오른쪽으로 밀려 있어 참 원점 이동은 −phase/8 칸
+                        records.append(rec)
+                    if progress:
+                        progress("same", unit, delta, axis, phase)
+    base = {(r["unit"], r["path"], r["phase"]): r["tile_p"] for r in records if r["delta"] == 0}
+    for r in records:
+        r["p0"] = base.get((r["unit"], r["path"], r["phase"]))
+    return records
+
+
+def false_measure(units=TILE_UNITS, deltas=FALSE_DELTAS, variants=VARIANTS, axes=FALSE_AXES, paths=PATHS, progress=None):
+    """(b) 거짓 일치. 같은 binding 집합을 쓰는 다른 패턴 B′ 와 A 를 잰다. 같은 (U, 변형, 경로)의 ΔU=0 쌍 단일 이동 unit 영역 P 를 p_var0 으로 붙인다
+    (다른 정도의 기준: 늘어난 상태의 단일 P 는 늘어남 때문에 낮아서 쓰지 않는다)."""
+    records = []
+    for unit in units:
+        sa, ra = signature("A", unit, unit, 0)
+        for variant in variants:
+            for delta in (0,) + tuple(deltas):
+                for axis in (AXES[:1] if delta == 0 else axes):
+                    uy, ux = dims(unit, delta, axis)
+                    sb, rb = signature("B", uy, ux, 0, variant)
+                    for path in paths:
+                        rec = tile_pair(sa, ra, sb, rb, path)
+                        rec.update(unit=unit, delta=delta, axis="-" if delta == 0 else axis, phase=0, path=path, variant=variant, p0=None)
+                        records.append(rec)
+                    if progress:
+                        progress(variant, unit, delta, axis, 0)
+    base = {(r["unit"], r["variant"], r["path"]): r["single_p"] for r in records if r["delta"] == 0}
+    for r in records:
+        r["p_var0"] = base.get((r["unit"], r["variant"], r["path"]))
+    return records
+
+
+SUPPORT_DELTA = screen_tile.MAX_DELTA_U_PX
+SUPPORT_UNITS = (SUPPORT_DELTA * screen_tile.TILE_DIVISOR * screen_tile.TILE_MIN_CELLS, SUPPORT_DELTA * screen_tile.TILE_DIVISOR * screen_tile.TILE_MIN_CELLS - 8)
+# tile 폭 = U // (2·ΔU) 칸: 최소 폭이면 ok, 한 칸(8 px)이 모자라면 too_small
+
+
+def support_measure(delta=SUPPORT_DELTA, units=SUPPORT_UNITS):
+    """지원 범위 확인: 지원 상한 ΔU 에서 U = 2·ΔU·최소 폭 → tile 폭이 최소(7 칸)로 ok, 거기서 8 px 작은 U → tile_too_small. 같은 설계·같은 합성기."""
+    records = []
+    for unit in units:
+        sa, ra = signature("A", unit, unit, 0)
+        sb, rb = signature("B", unit + delta, unit + delta, 0)
+        rec = tile_pair(sa, ra, sb, rb, "layer")
+        rec.update(unit=unit, delta=delta, axis="xy", phase=0, path="layer", variant=None, p0=None)
+        records.append(rec)
+    return records
+
+
+def in_tile_support(r):
+    """ΔU 가 tile 지원 범위 안인가(screen_tile.MAX_DELTA_U_PX). 밖이면 out_of_support 여야 한다(→ unknown, 안전 쪽)."""
+    return r["delta"] <= screen_tile.MAX_DELTA_U_PX
+
+
+def same_failures(records):
+    """(a): 지원 범위 안은 tile_status ok, tile_p ≥ P0 − margin, 판정 tier ≠ different, 같은 조합 2회 동일. 범위 밖은 out_of_support 와 tile_p None.
+    ΔU=0 은 P0 를 재는 쌍이라 tile_status·재현성만 본다(강제 P 0 의 tier 는 게이트 산출물이라 단정하지 않는다).
+    입력 이동이 SHIFT_TOL_CELLS 넘게 어긋난 쌍은 tile 이 고칠 수 없으므로 tile_p 가 있으면 P0 − margin 이상, 없으면 tier ≠ different 만 요구한다."""
+    bad = []
+    for r in records:
+        if not in_tile_support(r):
+            if r["tile_status"] != "out_of_support" or r["tile_p"] is not None:
+                bad.append(r)
+        elif r.get("shift_error", 0) > SHIFT_TOL_CELLS:
+            if not r["repeat_equal"] or r["tier"] == "different" or (r["tile_p"] is not None and r["p0"] is not None and r["tile_p"] < r["p0"] - MARGIN_P):
+                bad.append(r)
+        elif r["tile_status"] != "ok" or r["tile_p"] is None or r["p0"] is None or not r["repeat_equal"]:
+            bad.append(r)
+        elif r["delta"] and (r["tile_p"] < r["p0"] - MARGIN_P or r["tier"] == "different"):
+            bad.append(r)
+    return bad
+
+
+def false_failures(records):
+    """(b): P_var0 < 0.35 인 변형은 ΔU>0 의 모든 쌍에서 tile_p 가 None 이거나 (tier == different 이고 tile_p ≤ P_var0 + 0.05) 여야 한다. 같은 조합 2회 동일도 본다."""
+    bad = []
+    for r in records:
+        p_var0 = r["p_var0"]
+        if not r["repeat_equal"]:
+            bad.append(r)
+        elif r["delta"] and p_var0 is not None and p_var0 < FALSE_P and r["tile_p"] is not None and (r["tier"] != "different" or r["tile_p"] > p_var0 + FALSE_SLACK):
+            bad.append(r)
+    return bad
+
+
+def support_failures(records):
+    want = {SUPPORT_UNITS[0]: ("ok", screen_tile.TILE_MIN_CELLS), SUPPORT_UNITS[1]: ("tile_too_small", None)}
+    return [r for r in records if r["tile_status"] != want[r["unit"]][0] or (want[r["unit"]][1] and r["tile_size_y_cells"] != want[r["unit"]][1])]
+
+
+def seconds(group):
+    values = [r["seconds"] for r in group]
+    return f"{sum(values) / len(values):.2f}/{max(values):.2f}" if values else "—"
+
+
+def tile_table(records):
+    lines = ["| U | 변형 | ΔU | 축 | 경로 | n | tile 상태 | tile_p min | P0 min | (tile_p−P0) min | P_var0 min | (tile_p−P_var0) max | 단일 P min | 단일 unit P min | tier(강제) | 층 수 | tile 수 | tile 폭(칸) | 시간 평균/최대(s) |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    keyf = lambda r: (r["unit"], r["variant"] or "same", r["delta"], r["axis"], r["path"])
+    for key in sorted({keyf(r) for r in records}):
+        g = [r for r in records if keyf(r) == key]
+        tiled = [r["tile_p"] for r in g if r["tile_p"] is not None]
+        diffs = [r["tile_p"] - r["p0"] for r in g if r["tile_p"] is not None and r["p0"] is not None]
+        over = [r["tile_p"] - r["p_var0"] for r in g if r["tile_p"] is not None and r.get("p_var0") is not None]
+        mn = lambda vals: fmt(min(vals, default=None))
+        statuses = ",".join(sorted({str(r["tile_status"]) for r in g}))
+        tiers = ",".join(sorted({f"{r['tier']}/{r['reason']}" for r in g}))
+        widths = ",".join(sorted({f"{r['tile_size_y_cells']}x{r['tile_size_x_cells']}" for r in g}))
+        lines.append(f"| {key[0]} | {key[1]} | {key[2]} | {key[3]} | {key[4]} | {len(g)} | {statuses} | {mn(tiled)} | {mn([r['p0'] for r in g if r['p0'] is not None])} | {mn(diffs)} | "
+                     f"{mn([r['p_var0'] for r in g if r.get('p_var0') is not None])} | {fmt(max(over, default=None))} | "
+                     f"{mn([r['axis_p'] for r in g if r['axis_p'] is not None])} | {mn([r['single_p'] for r in g if r['single_p'] is not None])} | {tiers} | "
+                     f"{','.join(sorted({str(r['n_layers']) for r in g}))} | {','.join(sorted({str(r['tile_count']) for r in g}))} | {widths} | {seconds(g)} |")
+    return "\n".join(lines)
+
+
+def delta_table(same, false):
+    """ΔU 별 요약. (a) 같은 설계: 통과율·최소 tile_p−P0. (b) 거짓 일치: P_var0 < 0.35 변형 쌍의 실패 수·최대 tile_p−P_var0. 시간 평균/최대."""
+    lines = ["| ΔU | 범위 | (a) n | (a) 통과 | (a) 통과율 | (a) 이동 오류 제외 | (a) tile ok | (a) min(tile_p−P0) | (b) n(P_var0<0.35) | (b) tile_p 있음 | (b) 실패 | (b) max(tile_p−P_var0) | 시간 평균/최대(s) |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    bad_same, bad_false = {id(r) for r in same_failures(same)}, {id(r) for r in false_failures(false)}
+    for delta in sorted({r["delta"] for r in same + false}):
+        a = [r for r in same if r["delta"] == delta]
+        b = [r for r in false if r["delta"] == delta and r["p_var0"] is not None and r["p_var0"] < FALSE_P]
+        diffs = [r["tile_p"] - r["p0"] for r in a if r["tile_p"] is not None and r["p0"] is not None]
+        over = [r["tile_p"] - r["p_var0"] for r in b if r["tile_p"] is not None]
+        everything = a + [r for r in false if r["delta"] == delta]
+        a_pass = sum(id(r) not in bad_same for r in a)
+        excluded = sum(r.get("shift_error", 0) > SHIFT_TOL_CELLS for r in a)
+        lines.append(f"| {delta} | {'안' if delta <= screen_tile.MAX_DELTA_U_PX else '밖'} | {len(a)} | {a_pass} | {a_pass / len(a) if a else 0:.3f} | {excluded} | "
+                     f"{sum(r['tile_status'] == 'ok' for r in a)} | {fmt(min(diffs, default=None))} | {len(b)} | {len(over)} | "
+                     f"{sum(id(r) in bad_false for r in false if r['delta'] == delta)} | {fmt(max(over, default=None))} | {seconds(everything)} |")
+    return "\n".join(lines)
+
+
+def tile_main(args):
+    start = time.time()
+    done = []
+    progress = lambda kind, u, d, a, p: done.append(1) or (len(done) % 20 == 0 and print(f"  ... {len(done)} B products, {time.time() - start:.0f}s", file=sys.stderr))
+    same = tile_measure(progress=progress)
+    false = false_measure(progress=progress)
+    support = support_measure()
+    print(f"# tile gate (U={TILE_UNITS}, ΔU={TILE_DELTAS}, phases={TILE_PHASES}, factor={FACTOR}, tolerance={TOLERANCE}, "
+          f"judge p_floor={JUDGE_P_FLOOR} margin={MARGIN_P} u_floor={JUDGE_U_FLOOR} size_u_floor={JUDGE_SIZE_U_FLOOR})\n")
+    fail_same, fail_false, fail_support = same_failures(same), false_failures(false), support_failures(support)
+    print(f"## ΔU 별 요약 (지원 범위 ΔU ≤ {screen_tile.MAX_DELTA_U_PX} px, 그 위는 out_of_support 여야 한다)\n")
+    print(delta_table(same, false))
+    print("\n## (a) 같은 설계: tile_p ≥ P0 − 0.05, tile ok, tier ≠ different, 2회 동일 (P0 = 같은 tile 경로의 ΔU=0 tile_p; ΔU=0 은 tier 단정에서 뺀다)\n")
+    print(tile_table(same))
+    print(f"\n## (b) 거짓 일치: 다른 패턴 B′ (P_var0 < {FALSE_P} 이면 모든 ΔU 에서 tile_p None 또는 tier == different 이고 tile_p ≤ P_var0 + {FALSE_SLACK})\n")
+    print(tile_table(false))
+    print(f"\n## 지원 범위 확인 (ΔU {SUPPORT_DELTA})\n")
+    print(tile_table(support))
+    ratios = [r["tile_p"] / r["p0"] for r in same if r["delta"] and r["tile_p"] is not None and r["p0"]]
+    diffs = [r["tile_p"] - r["p0"] for r in same if r["delta"] and r["tile_p"] is not None and r["p0"] is not None]
+    tiled_false = [r["tile_p"] for r in false if r["delta"] and r["tile_p"] is not None]
+    low = [r for r in false if r["delta"] and r["p_var0"] is not None and r["p_var0"] < FALSE_P]
+    record = [r for r in false if r["delta"] and r["p_var0"] is not None and FALSE_P <= r["p_var0"] < RECORD_P]
+    times = [r["seconds"] for r in same + false + support]
+    print(f"\nsummary: same combos={len(same)} (min tile_p/P0={min(ratios):.4f}, min tile_p−P0={min(diffs):.4f}), "
+          f"false combos={len(false)} (P_var0<{FALSE_P}: {len(low)}, P_var0 {FALSE_P}–{RECORD_P} record only: {len(record)}), "
+          f"different-pattern tile_p present={len(tiled_false)} max={fmt(max(tiled_false, default=None))}, "
+          f"tile seconds mean={sum(times) / len(times):.2f} max={max(times):.2f}")
+    bad = fail_same + fail_false + fail_support
+    print(f"failing: (a) same design {len(fail_same)} of {len(same)} (tile not ok: {sum(r['tile_status'] != 'ok' for r in fail_same)}), "
+          f"(b) false match {len(fail_false)} of {len(false)}, support {len(fail_support)} of {len(support)}")
+    print(f"gate: {'PASS' if not bad else 'FAIL'} ({len(bad)} failing of {len(same) + len(false) + len(support)}); elapsed {time.time() - start:.0f}s")
+    for r in fail_false + fail_support + fail_same[:20]:
+        print(f"  FAIL variant={r['variant']} U={r['unit']} ΔU={r['delta']} axis={r['axis']} phase={r['phase']} path={r['path']} status={r['tile_status']} "
+              f"tile_p={r['tile_p']} P0={r['p0']} axis_p={r['axis_p']} single_p={r['single_p']} tier={r['tier']}/{r['reason']} repeat_equal={r['repeat_equal']}")
+    return 0 if not bad else 1
+
+
 def parse_phases(text):
     if "-" in text:
         lo, hi = text.split("-")
@@ -197,7 +466,10 @@ def main(argv=None):
     parser.add_argument("--unit", type=int, default=UNIT)
     parser.add_argument("--phases", default="0-7", help="ΔU 0–7 에 쓸 위상(예 0-7 또는 0,4)")
     parser.add_argument("--record-phases", default="0,4", help="ΔU 8·12·20·40(기록만)에 쓸 위상")
+    parser.add_argument("--tile", action="store_true", help="dl1-size/T4 tile 합성 게이트(U 560·1000, ΔU 8–60, 거짓 일치 B′, 지원 범위)")
     args = parser.parse_args(argv)
+    if args.tile:
+        return tile_main(args)
     start = time.time()
     done = []
     progress = lambda d, a, p: done.append(1) or (len(done) % 20 == 0 and print(f"  ... {len(done)} B products, {time.time() - start:.0f}s", file=sys.stderr))
