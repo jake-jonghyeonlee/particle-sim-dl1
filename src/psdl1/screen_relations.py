@@ -55,7 +55,8 @@ JUDGE_SCHEMA = "dl1_judge_v1"
 JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
 JUDGE_TILE_MAX_PAIRS = 2000  # --judge-tile-max-pairs 기본값
 JUDGE_SIZE_FIXED = {"support_px": 60, "s_max_cells": 2, "tile_min_cells": 8, "factor": 8, "tolerance": 1}  # screen_tile 상수와 같은 값. summary.judge.size.config 에 고정해 기록한다
-TILE_FAILURE_STATUSES = frozenset({"not_run", "geometry_unsupported", "out_of_support", "tile_too_small", "too_many_tiles", "unit_align_failed", "low_coverage"})
+TILE_FAILURE_STATUSES = frozenset({"not_run", "capped", "geometry_unsupported", "out_of_support", "tile_too_small", "too_many_tiles", "unit_align_failed", "low_coverage"})
+TILE_NOT_EXECUTED = frozenset({None, "not_run", "capped", "usage_below_floor", "not_candidate"})  # 이 밖의 tile_status 는 tile_pattern_axis 를 실제로 부른 쌍이다
 
 
 def block_reduce(mask, factor, how):
@@ -681,11 +682,12 @@ def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, 
     for p in pairs:
         axes = p["judge_axes"]
         p.update({key: axes[key] for key in JUDGE_SCORE_FIELDS if key in axes})
+        p["axis_p_eff"] = axes["axis_p"]  # tile_p 가 나오면 tile 단계가 바꾼다. cap·weakest·검토 이유의 P 정렬은 이 값을 쓴다(기능 off 면 axis_p 와 같다)
         p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
         p["judge_p_floor"], p["judge_u_floor"] = floor_of(axes_floor["p"], p), floor_of(axes_floor["u"], p)
         p["tier"], p["reason"], p["judge_case"] = judge_verdict(axes, p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,
                                                                 size_u_floor=size_u_floor)
-        if size_u_floor is not None:  # tile 은 아직 안 돌린다(T3 에서 연결): U >= 기준인 후보는 not_run, 나머지는 후보가 아니다
+        if size_u_floor is not None:  # tile 은 이 뒤의 judge_tile_stage 가 돌린다: U >= 기준인 후보는 not_run, 나머지는 후보가 아니다
             p.update({key: None for key in JUDGE_SIZE_SCORE_FIELDS})
             p["judge_size_u_floor"] = size_u_floor
             if p["reason"] == "size_differs_usage_below_floor":
@@ -695,6 +697,39 @@ def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, 
             else:
                 p["tile_status"] = "not_candidate"
     return global_floor, group_floor, axes_floor
+
+
+def tile_inputs(sa, sb, metrics_anchor):
+    """tile 정렬 소스와 P 를 낼 binding 이름. metrics_anchor LAYER 이고 공통 층이 있으면 층 래스터(tile_source=layer), 아니면 공통 binding 래스터(CNT 포함, binding)."""
+    common_layers = sorted(sa.get("layers", {}).keys() & sb.get("layers", {}).keys()) if metrics_anchor == "LAYER" else []
+    if common_layers:
+        sources, source = {k: (sa["layers"][k]["mask"], sb["layers"][k]["mask"]) for k in common_layers}, "layer"
+    else:
+        sources, source = {k: (sa["rasters"][k]["mask"], sb["rasters"][k]["mask"]) for k in sorted(sa["rasters"].keys() & sb["rasters"].keys())}, "binding"
+    return sources, source, sorted(k for k in sa["rasters"].keys() & sb["rasters"].keys() if k != CNT)
+
+
+def judge_tile_stage(pairs, signatures, shifts, size, margin):
+    """1차 판정 뒤 tile_status == not_run 인 쌍(B 통과)에 tile 정렬을 돌려 tile_p 로 판정표를 다시 적용한다.
+    (−U, product_a, product_b) 순으로 앞 max_pairs 개만 돌리고 나머지는 capped, max_pairs 0 이면 모두 not_run 으로 둔다.
+    shifts[(a, b)] = metrics_anchor 위치의 래스터 이동(B[y,x] → A[y+dy,x+dx]). screen_tile 약속과 같다."""
+    from . import screen_tile  # screen_tile 이 이 모듈의 boundary_f1 을 가져오므로 늦게 가져온다
+    if size["max_pairs"] == 0:
+        return
+    candidates = sorted((p for p in pairs if p.get("tile_status") == "not_run"), key=lambda p: (-p["axis_u"], p["product_a"], p["product_b"]))
+    for rank, p in enumerate(candidates):
+        if rank >= size["max_pairs"]:
+            p["tile_status"] = "capped"
+            continue
+        sa, sb = signatures[p["product_a"]], signatures[p["product_b"]]
+        sources, source, binding_keys = tile_inputs(sa, sb, p["metrics_anchor"])
+        out = screen_tile.tile_pattern_axis(sa, sb, shifts[(p["product_a"], p["product_b"])], sources, binding_keys, factor=size["factor"], tolerance=size["tolerance"])
+        p.update(out)
+        p["tile_source"] = source
+        p["tier"], p["reason"], p["judge_case"] = judge_verdict(p["judge_axes"], p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,
+                                                                size_u_floor=size["u_floor"], tile_p=out["tile_p"])
+        if out["tile_p"] is not None:
+            p["axis_p_eff"] = out["tile_p"]
 
 
 def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge, size=None):
@@ -717,7 +752,7 @@ def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge, size=No
                                "size_differs_tiled_different": sum(p["reason"] == "size_differs_below_pattern_floor_tiled" for p in pairs),
                                "size_differs_tile_unsupported": sum(status(p) in TILE_FAILURE_STATUSES for p in pairs)})
         judge["size"] = {"config": dict(size),
-                         "stats": {"pairs_usage_below_floor": sum(status(p) == "usage_below_floor" for p in pairs), "pairs_tiled": sum(status(p) == "ok" for p in pairs),
+                         "stats": {"pairs_usage_below_floor": sum(status(p) == "usage_below_floor" for p in pairs), "pairs_tiled": sum(status(p) not in TILE_NOT_EXECUTED for p in pairs),
                                    "pairs_capped": sum(status(p) == "capped" for p in pairs),
                                    "tile_status": {s: sum(status(p) == s for p in pairs) for s in sorted({status(p) for p in pairs if status(p) is not None})}}}
     return judge
@@ -820,7 +855,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     layers = load_screening_layers(manifest, wanted, factor, layer_originals)  # 사이드카 파일이 없으면 {}, 손상됐으면 오류
     for pid, named in layers.items():
         signatures[pid]["layers"] = {name: layer_item(raster, layer_originals[pid][name], signatures[pid]["full_shape"], tolerance) for name, raster in named.items()}
-    pairs = []
+    pairs, shifts = [], {}  # shifts: 판단 지표 위치(metrics_anchor)의 래스터 이동. tile 정렬이 쓴다
     for part in partitions:
         names = sorted(split[part])
         for i, a in enumerate(names):
@@ -840,7 +875,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
                 pairs[-1].update(columns)
                 pairs[-1]["layer_flags"], pairs[-1]["layer_excluded"] = align["flags"], align["excluded"]
                 on_layer = columns["metrics_anchor"] == "LAYER"  # 판단 지표는 metrics_anchor 위치에서 계산한다
-                rows = pair_metric_rows(signatures[a], signatures[b], align["shift"] if on_layer else result["shift"], tolerance=tolerance,
+                shifts[(a, b)] = align["shift"] if on_layer else result["shift"]
+                rows = pair_metric_rows(signatures[a], signatures[b], shifts[(a, b)], tolerance=tolerance,
                                         presence_fraction=presence_fraction, use_layers=on_layer)
                 pairs[-1]["metric_rows"] = rows
                 pairs[-1].update(pair_metric_columns(rows, columns["metrics_anchor"]))
@@ -861,7 +897,9 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         global_floor, group_floor, axes_floor = judge_pairs_three_axis(pairs, group_of, floor=floor, floor_spec=floor_spec, pick=pick, margin=margin,
                                                                        min_group_pairs=min_group_pairs, judge_floor_p=judge_floor_p, judge_floor_u=judge_floor_u,
                                                                        size_u_floor=None if size is None else size["u_floor"])
-        strength, strength_floor = (lambda p: p["axis_p"]), "judge_p_floor"
+        if size is not None:
+            judge_tile_stage(pairs, signatures, shifts, size, margin)
+        strength, strength_floor = (lambda p: p["axis_p_eff"]), "judge_p_floor"
     within_different = sum(p["tier"] == "different" and p["group_a"] == p["group_b"] for p in pairs)
     allowed = math.ceil(cross_group_fraction * within_different)
     cross = sorted((p for p in pairs if p["tier"] == "different" and p["group_a"] != p["group_b"]), key=lambda p: (-strength(p), p["product_a"], p["product_b"]))

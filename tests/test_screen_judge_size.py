@@ -178,14 +178,15 @@ def test_size_on_verdicts_and_tile_status(world):
     assert verdict(pairs[("A3", "B1")]) == ("unknown", "pattern_same_usage_differs", 1)  # adv:4
     assert verdict(pairs[("A3", "B2")]) == ("unknown", "size_differs_out_of_support", 3)
     assert pairs[("A1", "B1")]["tile_status"] == "usage_below_floor"
-    assert pairs[("A1", "B2")]["tile_status"] == "not_run"
-    assert pairs[("A3", "B2")]["tile_status"] == "not_run"
+    assert pairs[("A1", "B2")]["tile_status"] == "geometry_unsupported"  # 합성 world 의 프레임은 margin 1000 px 보다 작아 tile 을 지원하지 않는다
+    assert pairs[("A3", "B2")]["tile_status"] == "geometry_unsupported"
     assert pairs[("A2", "B1")]["tile_status"] == "not_candidate"  # U 없음
     assert pairs[("A2", "B2")]["tile_status"] == "not_candidate"
     assert pairs[("A3", "B1")]["tile_status"] == "not_candidate"
     assert all(pairs[k]["tile_status"] == "not_candidate" for k in SAME)  # 같은 계보
     assert all(pairs[k]["judge_size_u_floor"] == U_FLOOR for k in pairs)
-    assert all(pairs[k][key] is None for k in pairs for key in sr.JUDGE_SIZE_SCORE_FIELDS if key not in ("judge_size_u_floor", "tile_status"))
+    assert all(pairs[k][key] is None for k in pairs for key in sr.JUDGE_SIZE_SCORE_FIELDS if key not in ("judge_size_u_floor", "tile_status", "tile_source"))
+    assert pairs[("A1", "B2")]["tile_source"] in ("layer", "binding") and pairs[("A1", "B1")]["tile_source"] is None
 
 
 def test_size_on_summary_structure(world):
@@ -195,8 +196,8 @@ def test_size_on_summary_structure(world):
                                        "factor": 8, "tolerance": 1}
     stats = judge["size"]["stats"]
     assert set(stats) == {"pairs_usage_below_floor", "pairs_tiled", "pairs_capped", "tile_status"}
-    assert stats["pairs_usage_below_floor"] == 1 and stats["pairs_tiled"] == 0 and stats["pairs_capped"] == 0
-    assert stats["tile_status"] == {"not_candidate": 12, "not_run": 2, "usage_below_floor": 1}
+    assert stats["pairs_usage_below_floor"] == 1 and stats["pairs_tiled"] == 2 and stats["pairs_capped"] == 0  # tile 을 부른 쌍 수(실패 포함)
+    assert stats["tile_status"] == {"not_candidate": 12, "geometry_unsupported": 2, "usage_below_floor": 1}
     cases = judge["cases"]
     assert cases["size_differs_usage_below_floor"] == 1 and cases["size_differs_tiled"] == 0 and cases["size_differs_tiled_different"] == 0
     assert cases["size_differs_tile_unsupported"] == 2 and cases["size_differs_out_of_support"] == 3  # U 없음 쌍도 out_of_support
@@ -226,9 +227,9 @@ def test_scores_csv_gets_the_size_columns_only_when_on(world, tmp_path):
                                           "tile_applied", "tile_step_replaced", "tile_radius_y_cells", "tile_radius_x_cells", "tile_shift_min_y", "tile_shift_max_y",
                                           "tile_shift_min_x", "tile_shift_max_x")
     rows = {(r["product_a"], r["product_b"]): r for r in csv.DictReader((tmp_path / "on.scores.csv").open(encoding="utf-8", newline=""))}
-    assert rows[("A1", "B1")]["tile_status"] == "usage_below_floor" and rows[("A1", "B2")]["tile_status"] == "not_run"
+    assert rows[("A1", "B1")]["tile_status"] == "usage_below_floor" and rows[("A1", "B2")]["tile_status"] == "geometry_unsupported"
     assert {r["judge_size_u_floor"] for r in rows.values()} == {"0.75"}
-    assert all(r[key] == "" for r in rows.values() for key in sr.JUDGE_SIZE_SCORE_FIELDS if key not in ("judge_size_u_floor", "tile_status"))
+    assert all(r[key] == "" for r in rows.values() for key in sr.JUDGE_SIZE_SCORE_FIELDS if key not in ("judge_size_u_floor", "tile_status", "tile_source"))
     assert "size_differs_usage_below_floor" in (tmp_path / "on.scores.csv").read_text(encoding="utf-8")
     off_text = (tmp_path / "off.scores.csv").read_text(encoding="utf-8")
     assert "tile_status" not in off_text and "usage_below_floor" not in off_text
