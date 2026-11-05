@@ -51,7 +51,10 @@ REASON_TEXT = {"close_to_same_lineage": "다른 계열인데 같은 계열 쌍�
                "pattern_same_usage_differs": "패턴(P)은 같은데 사용(U)이 다름: 사용이 다른 같은 회로인지 확인",
                "size_differs_out_of_support": "크기가 다르고 P 를 믿을 범위 밖이라 different 로 못 정함: 직접 확인",
                "pattern_same_usage_unknown": "패턴(P)은 같은데 사용(U) 값이 없음: 사용이 같은지 직접 확인",
-               "no_pattern_value": "패턴(P) 값이 없어 판정하지 못함: 직접 확인"}
+               "no_pattern_value": "패턴(P) 값이 없어 판정하지 못함: 직접 확인",
+               "near_boundary_tiled": "크기가 달라 tile 정렬로 다시 잰 패턴(P)이 경계 부근: 판단 필요",
+               "size_differs_usage_below_floor": "크기가 다르고 사용(U)이 크기 기준보다 낮아 different 로 둠: 정말 다른지 확인",
+               "size_differs_below_pattern_floor_tiled": "크기가 다르고 tile 정렬 후에도 패턴(P)이 기준보다 낮아 different 로 둠: 정말 다른지 확인"}
 TIER_TEXT = {"similar": "similar", "different": "different", "unknown": "모름"}
 
 

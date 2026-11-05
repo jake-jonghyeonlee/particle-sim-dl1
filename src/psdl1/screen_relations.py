@@ -45,11 +45,17 @@ SCORE_FIELDS = ("product_a", "product_b", "partition", "group_a", "group_b", "li
 # three-axis 판정에서만 scores.csv 끝에 붙는 열(legacy 는 SCORE_FIELDS 그대로)
 JUDGE_SCORE_FIELDS = ("axis_p", "axis_p_layer", "axis_u", "size_ratio_y", "size_ratio_x", "size_delta_unit_px_y", "size_delta_unit_px_x", "size_tag",
                       "judge_case", "judge_p_floor", "judge_u_floor")
+# --judge-size-u-floor 가 켜졌을 때만 scores.csv 끝에 붙는 열(tile 열 이름은 screen_tile.tile_pattern_axis 반환 키와 같다)
+JUDGE_SIZE_SCORE_FIELDS = ("judge_size_u_floor", "tile_status", "tile_source", "tile_p", "tile_size_y_cells", "tile_size_x_cells", "tile_count", "tile_applied",
+                           "tile_step_replaced", "tile_radius_y_cells", "tile_radius_x_cells", "tile_shift_min_y", "tile_shift_max_y", "tile_shift_min_x", "tile_shift_max_x")
 JUDGE_REVIEW_REASONS = frozenset({"close_to_same_lineage", "near_boundary", "pattern_same_usage_differs", "size_differs_out_of_support",
-                                  "pattern_same_usage_unknown", "no_pattern_value"})  # three-axis 에서 unknown 쌍이 검토 목록에 들어가는 reason
+                                  "pattern_same_usage_unknown", "no_pattern_value", "near_boundary_tiled"})  # three-axis 에서 unknown 쌍이 검토 목록에 들어가는 reason
 JUDGE_MODES = ("legacy", "three-axis")
 JUDGE_SCHEMA = "dl1_judge_v1"
 JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
+JUDGE_TILE_MAX_PAIRS = 2000  # --judge-tile-max-pairs 기본값
+JUDGE_SIZE_FIXED = {"support_px": 60, "s_max_cells": 2, "tile_min_cells": 8, "factor": 8, "tolerance": 1}  # screen_tile 상수와 같은 값. summary.judge.size.config 에 고정해 기록한다
+TILE_FAILURE_STATUSES = frozenset({"not_run", "geometry_unsupported", "out_of_support", "tile_too_small", "too_many_tiles", "unit_align_failed", "low_coverage"})
 
 
 def block_reduce(mask, factor, how):
@@ -506,8 +512,25 @@ def load_floor_spec(path):
             raise bad(f"{axis} needs a string source and an integer n_values >= 0")
         axes[axis] = {"global": float(block["global"]), "groups": {k: float(v) for k, v in block["per_group"].items()}, "source": block["source"],
                       "n_values": block["n_values"]}
+    size = None
+    if "size" in judge:  # 선택 블록: 있을 때만 설정(config)을 검증해 읽는다. stats 는 증분에서 다시 계산하므로 읽지 않는다
+        block = judge["size"]
+        config = block.get("config") if isinstance(block, dict) else None
+        if not isinstance(config, dict) or set(config) != {"u_floor", "enabled", "max_pairs", *JUDGE_SIZE_FIXED}:
+            raise bad("size needs a config with u_floor, enabled, max_pairs, support_px, s_max_cells, tile_min_cells, factor and tolerance")
+        if not number(config["u_floor"]) or isinstance(config["u_floor"], bool) or not 0 <= config["u_floor"] <= 1:
+            raise bad("size.config.u_floor must be a number in [0,1]")
+        if config["enabled"] is not True:
+            raise bad("size.config.enabled must be true")
+        if isinstance(config["max_pairs"], bool) or not isinstance(config["max_pairs"], int) or config["max_pairs"] < 0:
+            raise bad("size.config.max_pairs must be an integer >= 0")
+        for key, fixed in JUDGE_SIZE_FIXED.items():
+            if isinstance(config[key], bool) or config[key] != fixed:
+                raise bad(f"size.config.{key} must be {fixed}")
+        size = {"u_floor": float(config["u_floor"]), "enabled": True, "max_pairs": config["max_pairs"], **JUDGE_SIZE_FIXED}
     return {"global": None if floor["global"] is None else float(floor["global"]), "groups": {k: float(v) for k, v in floor["per_group"].items()},
-            "judge": {"margin": float(judge["margin"]), "quantile": None if judge.get("quantile") is None else float(judge["quantile"]), **axes}}
+            "judge": {"margin": float(judge["margin"]), "quantile": None if judge.get("quantile") is None else float(judge["quantile"]), **axes,
+                      **({} if size is None else {"size": size})}}
 
 
 def read_base_relations(path, product_ids):
@@ -584,8 +607,9 @@ def size_supported(metrics_anchor, axes):
     return metrics_anchor == "LAYER" and max(abs(axes["size_delta_unit_px_y"]), abs(axes["size_delta_unit_px_x"])) <= JUDGE_SIZE_SUPPORT_PX
 
 
-def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin):
-    """three-axis 판정표(PLAN v1.1 A2·X2, v1.2 G-size)의 초기 (tier, reason, judge_case). cross-group cap 은 이 뒤에 따로 적용한다."""
+def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin, size_u_floor=None, tile_p=None):
+    """three-axis 판정표(PLAN v1.1 A2·X2, v1.2 G-size)의 초기 (tier, reason, judge_case). cross-group cap 은 이 뒤에 따로 적용한다.
+    size_u_floor(dl1-size B)가 있으면 단일 P < p_floor−margin 이고 크기가 달라 G-size 밖인 쌍만 U 와 tile_p 로 다시 가른다. None 이면 현행과 같다."""
     differs = axes["size_tag"] == "size_differs"
     if same_lineage:
         return "similar", "same_lineage", 3 if differs else None
@@ -595,7 +619,19 @@ def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin):
     exact = lambda value: Fraction(repr(float(value)))  # 십진 표기 그대로 비교한다: 0.52 - 0.05 = 0.47000000000000003 같은 float 오차가 경계를 옮기지 않는다
     if exact(p) < exact(p_floor) - exact(margin):
         if differs and not size_supported(metrics_anchor, axes):
-            return "unknown", "size_differs_out_of_support", 3
+            if size_u_floor is None or u is None:
+                return "unknown", "size_differs_out_of_support", 3
+            if exact(u) < exact(size_u_floor):
+                return "different", "size_differs_usage_below_floor", 2  # 사용(U)이 크기 기준보다 낮으면 크기 차와 상관없이 다른 회로다
+            if tile_p is None:  # 미지원·실패·cap, 또는 tile 을 아직 안 돌린 쌍
+                return "unknown", "size_differs_out_of_support", 3
+            if exact(tile_p) < exact(p_floor) - exact(margin):
+                return "different", "size_differs_below_pattern_floor_tiled", 2
+            if exact(tile_p) < exact(p_floor):
+                return "unknown", "near_boundary_tiled", None
+            if u is not None and exact(u) < exact(u_floor):
+                return "unknown", "pattern_same_usage_differs", 1
+            return "unknown", "close_to_same_lineage", 3
         return "different", "below_pattern_floor", 2
     if exact(p) < exact(p_floor):
         return "unknown", "near_boundary", None
@@ -624,7 +660,7 @@ def judge_axis_floor(axis, name, explicit, spec, same, group_of, pick, min_group
     return {"global": pick(values), "per_group": per_group, "source": "calibrated", "n_values": len(values)}
 
 
-def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, min_group_pairs, judge_floor_p, judge_floor_u):
+def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, min_group_pairs, judge_floor_p, judge_floor_u, size_u_floor=None):
     """three-axis 판정. 쌍마다 축 값·기준·tier·reason·judge_case 를 채우고 (similarity global, similarity groups, {"p": ..., "u": ...}) 를 돌려준다.
     similarity floor 는 계산되면 기록하고 없어도 오류가 아니다(L5)."""
     same = [p for p in pairs if p["same_lineage"]]
@@ -647,34 +683,58 @@ def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, 
         p.update({key: axes[key] for key in JUDGE_SCORE_FIELDS if key in axes})
         p["floor"] = group_floor.get(p["group_a"], global_floor) if p["group_a"] == p["group_b"] else global_floor
         p["judge_p_floor"], p["judge_u_floor"] = floor_of(axes_floor["p"], p), floor_of(axes_floor["u"], p)
-        p["tier"], p["reason"], p["judge_case"] = judge_verdict(axes, p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin)
+        p["tier"], p["reason"], p["judge_case"] = judge_verdict(axes, p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,
+                                                                size_u_floor=size_u_floor)
+        if size_u_floor is not None:  # tile 은 아직 안 돌린다(T3 에서 연결): U >= 기준인 후보는 not_run, 나머지는 후보가 아니다
+            p.update({key: None for key in JUDGE_SIZE_SCORE_FIELDS})
+            p["judge_size_u_floor"] = size_u_floor
+            if p["reason"] == "size_differs_usage_below_floor":
+                p["tile_status"] = "usage_below_floor"
+            elif p["reason"] == "size_differs_out_of_support" and axes["axis_u"] is not None:
+                p["tile_status"] = "not_run"
+            else:
+                p["tile_status"] = "not_candidate"
     return global_floor, group_floor, axes_floor
 
 
-def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge):
-    """summary.json 의 judge 블록(스키마 dl1_judge_v1, three-axis 에서만)."""
+def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge, size=None):
+    """summary.json 의 judge 블록(스키마 dl1_judge_v1, three-axis 에서만). size = 설정 dict(기능 on 일 때만), 있으면 size 블록과 cases 새 키가 붙는다."""
     cross = [p for p in pairs if not p["same_lineage"]]
     same = [p for p in pairs if p["same_lineage"]]
     names = ("axis_p", "axis_u")
     quantile = floor_quantile if spec_judge is None else spec_judge["quantile"]
-    return {"schema": JUDGE_SCHEMA, "mode": "three-axis", "margin": margin, "quantile": quantile, "p": axes_floor["p"], "u": axes_floor["u"],
-            "cases": {"case_1": sum(p["judge_case"] == 1 for p in pairs), "case_2": sum(p["judge_case"] == 2 for p in pairs),
-                      "case_2_capped": sum(p["reason"] == "cross_group_capped" for p in pairs),
-                      "case_3": sum(p["judge_case"] == 3 for p in pairs),
-                      "size_differs_out_of_support": sum(p["reason"] == "size_differs_out_of_support" for p in pairs)},
-            "auc": {**{name: auc([p[name] for p in same if p[name] is not None], [p[name] for p in cross if p[name] is not None]) for name in names},
-                    "n_pairs_with_value": {name: sum(p[name] is not None for p in pairs) for name in names}}}
+    judge = {"schema": JUDGE_SCHEMA, "mode": "three-axis", "margin": margin, "quantile": quantile, "p": axes_floor["p"], "u": axes_floor["u"],
+             "cases": {"case_1": sum(p["judge_case"] == 1 for p in pairs), "case_2": sum(p["judge_case"] == 2 for p in pairs),
+                       "case_2_capped": sum(p["reason"] == "cross_group_capped" for p in pairs),
+                       "case_3": sum(p["judge_case"] == 3 for p in pairs),
+                       "size_differs_out_of_support": sum(p["reason"] == "size_differs_out_of_support" for p in pairs)},
+             "auc": {**{name: auc([p[name] for p in same if p[name] is not None], [p[name] for p in cross if p[name] is not None]) for name in names},
+                     "n_pairs_with_value": {name: sum(p[name] is not None for p in pairs) for name in names}}}
+    if size is not None:
+        status = lambda p: p.get("tile_status")
+        judge["cases"].update({"size_differs_usage_below_floor": sum(p["reason"] == "size_differs_usage_below_floor" for p in pairs),
+                               "size_differs_tiled": sum(status(p) == "ok" for p in pairs),
+                               "size_differs_tiled_different": sum(p["reason"] == "size_differs_below_pattern_floor_tiled" for p in pairs),
+                               "size_differs_tile_unsupported": sum(status(p) in TILE_FAILURE_STATUSES for p in pairs)})
+        judge["size"] = {"config": dict(size),
+                         "stats": {"pairs_usage_below_floor": sum(status(p) == "usage_below_floor" for p in pairs), "pairs_tiled": sum(status(p) == "ok" for p in pairs),
+                                   "pairs_capped": sum(status(p) == "capped" for p in pairs),
+                                   "tile_status": {s: sum(status(p) == s for p in pairs) for s in sorted({status(p) for p in pairs if status(p) is not None})}}}
+    return judge
 
 
 def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tolerance=1, margin=None, floor=None, cross_group_fraction=0.2,
            min_group_pairs=3, anchor="auto", max_shift=0.35, candidates=5, review_band=0.15, base_split=None, base_relations=None, floor_spec=None,
            align_min_overlap=screen_align.ALIGN_MIN_OVERLAP, align_min_support=screen_align.ALIGN_MIN_SUPPORT, align_min_dice=screen_align.ALIGN_MIN_DICE,
-           presence_fraction=PRESENCE_FRACTION, floor_quantile=None, judge=None, judge_floor_p=None, judge_floor_u=None):
+           presence_fraction=PRESENCE_FRACTION, floor_quantile=None, judge=None, judge_floor_p=None, judge_floor_u=None,
+           judge_size_u_floor=None, judge_tile_max_pairs=None):
     """base_split과 base_relations를 함께 주면 증분 모드: 새 제품이 낀 쌍(새×새, 새×기존)만 계산한다. floor_spec은 load_floor_spec() 결과다.
     align_*는 Layer 정렬(scores.csv 의 새 컬럼)에만 쓰이고 tier·floor 판정은 바꾸지 않는다.
     floor_quantile=q 이면 같은 계열 유사도를 정렬한 index floor(q*(n-1)) 의 값을 floor 로 쓴다(None 이면 최솟값). floor·floor_spec 과 배타다.
     judge: "legacy"(기본, similarity 판정) | "three-axis"(P·U 판정). None 이면 비증분은 legacy, 증분(floor_spec)은 base summary 의 모드를 잇고 다르면 거부한다.
-    margin=None 이면 0.05, 단 three-axis 증분은 base summary 에 저장된 margin 을 쓰고 다른 값을 주면 거부한다. judge_floor_p/u 는 three-axis 의 축별 명시 기준이다."""
+    margin=None 이면 0.05, 단 three-axis 증분은 base summary 에 저장된 margin 을 쓰고 다른 값을 주면 거부한다. judge_floor_p/u 는 three-axis 의 축별 명시 기준이다.
+    judge_size_u_floor=X([0,1])는 크기가 다른 쌍의 B 판정(U 기준)을 켠다. three-axis 에서만, factor 8·tolerance 1 에서만 허용하고 floor_spec 과는 배타다.
+    judge_tile_max_pairs(정수 >= 0, 기본 2000)는 size 기준과 함께만 준다. 증분은 base summary 의 size 설정을 그대로 쓴다."""
     if judge is not None and judge not in JUDGE_MODES:
         raise ValueError(f"judge must be one of {JUDGE_MODES}")
     spec_judge = None if floor_spec is None else floor_spec.get("judge")
@@ -693,6 +753,24 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         for value in (judge_floor_p, judge_floor_u):
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1):
                 raise ValueError("judge_floor_p and judge_floor_u in [0,1] required")
+    size = None
+    if judge_size_u_floor is not None or judge_tile_max_pairs is not None:
+        if judge == "legacy":
+            raise ValueError("judge_size_u_floor and judge_tile_max_pairs need the three-axis judge")
+        if floor_spec is not None:
+            raise ValueError("judge_size_u_floor and judge_tile_max_pairs are exclusive with floor_spec")
+        if judge_size_u_floor is None:
+            raise ValueError("judge_tile_max_pairs needs judge_size_u_floor")
+        if isinstance(judge_size_u_floor, bool) or not isinstance(judge_size_u_floor, (int, float)) or not 0 <= judge_size_u_floor <= 1:
+            raise ValueError("judge_size_u_floor in [0,1] required")
+        if judge_tile_max_pairs is not None and (type(judge_tile_max_pairs) is not int or judge_tile_max_pairs < 0):
+            raise ValueError("judge_tile_max_pairs must be an integer >= 0")
+        size = {"u_floor": float(judge_size_u_floor), "enabled": True, "max_pairs": JUDGE_TILE_MAX_PAIRS if judge_tile_max_pairs is None else judge_tile_max_pairs,
+                **JUDGE_SIZE_FIXED}
+    elif spec_judge is not None and spec_judge.get("size") is not None:
+        size = dict(spec_judge["size"])  # 증분: 설정만 고정하고 stats 는 이 라운드 쌍으로 다시 센다
+    if size is not None and (factor != JUDGE_SIZE_FIXED["factor"] or tolerance != JUDGE_SIZE_FIXED["tolerance"]):
+        raise ValueError(f"the size judge needs factor {JUDGE_SIZE_FIXED['factor']} and tolerance {JUDGE_SIZE_FIXED['tolerance']}")
     if spec_judge is not None:
         if margin is not None and margin != spec_judge["margin"]:
             raise ValueError("margin differs from the base round summary")
@@ -781,7 +859,8 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
         strength, strength_floor = (lambda p: p["similarity"]), "floor"
     else:  # 이 뒤의 cap·weakest·review 는 similarity 대신 P 와 P 기준값을 쓴다
         global_floor, group_floor, axes_floor = judge_pairs_three_axis(pairs, group_of, floor=floor, floor_spec=floor_spec, pick=pick, margin=margin,
-                                                                       min_group_pairs=min_group_pairs, judge_floor_p=judge_floor_p, judge_floor_u=judge_floor_u)
+                                                                       min_group_pairs=min_group_pairs, judge_floor_p=judge_floor_p, judge_floor_u=judge_floor_u,
+                                                                       size_u_floor=None if size is None else size["u_floor"])
         strength, strength_floor = (lambda p: p["axis_p"]), "judge_p_floor"
     within_different = sum(p["tier"] == "different" and p["group_a"] == p["group_b"] for p in pairs)
     allowed = math.ceil(cross_group_fraction * within_different)
@@ -830,7 +909,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     if floor_spec is not None:
         summary["floor"]["source"] = "base_summary"
     if judge == "three-axis":
-        summary["judge"] = judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge)
+        summary["judge"] = judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge, size)
     if floor_quantile is not None:
         summary["floor"]["quantile"] = floor_quantile
         summary["floor"]["quantile_method"] = "lower_index"
@@ -887,7 +966,8 @@ def write_csvs(result, out, scores_path, bindings_path=None):
             for row in p["metric_rows"]:  # 쌍 안의 행은 (kind, key) 순이다
                 writer.writerow({"product_a": p["product_a"], "product_b": p["product_b"], "partition": p["partition"], "metrics_anchor": p["metrics_anchor"], **row})
     with open(scores_path, "w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, SCORE_FIELDS + (JUDGE_SCORE_FIELDS if "judge" in result["summary"] else ()), extrasaction="ignore")
+        writer = csv.DictWriter(stream, SCORE_FIELDS + (JUDGE_SCORE_FIELDS if "judge" in result["summary"] else ())
+                                + (JUDGE_SIZE_SCORE_FIELDS if "size" in result["summary"].get("judge", {}) else ()), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(sorted(pairs, key=lambda p: (-p["similarity"], p["product_a"], p["product_b"])))
     with open(out, "w", newline="", encoding="utf-8") as stream:
@@ -921,6 +1001,9 @@ def main(argv=None):
                     "with --floor-json it inherits the base summary's mode and a different explicit value is rejected")
     ap.add_argument("--judge-floor-p", type=float, help="three-axis: explicit pattern (P) floor instead of calibrating it on the same-lineage pairs (exclusive with --floor-json)")
     ap.add_argument("--judge-floor-u", type=float, help="three-axis: explicit usage (U) floor instead of calibrating it on the same-lineage pairs (exclusive with --floor-json)")
+    ap.add_argument("--judge-size-u-floor", type=float, help="three-axis: usage (U) floor in [0,1] for pairs whose unit size differs beyond the P-trusted range; "
+                    "below it the pair is 'different' (factor 8 and tolerance 1 only; exclusive with --floor-json, which carries the setting from round 1)")
+    ap.add_argument("--judge-tile-max-pairs", type=int, help=f"three-axis: most size-differing pairs to tile-align, integer >= 0 (default {JUDGE_TILE_MAX_PAIRS}; needs --judge-size-u-floor)")
     ap.add_argument("--floor", type=float, help="explicit similarity floor instead of the weakest same-lineage pair")
     ap.add_argument("--floor-quantile", type=float, help="use the lower-index quantile q in [0,1] of the same-lineage similarities as the floor instead of the minimum (exclusive with --floor and --floor-json)")
     ap.add_argument("--cross-group-fraction", type=float, default=0.2, help="cross-group 'different' pairs kept, as a fraction of within-group ones")
@@ -944,6 +1027,14 @@ def main(argv=None):
         ap.error("--floor and --floor-json are exclusive")
     if a.floor_json is not None and (a.judge_floor_p is not None or a.judge_floor_u is not None):
         ap.error("--judge-floor-p and --judge-floor-u are exclusive with --floor-json")
+    if a.floor_json is not None and (a.judge_size_u_floor is not None or a.judge_tile_max_pairs is not None):
+        ap.error("--judge-size-u-floor and --judge-tile-max-pairs are exclusive with --floor-json")
+    if a.judge == "legacy" and (a.judge_size_u_floor is not None or a.judge_tile_max_pairs is not None):
+        ap.error("--judge-size-u-floor and --judge-tile-max-pairs need --judge three-axis")
+    if a.judge_size_u_floor is not None and not 0 <= a.judge_size_u_floor <= 1:  # NaN 도 여기서 걸린다
+        ap.error("--judge-size-u-floor must be in [0,1]")
+    if a.judge_tile_max_pairs is not None and (a.judge_tile_max_pairs < 0 or a.judge_size_u_floor is None):
+        ap.error("--judge-tile-max-pairs must be 0 or more and needs --judge-size-u-floor")
     if a.floor_quantile is not None:
         if a.floor is not None or a.floor_json is not None:
             ap.error("--floor-quantile is exclusive with --floor and --floor-json")
@@ -971,7 +1062,8 @@ def main(argv=None):
     result = screen(a.manifest, split, groups=a.groups, partitions=tuple(a.partitions), factor=a.factor, tolerance=a.tolerance, margin=a.margin,
                     floor=a.floor, cross_group_fraction=a.cross_group_fraction, anchor=a.anchor, max_shift=a.max_shift, candidates=a.candidates, review_band=a.review_band,
                     align_min_overlap=a.align_min_overlap, align_min_support=a.align_min_support, align_min_dice=a.align_min_dice, presence_fraction=a.presence_fraction, floor_quantile=a.floor_quantile,
-                    judge=a.judge, judge_floor_p=a.judge_floor_p, judge_floor_u=a.judge_floor_u, **extra)
+                    judge=a.judge, judge_floor_p=a.judge_floor_p, judge_floor_u=a.judge_floor_u,
+                    judge_size_u_floor=a.judge_size_u_floor, judge_tile_max_pairs=a.judge_tile_max_pairs, **extra)
     write_csvs(result, out, scores, bindings)
     # 쓰기 순서: bindings·scores → relations → review → summary(필수 3개는 마지막이라 중단되면 부분 출력 검사가 잡는다)
     page = render_review(result, a.review_pairs, a.review_bindings, a.review_layers)
