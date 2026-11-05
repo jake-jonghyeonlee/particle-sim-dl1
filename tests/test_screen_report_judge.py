@@ -103,6 +103,103 @@ def test_new_reasons_enter_the_review_list_and_have_text(world):
         assert report.REASON_TEXT[reason] in page
 
 
+def tiled_result(world):
+    """size 기능이 켜진 것처럼 tile 값을 합성한다(렌더링만 본다): A3↔B2 는 tile 성공, A1↔B2 는 tile 실패."""
+    result = world(AXES, margin=MARGIN)
+    pairs = by_pair(result)
+    pairs[("A3", "B2")].update(tile_status="ok", tile_p=0.52)
+    pairs[("A1", "B2")].update(tile_status="unit_align_failed", tile_p=None)
+    result["summary"]["judge"]["size"] = {"config": {}, "stats": {}}
+    return result, pairs
+
+
+def test_three_axis_card_has_axis_note_and_tile_second_line(world):
+    result, pairs = tiled_result(world)
+    page = render_review(result, top_pairs=60)
+    assert page.count(report.AXIS_NOTE) == len(cards_of(page)) > 0
+    assert f'P(tile) 0.52 (단일 {pairs[("A3", "B2")]["axis_p"]:.2f})' in page and "tile: unit_align_failed" in page
+    assert report.tile_text({"tile_status": "not_run", "tile_p": None}) == "" and report.tile_text({}) == ""
+
+
+def test_three_axis_figure_legend_lists_only_drawn_rows_with_values(world):
+    result = world(AXES, margin=MARGIN)
+    page = render_review(result, top_pairs=60)
+    legend = page[page.index("그림의 각 행"):page.index("<svg")]
+    for name in report.DIST_METRICS + ("axis_p", "axis_u"):
+        assert (f"<b>{name}</b>" in legend) == any(p.get(name) is not None for p in result["pairs"])
+    assert "<b>tile_p</b>" not in legend and 'data-metric="tile_p"' not in page
+    assert "초록 = 같은 계보 쌍, 회색 = 다른 계보 쌍, 빨간 선 = 기준" in legend
+
+
+def test_tile_p_row_appears_only_with_values_and_uses_the_p_floor(world):
+    result, _ = tiled_result(world)
+    page = render_review(result, top_pairs=60)
+    legend = page[page.index("그림의 각 행"):page.index("<svg")]
+    assert "<b>tile_p</b>" in legend
+    svg = page[page.index("<svg"):page.index("</svg>")]
+    assert re.findall(r'data-metric="(\w+)"', svg) == [*report.DIST_METRICS, "axis_p", "axis_u", "tile_p"]
+    group = svg[svg.index('data-metric="tile_p"'):]
+    assert f"floor(global) {result['summary']['judge']['p']['global']:.3f}" in group[:group.index("</g>")]
+
+
+def test_layer_stack_alpha_blends_and_default_is_opaque():
+    import numpy as np
+    below, above = np.array([[True, True]]), np.array([[False, True]])
+    colors = {"a": (200, 0, 0), "b": (0, 0, 200)}
+    opaque = report.layer_stack_rgba([("a", below), ("b", above)], colors)
+    assert opaque.tolist() == [[[200, 0, 0, 255], [0, 0, 200, 255]]]
+    assert (report.layer_stack_rgba([("a", below), ("b", above)], colors, 255) == opaque).all()
+    soft = report.layer_stack_rgba([("a", below), ("b", above)], colors, report.THREE_AXIS_ALPHA)
+    assert soft[0, 0].tolist() == [200, 0, 0, 102]  # 한 층: 색은 그대로, 알파만 40%
+    assert 0 < soft[0, 1, 0] < 200 and 0 < soft[0, 1, 2] < 200 and soft[0, 1, 3] > 102  # 겹친 곳은 섞이고 더 진하다
+
+
+def test_three_axis_thumbnails_use_alpha_102_and_legacy_stays_opaque(tmp_path, monkeypatch):
+    from test_screen_report import synthetic  # Layer 가 있는 합성 제품(world 의 제품에는 Layer 가 없다)
+    from test_screen_relations import FACTOR
+    from psdl1.screen_relations import screen
+    seen = []
+    real = report.layer_stack_rgba
+    monkeypatch.setattr(report, "layer_stack_rgba", lambda masks, colors, alpha=255: seen.append(alpha) or real(masks, colors, alpha))
+    manifest, split = synthetic(tmp_path, count=4, layers=4)
+    for judge, expected in (("three-axis", {102}), (None, {255})):
+        seen.clear()
+        result = screen(manifest, split, factor=FACTOR, margin=0.0, review_band=1.0, judge=judge)
+        for p in result["pairs"]:
+            p["review"] = p["review"] or ["near_boundary"]
+        render_review(result, top_pairs=2, top_layers=2)
+        assert seen and set(seen) == expected
+
+
+def test_different_pairs_hide_alignment_reasons_only_in_the_rendering(world):
+    result = world(AXES, margin=MARGIN)
+    pairs = by_pair(result)
+    only, mixed, kept = pairs[("A4", "B1")], pairs[("A1", "B2")], pairs[("A2", "B1")]
+    assert only["tier"] == "different" and kept["tier"] != "different"
+    only["review"] = ["low_overlap"]
+    mixed["tier"] = "different"
+    mixed["review"] = ["no_anchor", "size_differs_out_of_support"]
+    kept["review"] = ["low_overlap"]
+    before = [list(p["review"]) for p in result["pairs"]]
+    page = render_review(result, top_pairs=60)
+    table = page[page.index("<h2>검토 대상 전체</h2>"):page.index("<h2>카드</h2>")]
+    rows = re.findall(r"<tr><td>\d+</td><td>(\w+) ↔ (\w+)</td>", table)
+    assert ("A4", "B1") not in rows and ("A1", "B2") in rows and ("A2", "B1") in rows
+    assert "정렬 표시만 있는 different 쌍 1 개는 숨김" in page
+    assert report.REASON_TEXT["no_anchor"] not in page and report.REASON_TEXT["low_overlap"] in page  # 숨김은 different 쌍만, similar·unknown 쌍은 그대로
+    assert [p["review"] for p in result["pairs"]] == before  # 데이터는 바뀌지 않는다
+
+
+def test_tile_columns_only_on_size_pages(world):
+    result, pairs = tiled_result(world)
+    page = render_review(result, top_pairs=60)
+    assert "<th>경우</th><th>tile 상태</th><th>tile P</th><th>이유</th>" in page
+    table = page[page.index("<h2>검토 대상 전체</h2>"):page.index("<h2>카드</h2>")]
+    assert "<td>unit_align_failed</td><td class=\"n\">–</td>" in table and "<td>ok</td><td class=\"n\">0.52</td>" in table
+    plain = render_review(world(AXES, margin=MARGIN), top_pairs=60)
+    assert "tile 상태" not in plain and "P(tile)" not in plain
+
+
 def legacy_page(world):
     return render_review(world(AXES, judge="legacy"), top_pairs=60)
 

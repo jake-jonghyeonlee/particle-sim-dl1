@@ -56,6 +56,20 @@ REASON_TEXT = {"close_to_same_lineage": "다른 계열인데 같은 계열 쌍�
                "size_differs_usage_below_floor": "크기가 다르고 사용(U)이 크기 기준보다 낮아 different 로 둠: 정말 다른지 확인",
                "size_differs_below_pattern_floor_tiled": "크기가 다르고 tile 정렬 후에도 패턴(P)이 기준보다 낮아 different 로 둠: 정말 다른지 확인"}
 TIER_TEXT = {"similar": "similar", "different": "different", "unknown": "모름"}
+ALIGN_REASONS = frozenset({"alignment_unreliable", "ambiguous_alignment", "low_overlap", "no_anchor"})  # different 쌍에서는 three-axis 표시에서 숨기는 정렬 이유
+THREE_AXIS_ALPHA = 102  # three-axis 썸네일의 층 겹침 불투명도(약 40%)
+AXIS_NOTE = ("P = 같은 binding 끼리 겹친 경계 일치(F1) 평균. 패턴이 얼마나 같은지. U = 두 제품이 모두 쓰는 binding(layer×전극) 비율. 전극 사용이 얼마나 같은지. "
+             "S = 축별 프레임 크기 비율. 판정에 쓰지 않고 태그만.")
+METRIC_TEXT = {"similarity": "1 − binding 거리 평균. 한쪽에만 있는 binding 은 거리 1 로 들어가 패턴과 사용이 섞인 값.",
+               "similarity_layer": "Layer 정렬 위치에서 다시 잰 similarity.",
+               "usage_jaccard": "양쪽 다 있는 binding 비율(CNT 포함, 전체 합집합 기준).",
+               "usage_jaccard_electrodes": "U. CNT 를 빼고 사용 문턱을 적용한 binding 의 사용 일치.",
+               "electrode_similarity": "전극 종류(role)별 경계 F1 평균. layer 가 달라도 같은 종류끼리 비교.",
+               "pattern_similarity": "Layer 별 경계 F1 평균(Layer 정렬일 때만).",
+               "cnt_similarity": "CNT 경계 F1.",
+               "axis_p": "P. 같은 binding 끼리 겹친 경계 일치(F1) 평균.",
+               "axis_u": "U. 두 제품이 모두 쓰는 binding 비율.",
+               "tile_p": "크기가 다른 쌍의 tile 정렬 P(unit 영역만). 기준선은 p 기준."}
 
 
 def esc(value):
@@ -85,7 +99,17 @@ def judge_second_line(p):
     ratio = "—" if p["size_ratio_y"] is None or p["size_ratio_x"] is None else f'{p["size_ratio_y"]:.2f}/{p["size_ratio_x"]:.2f}'
     size = "크기 다름" if p["size_tag"] == "size_differs" else "크기 같음"
     case = "—" if p["judge_case"] is None else p["judge_case"]
-    return (f'P {axis_text(p["axis_p"], p["judge_p_floor"])} · U {axis_text(p["axis_u"], p["judge_u_floor"])} · S {ratio} {size} · 경우 {case} → {TIER_TEXT[p["tier"]]}')
+    return (f'P {axis_text(p["axis_p"], p["judge_p_floor"])} · U {axis_text(p["axis_u"], p["judge_u_floor"])} · S {ratio} {size} · 경우 {case}{tile_text(p)} → {TIER_TEXT[p["tier"]]}')
+
+
+def tile_text(p):
+    """tile 정렬이 돈 쌍만: tile_p 가 있으면 ` · P(tile) 0.52 (단일 0.15)`, 실패했으면 ` · tile: unit_align_failed`. 돌지 않은 쌍은 빈 문자열."""
+    status = p.get("tile_status")
+    if status in sr.TILE_NOT_EXECUTED:
+        return ""
+    if p.get("tile_p") is None:
+        return f" · tile: {status}"
+    return f' · P(tile) {p["tile_p"]:.2f} (단일 {num(p["axis_p"], 2)})'
 
 
 def data_uri(image):
@@ -126,11 +150,25 @@ def overlay_png(a, b, size=TILE):
     return tile_uri(diff_rgba(a, b), size)
 
 
-def layer_stack_rgba(masks, colors):
-    """층 마스크를 색으로 겹친다(나중 층이 위). masks: [(이름, bool 배열)], colors: {이름: (r, g, b)}."""
+def layer_stack_rgba(masks, colors, alpha=255):
+    """층 마스크를 색으로 겹친다(나중 층이 위). masks: [(이름, bool 배열)], colors: {이름: (r, g, b)}.
+    alpha < 255 면 층을 반투명으로 얹어(over 합성) 아래 층이 비치고 겹친 곳은 색이 섞인다. 기본값은 불투명 덮어쓰기다."""
     rgba = np.zeros(masks[0][1].shape + (4,), dtype=np.uint8)
+    if alpha >= 255:
+        for name, mask in masks:
+            rgba[mask] = colors[name] + (255,)
+        return rgba
+    top = alpha / 255.0
+    acc = np.zeros(rgba.shape, dtype=np.float64)  # 알파 곱한 rgb 와 알파(0–1)
     for name, mask in masks:
-        rgba[mask] = colors[name] + (255,)
+        color = np.array(colors[name], dtype=np.float64)
+        below = acc[mask][:, 3:4]
+        acc[mask, :3] = color * top + acc[mask][:, :3] * (1 - top)
+        acc[mask, 3:4] = top + below * (1 - top)
+    out_a = acc[..., 3:4]
+    rgb = np.where(out_a > 0, acc[..., :3] / np.where(out_a > 0, out_a, 1), 0)
+    rgba[..., :3] = np.rint(rgb).astype(np.uint8)
+    rgba[..., 3:4] = np.rint(out_a * 255).astype(np.uint8)
     return rgba
 
 
@@ -221,8 +259,8 @@ def binding_triples(p, sa, sb, shift, top_layers):
             f'<div class="triples">{shown or "<p class=sub>비교할 binding이 없습니다.</p>"}</div>')
 
 
-def frame_thumbs(p, sa, sb, names, shift):
-    """A·B 전체 프레임 썸네일 둘. Layer 가 있으면 층 색 겹침, 없으면 전극 합집합(회색)과 CNT(색). 선택 정렬의 ROI 박스를 그린다."""
+def frame_thumbs(p, sa, sb, names, shift, alpha=255):
+    """A·B 전체 프레임 썸네일 둘. Layer 가 있으면 층 색 겹침(alpha < 255 면 반투명), 없으면 전극 합집합(회색)과 CNT(색). 선택 정렬의 ROI 박스를 그린다."""
     box = sr.roi_box(sa["shape"], sb["shape"], shift[0], shift[1])
     box_b = None if box is None else (box[0] - shift[0], box[1] - shift[0], box[2] - shift[1], box[3] - shift[1])
     if names is not None:
@@ -230,7 +268,7 @@ def frame_thumbs(p, sa, sb, names, shift):
 
         def paint(sig):
             present = [(n, sig["layers"][n]["mask"]) for n in names if n in sig["layers"]]
-            return layer_stack_rgba(present, colors) if present else np.zeros(sig["shape"] + (4,), np.uint8)
+            return layer_stack_rgba(present, colors, alpha) if present else np.zeros(sig["shape"] + (4,), np.uint8)
         legend = "".join(f'<span class="swatch" style="background:rgb{colors[n]}"></span>{esc(n)}' for n in names)
         note = "Layer 색 겹침"
     else:
@@ -323,14 +361,23 @@ def key_lines(p, primary, diff_names):
     if "judge_case" in p:  # three-axis
         second = esc(judge_second_line(p))
     third = ", ".join(esc(n) for n in diff_names) or "비교할 층 없음"
-    return (f'<ol class="key"><li{warn}><b>정렬 신뢰</b> {first}</li><li><b>주 지표</b> {second}</li><li><b>차이 큰 층</b> {third}</li></ol>')
+    note = f'<p class="sub">{esc(AXIS_NOTE)}</p>' if "judge_case" in p else ""
+    return (f'<ol class="key"><li{warn}><b>정렬 신뢰</b> {first}</li><li><b>주 지표</b> {second}</li><li><b>차이 큰 층</b> {third}</li></ol>{note}')
+
+
+def shown_reasons(p, three):
+    """표시할 검토 이유. three-axis 에서 최종 tier 가 different 인 쌍은 정렬 표시를 숨긴다(데이터는 그대로, 렌더링에서만 거름)."""
+    if three and p["tier"] == "different":
+        return [r for r in p["review"] if r not in ALIGN_REASONS]
+    return list(p["review"])
 
 
 def card_html(p, sig, top_layers, primary):
     sa, sb = sig[p["product_a"]], sig[p["product_b"]]
     shift = selected_shift(p, sa)
     names = pair_layers(sa, sb)
-    reasons = "".join(f'<li>{esc(REASON_TEXT[r])}</li>' for r in p["review"])
+    three = "judge_case" in p
+    reasons = "".join(f'<li>{esc(REASON_TEXT[r])}</li>' for r in shown_reasons(p, three))
     if names is not None:
         items = layer_items(sa, sb, names, shift)
         body, diff_names = layer_triples(p, items, top_layers), [item[1] for item in (items or [])[:3]]
@@ -344,7 +391,22 @@ def card_html(p, sig, top_layers, primary):
               f'<span class="badge" title="CNT 를 빼고 사용 문턱을 적용한 binding 의 사용 일치">usage_jaccard_electrodes {num(p["usage_jaccard_electrodes"], 2)}</span></div>')
     folded = f'<details class="all"><summary>모든 값 보기</summary>{badges}{alignment_lines(p)}{binding_table(p)}</details>'
     return (f'<section class="card"><header><h2>A {esc(p["product_a"])} ↔ B {esc(p["product_b"])}</h2></header>'
-            f'<ul class="sub">{reasons}</ul>{key_lines(p, primary, diff_names)}{frame_thumbs(p, sa, sb, names, shift)}{body}{folded}</section>')
+            f'<ul class="sub">{reasons}</ul>{key_lines(p, primary, diff_names)}{frame_thumbs(p, sa, sb, names, shift, THREE_AXIS_ALPHA if three else 255)}{body}{folded}</section>')
+
+
+def dist_metrics(result):
+    """분포 그림에 그려지는 행. three-axis 면 axis_p/axis_u 를 더하고, tile_p 값이 하나라도 있으면 tile_p 행도 더한다."""
+    if result["summary"].get("judge") is None:
+        return DIST_METRICS
+    tiled = any(p.get("tile_p") is not None for p in result["pairs"])
+    return DIST_METRICS + ("axis_p", "axis_u") + (("tile_p",) if tiled else ())
+
+
+def metric_legend(result):
+    """three-axis 분포 그림 위의 '그림의 각 행' 설명. 그려지는 행 중 값이 하나라도 있는 행만 적는다."""
+    items = "".join(f'<li><b>{esc(name)}</b>: {esc(METRIC_TEXT[name])}</li>' for name in dist_metrics(result)
+                    if any(p.get(name) is not None for p in result["pairs"]))
+    return f'<h3>그림의 각 행</h3><ul class="sub">{items}</ul><p class="sub">초록 = 같은 계보 쌍, 회색 = 다른 계보 쌍, 빨간 선 = 기준.</p>'
 
 
 def distribution_svg(result):
@@ -353,7 +415,7 @@ def distribution_svg(result):
     auc = summary["separation_auc_same_vs_other_lineage"]
     left, width, lane, gap = 170, 520, 26, 10
     judge = summary.get("judge")
-    metrics = DIST_METRICS + (("axis_p", "axis_u") if judge is not None else ())
+    metrics = dist_metrics(result)
     height = len(metrics) * (2 * lane + gap) + 30
     out = [f'<svg class="dist" viewBox="0 0 {left + width + 130} {height}" width="{left + width + 130}" role="img" aria-label="지표별 같은 계열 대 다른 계열 분포">']
     for i in range(0, 11):
@@ -361,9 +423,9 @@ def distribution_svg(result):
         out.append(f'<line class="grid" x1="{x:.1f}" y1="14" x2="{x:.1f}" y2="{height - 14}"/><text class="muted" x="{x:.1f}" y="10" text-anchor="middle">{i / 10:.1f}</text>')
     for row, name in enumerate(metrics):
         top = 20 + row * (2 * lane + gap)
-        groups = [[p[name] for p in pairs if p["same_lineage"] and p[name] is not None], [p[name] for p in pairs if not p["same_lineage"] and p[name] is not None]]
+        groups = [[p[name] for p in pairs if p["same_lineage"] and p.get(name) is not None], [p[name] for p in pairs if not p["same_lineage"] and p.get(name) is not None]]
         n = len(groups[0]) + len(groups[1])
-        value_auc = judge["auc"].get(name) if name in ("axis_p", "axis_u") else auc.get(name)
+        value_auc = judge["auc"].get(name) if name in ("axis_p", "axis_u", "tile_p") else auc.get(name)
         out.append(f'<g data-metric="{name}"><text x="4" y="{top + lane}">{esc(name)}</text>'
                    f'<text class="muted" x="{left + width + 8}" y="{top + lane - 2}">AUC {num(value_auc)}</text><text class="muted" x="{left + width + 8}" y="{top + lane + 12}">n={n}'
                    f'{" (히스토그램)" if n > DENSE_POINTS else ""}</text>')
@@ -379,8 +441,8 @@ def distribution_svg(result):
                 for k, v in enumerate(values):
                     jitter = ((k * 0.6180339887) % 1.0) * (lane - 8)
                     out.append(f'<circle class="{css}" cx="{left + width * min(max(v, 0.0), 1.0):.1f}" cy="{base + 4 + jitter:.1f}" r="2.2"/>')
-        if name in ("axis_p", "axis_u"):
-            floor = judge["p" if name == "axis_p" else "u"]
+        if name in ("axis_p", "axis_u", "tile_p"):
+            floor = judge["u" if name == "axis_u" else "p"]  # tile_p 의 기준선은 p floor
             lines = [("floor", f'floor(global) {floor["global"]:.3f}', floor["global"])] + [("floor-group", f'floor {esc(g)} {v:.3f}', v) for g, v in sorted(floor["per_group"].items())]
             for css, title, value in lines:
                 x = left + width * value
@@ -406,13 +468,17 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
         order = lambda p: (p["axis_p"] is None, 0.0 if p["axis_p"] is None else abs(p["axis_p"] - p["judge_p_floor"]), p["product_a"], p["product_b"])
     else:
         order = lambda p: (0.0 if p["floor"] is None else abs(p["similarity"] - p["floor"]), p["product_a"], p["product_b"])
-    chosen = sorted((p for p in pairs if p["review"]), key=order)
     summary = result["summary"]
+    tile_cols = three and "size" in summary["judge"]
+    chosen = sorted((p for p in pairs if shown_reasons(p, three)), key=order)
+    hidden = sum(bool(p["review"]) and not shown_reasons(p, three) for p in pairs)
     counts = "".join(f'<li>{esc(r)}: {n}쌍 — {esc(REASON_TEXT[r])}</li>' for r, n in summary["review"]["by_reason"].items())
     axis_cells = lambda p: (f'<td class="n">{num(p["axis_p"], 2)}</td><td class="n">{num(p["axis_u"], 2)}</td><td class="n">{"—" if p["judge_case"] is None else p["judge_case"]}</td>' if three else "")
+    tile_cells = lambda p: (f'<td>{esc(p.get("tile_status") or "—")}</td><td class="n">{num(p.get("tile_p"), 2)}</td>' if tile_cols else "")
     table = "".join(f'<tr><td>{i}</td><td>{esc(p["product_a"])} ↔ {esc(p["product_b"])}</td><td>{TIER_TEXT[p["tier"]]}</td><td class="n">{p["similarity"]:.3f}</td>'
-                    f'<td class="n">{floor_text(p["floor"])}</td>{axis_cells(p)}<td>{esc(", ".join(p["review"]))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
-    axis_head = "<th>P</th><th>U</th><th>경우</th>" if three else ""
+                    f'<td class="n">{floor_text(p["floor"])}</td>{axis_cells(p)}{tile_cells(p)}<td>{esc(", ".join(shown_reasons(p, three)))}</td><td>{"아래 카드" if i <= top_pairs else "scores.csv"}</td></tr>' for i, p in enumerate(chosen, 1))
+    axis_head = ("<th>P</th><th>U</th><th>경우</th>" + ("<th>tile 상태</th><th>tile P</th>" if tile_cols else "")) if three else ""
+    hidden_note = f'<p class="sub">정렬 표시만 있는 different 쌍 {hidden} 개는 숨김.</p>' if hidden else ""
     judge_note = (f'<p class="sub">판정 모드: three-axis — 패턴(P)·사용(U)·크기 세 축으로 판정합니다. 다른 계보 쌍의 초기 tier 는 P 로 정하고 그 뒤 그룹 cap 을 적용한다. '
                   f'G-size: 크기가 다른 쌍은 LAYER 정렬에서 단위 크기 차 |ΔU| 가 {sr.JUDGE_SIZE_SUPPORT_PX}px 이하일 때만 P 를 믿고, 그 밖이면 different 대신 unknown 으로 둔다.</p>' if three else "")
     primary = primary_context(result)
@@ -422,10 +488,11 @@ def render_review(result, top_pairs=60, top_bindings=6, top_layers=4):
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>DL1 스크리닝 검토</title><style>{REVIEW_CSS}</style></head><body>'
             f'<h1>DL1 스크리닝 검토</h1><p class="sub">검토 대상 <b>{len(chosen)}쌍</b>입니다({"P 가 p 기준에 가까운 순, P 값이 없는 쌍은 맨 뒤" if three else "경계에 가까운 순"}). 유사도 = 1 − binding별 거리의 평균이며, 한쪽에서만 쓰이는 전극은 거리 1입니다. '
             f'이미지는 B를 A에 정렬한 뒤 두 제품이 겹치는 영역(ROI)만 그린 것입니다. 확정할 쌍은 relations.csv에 similar/different로 직접 추가하고, 틀린 자동 줄은 지우세요.</p>'
-            f'{primary_line(primary)}{judge_note}'
+            f'{primary_line(primary)}{judge_note}{hidden_note}'
             f'<p class="sub">용어: L1 Dice(첫 층) = 첫 층만의 Dice(정렬 신뢰 판정 기준), 결정 층 Dice = 정렬을 정한 층의 Dice, 2순위 Dice 는 결정 층 기준입니다.</p>'
             f'<h2>지표별 분포: 같은 계열(초록) vs 다른 계열(회색)</h2><p class="sub">AUC 1에 가까울수록 두 집단이 잘 갈립니다. 빨간 선은 similarity 의 floor 입니다(실선=global, 점선=그룹). 빈칸 값은 그리지 않고 n 에서 뺍니다.</p>'
-            f'{distribution_svg(result)}'
+            + (metric_legend(result) if three else "")
+            + f'{distribution_svg(result)}'
             f'<ul class="sub">{counts or "<li>검토 대상이 없습니다.</li>"}</ul>'
             f'<div class="legend"><span><i style="background:var(--a)"></i>A만</span><span><i style="background:var(--b)"></i>B만</span><span><i style="background:var(--both)"></i>둘 다</span>'
             f'<span>기준(같은 계열 최저 유사도) {floor_text(summary["floor"]["global"])}</span></div>'
