@@ -458,12 +458,56 @@ def _user_floor_source(args):
 
 
 JUDGE_ARGS = ("--judge", "--judge-floor-p", "--judge-floor-u")
+SIZE_ARGS = ("--judge-size-u-floor", "--judge-tile-max-pairs")
+SIZE_MAX_PAIRS_DEFAULT = 2000  # screen_relations.JUDGE_TILE_MAX_PAIRS 와 같은 값(테스트가 같음을 단정한다). --judge-tile-max-pairs 를 생략했을 때 기록되는 값
 JUDGE_MODES = ("legacy", "three-axis")
+
+
+def _size_args(args):
+    """SCREEN_ARGS 의 정확한 --judge-size-u-floor·--judge-tile-max-pairs 를 읽는다: (u_floor 또는 None, max_pairs 또는 None). 공백형·= 형, 마지막 값.
+    u_floor 는 [0, 1] 의 수, max_pairs 는 0 이상의 정수여야 한다. 약어는 _judge_args 가 멈춘다."""
+    u_floor = max_pairs = None
+    for i, arg in enumerate(args):
+        text = str(arg)
+        name = text.split("=", 1)[0]
+        if name not in SIZE_ARGS:
+            continue
+        if "=" in text:
+            value = text.split("=", 1)[1]
+        elif i + 1 < len(args):
+            value = str(args[i + 1])
+        else:
+            _stop(f"SCREEN_ARGS has {name} without a value")
+        if name == "--judge-size-u-floor":
+            try:
+                number = float(value)
+            except ValueError:
+                number = None
+            if number is None or not 0.0 <= number <= 1.0:
+                _stop(f"SCREEN_ARGS has {name} {value}: a number in [0, 1] is required")
+            u_floor = number
+        else:
+            try:
+                count = int(value)
+            except ValueError:
+                count = None
+            if count is None or count < 0:
+                _stop(f"SCREEN_ARGS has {name} {value}: an integer of 0 or more is required")
+            max_pairs = count
+    return u_floor, max_pairs
+
+
+def _size_request(args):
+    """요청한 size 판정 설정: 없으면 None, 있으면 {"u_floor", "max_pairs"}(max_pairs 를 생략하면 기본값)."""
+    u_floor, max_pairs = _size_args(args)
+    if u_floor is None:
+        return None
+    return {"u_floor": u_floor, "max_pairs": SIZE_MAX_PAIRS_DEFAULT if max_pairs is None else max_pairs}
 
 
 def _judge_args(args):
     """SCREEN_ARGS 의 --judge 계열을 식별한다: (mode 또는 None, floor_p 또는 None, floor_u 또는 None). 공백형·= 형을 모두 읽고 마지막 값을 쓴다.
-    정확한 이름이 아니고 이 셋 중 하나의 접두어인 토큰(--jud, --judge-floor, --judge-f 등)은 전체 이름을 쓰라며 멈춘다."""
+    정확한 이름이 아니고 이 다섯 중 하나의 접두어인 토큰(--jud, --judge-floor, --judge-f, --judge-size, --judge-tile 등)은 전체 이름을 쓰라며 멈춘다."""
     mode = floor_p = floor_u = None
     for i, arg in enumerate(args):
         text = str(arg)
@@ -490,6 +534,10 @@ def _judge_args(args):
                 floor_p = number
             else:
                 floor_u = number
+        elif name in SIZE_ARGS:
+            continue  # 값은 _size_args 가 읽는다
+        elif name.startswith("--") and len(name) > 2 and any(flag.startswith(name) for flag in SIZE_ARGS):
+            _stop(f"SCREEN_ARGS has {name}: write the full name (--judge, --judge-floor-p, --judge-floor-u, --judge-size-u-floor or --judge-tile-max-pairs)")
         elif name.startswith("--") and len(name) > 2 and any(flag.startswith(name) for flag in JUDGE_ARGS):
             _stop(f"SCREEN_ARGS has {name}: write the full name (--judge, --judge-floor-p or --judge-floor-u)")
     return mode, floor_p, floor_u
@@ -553,6 +601,15 @@ def _judge_expectation(summary, mode):
             expect[axis] = float(value)
         expect["margin"] = judge.get("margin")
         expect["quantile"] = judge.get("quantile")
+        expect["size"] = None
+        if judge.get("size") is not None:  # size 블록이 있으면 그 설정(config)이 기대값이다. stats 는 비교하지 않는다
+            config = judge["size"]["config"]
+            u_floor, max_pairs = config["u_floor"], config["max_pairs"]
+            if type(u_floor) not in (int, float) or not 0 <= u_floor <= 1:
+                raise ValueError("judge.size.config.u_floor is not a number in [0, 1]")
+            if type(max_pairs) is not int or max_pairs < 0:
+                raise ValueError("judge.size.config.max_pairs is not an integer >= 0")
+            expect["size"] = {"u_floor": float(u_floor), "max_pairs": max_pairs}
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         _stop(f"the round-1 train summary has no usable three-axis judge block ({type(exc).__name__}: {exc}); not using it as the fixed criteria")
     return expect
@@ -576,7 +633,24 @@ def _judge_problem(summary, expect):
         return f"has judge.margin = {judge.get('margin')}, but this run fixes {expect['margin']}"
     if "quantile" in expect and judge.get("quantile") != expect["quantile"]:
         return f"has judge.quantile = {judge.get('quantile')}, but this run fixes {expect['quantile']}"
+    if "size" in expect:
+        got = _summary_size_config(summary)
+        if got != expect["size"]:
+            show = lambda size: "no size judge" if size is None else f"u_floor {size['u_floor']} and max_pairs {size['max_pairs']}"
+            return f"has judge.size.config with {show(got)}, but this run fixes {show(expect['size'])}"
     return None
+
+
+def _summary_size_config(summary):
+    """요약 dict 의 judge.size.config 에서 비교할 설정: size 블록이 없으면 None, 있으면 {"u_floor", "max_pairs"}(읽을 수 없는 값은 None). stats 는 보지 않는다."""
+    size = summary["judge"].get("size")
+    if size is None:
+        return None
+    config = size.get("config") if isinstance(size, dict) else None
+    if not isinstance(config, dict):
+        return {"u_floor": None, "max_pairs": None}
+    u_floor = config.get("u_floor")
+    return {"u_floor": float(u_floor) if type(u_floor) in (int, float) else None, "max_pairs": config.get("max_pairs")}
 
 
 def _check_relations_reuse(relations, expect, incremental):
@@ -743,7 +817,11 @@ def _check_screen_args():
         name = str(arg).split("=", 1)[0]
         if name != "--margin" and len(name) >= 5 and "--margin".startswith(name):
             _stop(f"SCREEN_ARGS has {name}: write the full name --margin")
+    size_u_floor, size_max_pairs = _size_args(SCREEN_ARGS)  # 값 범위는 여기서 멈춘다
     if ROUND is not None and ROUND >= 2:
+        if size_u_floor is not None or size_max_pairs is not None:
+            _stop("SCREEN_ARGS must not contain --judge-size-u-floor or --judge-tile-max-pairs: ROUND >= 2 uses the size settings saved in the round-1 train summary "
+                  "(judge.size.config, passed through --floor-json from WORK/rounds/r01), so new ones would change them between rounds. Remove it")
         if judge_floor_p is not None or judge_floor_u is not None:
             _stop("SCREEN_ARGS must not contain --judge-floor-p or --judge-floor-u: ROUND >= 2 always uses the round-1 criteria "
                   "(--floor-json from WORK/rounds/r01), so a new floor would change them between rounds. Remove it")
@@ -764,6 +842,13 @@ def _check_screen_args():
             _stop("SCREEN_ARGS has --judge-floor-p or --judge-floor-u without --judge three-axis")
         if (judge_floor_p is not None or judge_floor_u is not None) and _has_floor_json(SCREEN_ARGS):
             _stop("SCREEN_ARGS has --judge-floor-p or --judge-floor-u together with --floor-json: use only one")
+        if size_u_floor is not None or size_max_pairs is not None:
+            if (judge_mode or "legacy") != "three-axis":
+                _stop("SCREEN_ARGS has --judge-size-u-floor or --judge-tile-max-pairs without --judge three-axis (the legacy judge has no size judge)")
+            if size_u_floor is None:
+                _stop("SCREEN_ARGS has --judge-tile-max-pairs without --judge-size-u-floor: the tile limit needs the size judge")
+            if _has_floor_json(SCREEN_ARGS):
+                _stop("SCREEN_ARGS has --judge-size-u-floor or --judge-tile-max-pairs together with --floor-json: use only one")
 
 
 def _merge_step(prev, export, export_new):
@@ -846,6 +931,7 @@ def stage():
             for axis, value in (("p", judge_floor_p), ("u", judge_floor_u)):
                 if value is not None:
                     judge_expect[axis] = value
+            judge_expect["size"] = _size_request(SCREEN_ARGS)  # 요청하지 않았으면 None: 저장된 size 설정이 있으면 재사용 전에 멈춘다
             margin_text, quantile_text = _arg_value(SCREEN_ARGS, "--margin"), _arg_value(SCREEN_ARGS, "--floor-quantile")
             try:  # 저장값과 비교할 margin·quantile. 숫자가 아니면 screen_relations 가 거부한다.
                 judge_expect["margin"] = 0.05 if margin_text is None else float(margin_text)
@@ -941,6 +1027,13 @@ def stage():
                     for flag, axis, given in (("--judge-floor-p", "p", judge_floor_p), ("--judge-floor-u", "u", judge_floor_u)):
                         if given is None:
                             floor += [flag, repr(train_expect[axis])]
+                    size = train_expect.get("size")  # train 의 size 설정(config)을 같은 인수로 넘긴다. 사용자가 준 인수는 SCREEN_ARGS 로 이미 간다
+                    if size is not None:
+                        given_u, given_max = _size_args(SCREEN_ARGS)
+                        if given_u is None:
+                            floor += ["--judge-size-u-floor", repr(size["u_floor"])]
+                        if given_max is None:
+                            floor += ["--judge-tile-max-pairs", str(size["max_pairs"])]
                 if not _user_floor_source(SCREEN_ARGS) and (train_summary.get("floor") or {}).get("global") is not None:
                     floor += ["--floor", repr(train_summary["floor"]["global"])]
             else:
