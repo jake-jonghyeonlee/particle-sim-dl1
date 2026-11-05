@@ -54,7 +54,7 @@ JUDGE_MODES = ("legacy", "three-axis")
 JUDGE_SCHEMA = "dl1_judge_v1"
 JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
 JUDGE_TILE_MAX_PAIRS = 2000  # --judge-tile-max-pairs 기본값
-JUDGE_SIZE_FIXED = {"support_px": 60, "s_max_cells": 2, "tile_min_cells": 8, "factor": 8, "tolerance": 1}  # screen_tile 상수와 같은 값. summary.judge.size.config 에 고정해 기록한다
+JUDGE_SIZE_FIXED = {"support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "factor": 8, "tolerance": 1}  # screen_tile 상수(MAX_DELTA_U_PX·S_MAX_CELLS·TILE_MIN_CELLS)와 같은 값(순환 import 라 값으로 적고 테스트가 같음을 단정한다). summary.judge.size.config 에 고정해 기록한다
 TILE_FAILURE_STATUSES = frozenset({"not_run", "capped", "geometry_unsupported", "out_of_support", "tile_too_small", "too_many_tiles", "unit_align_failed", "low_coverage"})
 TILE_NOT_EXECUTED = frozenset({None, "not_run", "capped", "usage_below_floor", "not_candidate"})  # 이 밖의 tile_status 는 tile_pattern_axis 를 실제로 부른 쌍이다
 
