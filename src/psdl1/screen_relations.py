@@ -53,10 +53,10 @@ JUDGE_REVIEW_REASONS = frozenset({"close_to_same_lineage", "near_boundary", "pat
 JUDGE_MODES = ("legacy", "three-axis")
 JUDGE_SCHEMA = "dl1_judge_v1"
 JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
-JUDGE_TILE_MAX_PAIRS = 2000  # --judge-tile-max-pairs 기본값
+JUDGE_TILE_MAX_PAIRS = 20000  # --judge-tile-max-pairs 기본값
 JUDGE_SIZE_FIXED = {"support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "factor": 8, "tolerance": 1}  # screen_tile 상수(MAX_DELTA_U_PX·S_MAX_CELLS·TILE_MIN_CELLS)와 같은 값(순환 import 라 값으로 적고 테스트가 같음을 단정한다). summary.judge.size.config 에 고정해 기록한다
 TILE_FAILURE_STATUSES = frozenset({"not_run", "capped", "geometry_unsupported", "out_of_support", "tile_too_small", "too_many_tiles", "unit_align_failed", "low_coverage"})
-TILE_NOT_EXECUTED = frozenset({None, "not_run", "capped", "usage_below_floor", "not_candidate"})  # 이 밖의 tile_status 는 tile_pattern_axis 를 실제로 부른 쌍이다
+TILE_NOT_EXECUTED = frozenset({None, "not_run", "capped", "not_candidate"})  # 이 밖의 tile_status 는 tile_pattern_axis 를 실제로 부른 쌍이다
 
 
 def block_reduce(mask, factor, how):
@@ -608,9 +608,11 @@ def size_supported(metrics_anchor, axes):
     return metrics_anchor == "LAYER" and max(abs(axes["size_delta_unit_px_y"]), abs(axes["size_delta_unit_px_x"])) <= JUDGE_SIZE_SUPPORT_PX
 
 
-def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin, size_u_floor=None, tile_p=None):
-    """three-axis 판정표(PLAN v1.1 A2·X2, v1.2 G-size)의 초기 (tier, reason, judge_case). cross-group cap 은 이 뒤에 따로 적용한다.
-    size_u_floor(dl1-size B)가 있으면 단일 P < p_floor−margin 이고 크기가 달라 G-size 밖인 쌍만 U 와 tile_p 로 다시 가른다. None 이면 현행과 같다."""
+def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin, size_u_floor=None, tile_p=None, tiled=False):
+    """three-axis 판정표(PLAN v1.1 A2·X2, v1.2 G-size, T4d 혼합)의 초기 (tier, reason, judge_case). cross-group cap 은 이 뒤에 따로 적용한다.
+    size_u_floor(dl1-size B)가 있으면 단일 P < p_floor−margin 이고 크기가 달라 G-size 밖인 쌍만 다시 가른다. None 이면 현행과 같다.
+    tiled=False 는 1차 판정(U 가 있는 쌍은 모두 tile 후보라 unknown). tiled=True 는 tile 단계의 판정: tile_p 가 있으면 tile_p 로 가르고
+    (U 가 기준보다 낮아도 tile_p 가 높으면 different 로 보내지 않는다), tile_p 가 없으면(실패·capped·not_run) U 가 기준보다 낮은 쌍만 different 다."""
     differs = axes["size_tag"] == "size_differs"
     if same_lineage:
         return "similar", "same_lineage", 3 if differs else None
@@ -622,9 +624,11 @@ def judge_verdict(axes, metrics_anchor, same_lineage, p_floor, u_floor, margin, 
         if differs and not size_supported(metrics_anchor, axes):
             if size_u_floor is None or u is None:
                 return "unknown", "size_differs_out_of_support", 3
-            if exact(u) < exact(size_u_floor):
-                return "different", "size_differs_usage_below_floor", 2  # 사용(U)이 크기 기준보다 낮으면 크기 차와 상관없이 다른 회로다
-            if tile_p is None:  # 미지원·실패·cap, 또는 tile 을 아직 안 돌린 쌍
+            if not tiled:  # tile 단계가 다시 판정한다
+                return "unknown", "size_differs_out_of_support", 3
+            if tile_p is None:  # 미지원·실패·cap·미실행
+                if exact(u) < exact(size_u_floor):
+                    return "different", "size_differs_usage_below_floor", 2  # tile 로 확인 못 한 쌍은 사용(U)이 크기 기준보다 낮으면 다른 회로다
                 return "unknown", "size_differs_out_of_support", 3
             if exact(tile_p) < exact(p_floor) - exact(margin):
                 return "different", "size_differs_below_pattern_floor_tiled", 2
@@ -687,12 +691,10 @@ def judge_pairs_three_axis(pairs, group_of, *, floor, floor_spec, pick, margin, 
         p["judge_p_floor"], p["judge_u_floor"] = floor_of(axes_floor["p"], p), floor_of(axes_floor["u"], p)
         p["tier"], p["reason"], p["judge_case"] = judge_verdict(axes, p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,
                                                                 size_u_floor=size_u_floor)
-        if size_u_floor is not None:  # tile 은 이 뒤의 judge_tile_stage 가 돌린다: U >= 기준인 후보는 not_run, 나머지는 후보가 아니다
+        if size_u_floor is not None:  # tile 은 이 뒤의 judge_tile_stage 가 돌린다: U 가 있는 size_differs_out_of_support 쌍은 모두 not_run(후보), 나머지는 후보가 아니다
             p.update({key: None for key in JUDGE_SIZE_SCORE_FIELDS})
             p["judge_size_u_floor"] = size_u_floor
-            if p["reason"] == "size_differs_usage_below_floor":
-                p["tile_status"] = "usage_below_floor"
-            elif p["reason"] == "size_differs_out_of_support" and axes["axis_u"] is not None:
+            if p["reason"] == "size_differs_out_of_support" and axes["axis_u"] is not None:
                 p["tile_status"] = "not_run"
             else:
                 p["tile_status"] = "not_candidate"
@@ -710,17 +712,19 @@ def tile_inputs(sa, sb, metrics_anchor):
 
 
 def judge_tile_stage(pairs, signatures, shifts, size, margin):
-    """1차 판정 뒤 tile_status == not_run 인 쌍(B 통과)에 tile 정렬을 돌려 tile_p 로 판정표를 다시 적용한다.
+    """1차 판정 뒤 tile_status == not_run 인 쌍(U 가 있는 크기 차 쌍 전부)에 tile 정렬을 돌려 tile_p 로 판정표를 다시 적용한다.
     (−U, product_a, product_b) 순으로 앞 max_pairs 개만 돌리고 나머지는 capped, max_pairs 0 이면 모두 not_run 으로 둔다.
+    돌리지 못한 쌍(capped·not_run)과 tile 실패 쌍은 tile_p 없음 행으로 판정한다(U 가 기준보다 낮으면 different).
     shifts[(a, b)] = metrics_anchor 위치의 래스터 이동(B[y,x] → A[y+dy,x+dx]). compare·layer 정렬처럼 두 프레임 중심을 맞춘 기준이므로
     screen_tile 이 쓰는 원점 이동으로 바꿔서(screen_tile.origin_shift) 넘긴다."""
     from . import screen_tile  # screen_tile 이 이 모듈의 boundary_f1 을 가져오므로 늦게 가져온다
-    if size["max_pairs"] == 0:
-        return
     candidates = sorted((p for p in pairs if p.get("tile_status") == "not_run"), key=lambda p: (-p["axis_u"], p["product_a"], p["product_b"]))
     for rank, p in enumerate(candidates):
         if rank >= size["max_pairs"]:
-            p["tile_status"] = "capped"
+            if size["max_pairs"] > 0:
+                p["tile_status"] = "capped"
+            p["tier"], p["reason"], p["judge_case"] = judge_verdict(p["judge_axes"], p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,
+                                                                    size_u_floor=size["u_floor"], tiled=True)
             continue
         sa, sb = signatures[p["product_a"]], signatures[p["product_b"]]
         sources, source, binding_keys = tile_inputs(sa, sb, p["metrics_anchor"])
@@ -729,7 +733,7 @@ def judge_tile_stage(pairs, signatures, shifts, size, margin):
         p.update(out)
         p["tile_source"] = source
         p["tier"], p["reason"], p["judge_case"] = judge_verdict(p["judge_axes"], p["metrics_anchor"], p["same_lineage"], p["judge_p_floor"], p["judge_u_floor"], margin,
-                                                                size_u_floor=size["u_floor"], tile_p=out["tile_p"])
+                                                                size_u_floor=size["u_floor"], tile_p=out["tile_p"], tiled=True)
         if out["tile_p"] is not None:
             p["axis_p_eff"] = out["tile_p"]
 
@@ -754,7 +758,7 @@ def judge_summary(pairs, axes_floor, margin, floor_quantile, spec_judge, size=No
                                "size_differs_tiled_different": sum(p["reason"] == "size_differs_below_pattern_floor_tiled" for p in pairs),
                                "size_differs_tile_unsupported": sum(status(p) in TILE_FAILURE_STATUSES for p in pairs)})
         judge["size"] = {"config": dict(size),
-                         "stats": {"pairs_usage_below_floor": sum(status(p) == "usage_below_floor" for p in pairs), "pairs_tiled": sum(status(p) not in TILE_NOT_EXECUTED for p in pairs),
+                         "stats": {"pairs_usage_below_floor": sum(p["reason"] == "size_differs_usage_below_floor" for p in pairs), "pairs_tiled": sum(status(p) not in TILE_NOT_EXECUTED for p in pairs),
                                    "pairs_capped": sum(status(p) == "capped" for p in pairs),
                                    "tile_status": {s: sum(status(p) == s for p in pairs) for s in sorted({status(p) for p in pairs if status(p) is not None})}}}
     return judge
@@ -771,7 +775,7 @@ def screen(manifest, split, *, groups=None, partitions=("train",), factor=8, tol
     judge: "legacy"(기본, similarity 판정) | "three-axis"(P·U 판정). None 이면 비증분은 legacy, 증분(floor_spec)은 base summary 의 모드를 잇고 다르면 거부한다.
     margin=None 이면 0.05, 단 three-axis 증분은 base summary 에 저장된 margin 을 쓰고 다른 값을 주면 거부한다. judge_floor_p/u 는 three-axis 의 축별 명시 기준이다.
     judge_size_u_floor=X([0,1])는 크기가 다른 쌍의 B 판정(U 기준)을 켠다. three-axis 에서만, factor 8·tolerance 1 에서만 허용하고 floor_spec 과는 배타다.
-    judge_tile_max_pairs(정수 >= 0, 기본 2000)는 size 기준과 함께만 준다. 증분은 base summary 의 size 설정을 그대로 쓴다."""
+    judge_tile_max_pairs(정수 >= 0, 기본 20000)는 size 기준과 함께만 준다. 증분은 base summary 의 size 설정을 그대로 쓴다."""
     if judge is not None and judge not in JUDGE_MODES:
         raise ValueError(f"judge must be one of {JUDGE_MODES}")
     spec_judge = None if floor_spec is None else floor_spec.get("judge")

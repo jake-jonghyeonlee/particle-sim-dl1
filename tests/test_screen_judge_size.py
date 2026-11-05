@@ -29,8 +29,9 @@ def axes(p, u, **extra):
     return {"axis_p": p, "axis_u": u, **OUT_OF_SUPPORT, **extra}
 
 
-def vd(ax, tile_p=None, size_u_floor=U_FLOOR, anchor="LAYER", same_lineage=False, u_floor=0.9):
-    return judge_verdict(ax, anchor, same_lineage, P_FLOOR, u_floor, MARGIN_V, size_u_floor=size_u_floor, tile_p=tile_p)
+def vd(ax, tile_p=None, size_u_floor=U_FLOOR, anchor="LAYER", same_lineage=False, u_floor=0.9, tiled=None):
+    """tiled 를 안 주면 tile_p 가 있을 때만 tile 단계 판정으로 본다(tile_p 없는 tile 단계 판정은 tiled=True 로 준다)."""
+    return judge_verdict(ax, anchor, same_lineage, P_FLOOR, u_floor, MARGIN_V, size_u_floor=size_u_floor, tile_p=tile_p, tiled=tile_p is not None if tiled is None else tiled)
 
 
 # ---- judge_verdict 표 --------------------------------------------------------------------------------------------------
@@ -47,13 +48,32 @@ def test_u_none_stays_unknown():
 
 @pytest.mark.parametrize("u, expected", [(0.5, "different"), (0.7499999, "different"), (0.75, "unknown"), (0.7500001, "unknown"), (1.0, "unknown")])
 def test_size_u_floor_boundary_is_exact_and_u_equal_passes(u, expected):
-    tier, reason, case = vd(axes(0.2, u))
+    tier, reason, case = vd(axes(0.2, u), tiled=True)  # tile_p 없음(실패·capped·not_run) 행
     assert tier == expected
     assert (reason, case) == (("size_differs_usage_below_floor", 2) if expected == "different" else ("size_differs_out_of_support", 3))
 
 
+def test_first_pass_sends_every_size_differing_pair_with_u_to_the_tile_stage():
+    for u in (0.0, 0.5, 0.75, 0.95):
+        assert vd(axes(0.2, u)) == ("unknown", "size_differs_out_of_support", 3)  # U 가 낮아도 1차는 unknown: tile 이 가른다
+
+
 def test_u_at_or_above_the_size_floor_without_tile_p_is_out_of_support():
-    assert vd(axes(0.2, 0.9)) == ("unknown", "size_differs_out_of_support", 3)
+    assert vd(axes(0.2, 0.9), tiled=True) == ("unknown", "size_differs_out_of_support", 3)
+
+
+def test_low_usage_with_a_high_tile_p_is_not_different():
+    """U 가 크기 기준보다 낮아도 tile_p 가 높으면 different 로 보내지 않는다(경우 1 충돌 해소)."""
+    assert vd(axes(0.2, 0.5), tile_p=0.9) == ("unknown", "pattern_same_usage_differs", 1)
+    assert vd(axes(0.2, 0.5), tile_p=0.5) == ("unknown", "pattern_same_usage_differs", 1)
+    assert vd(axes(0.2, 0.5), tile_p=0.45) == ("unknown", "near_boundary_tiled", None)
+    assert vd(axes(0.2, 0.5), tile_p=0.3) == ("different", "size_differs_below_pattern_floor_tiled", 2)
+    assert vd(axes(0.2, 0.5), tile_p=0.9, u_floor=0.4) == ("unknown", "close_to_same_lineage", 3)
+
+
+def test_low_usage_without_tile_p_is_different_and_u_none_stays_unknown():
+    assert vd(axes(0.2, 0.5), tiled=True) == ("different", "size_differs_usage_below_floor", 2)
+    assert vd(axes(0.2, None), tiled=True) == ("unknown", "size_differs_out_of_support", 3)
 
 
 @pytest.mark.parametrize("tile_p, expected", [
@@ -78,7 +98,7 @@ def test_tile_p_at_the_pattern_floor_with_low_usage_is_case_1():
 def test_tile_p_is_compared_decimal_exact():
     # 실제 기준 p_floor 0.45, margin 0.05: 0.45 - 0.05 는 float 로 0.4 가 아니어도 경계는 십진 0.40 / 0.45 이다
     def at(tile_p):
-        return judge_verdict(axes(0.2, 0.95), "LAYER", False, 0.45, 0.9, 0.05, size_u_floor=U_FLOOR, tile_p=tile_p)[:2]
+        return judge_verdict(axes(0.2, 0.95), "LAYER", False, 0.45, 0.9, 0.05, size_u_floor=U_FLOOR, tile_p=tile_p, tiled=True)[:2]
     assert at(0.39999999) == ("different", "size_differs_below_pattern_floor_tiled")
     assert at(0.40) == ("unknown", "near_boundary_tiled")
     assert at(0.44999999) == ("unknown", "near_boundary_tiled")
@@ -177,7 +197,7 @@ def test_size_on_verdicts_and_tile_status(world):
     assert verdict(pairs[("A2", "B2")]) == ("different", "below_pattern_floor", 2)
     assert verdict(pairs[("A3", "B1")]) == ("unknown", "pattern_same_usage_differs", 1)  # adv:4
     assert verdict(pairs[("A3", "B2")]) == ("unknown", "size_differs_out_of_support", 3)
-    assert pairs[("A1", "B1")]["tile_status"] == "usage_below_floor"
+    assert pairs[("A1", "B1")]["tile_status"] == "geometry_unsupported"  # U 가 낮아도 후보: tile 이 안 되면 U 로 different
     assert pairs[("A1", "B2")]["tile_status"] == "geometry_unsupported"  # 합성 world 의 프레임은 margin 1000 px 보다 작아 tile 을 지원하지 않는다
     assert pairs[("A3", "B2")]["tile_status"] == "geometry_unsupported"
     assert pairs[("A2", "B1")]["tile_status"] == "not_candidate"  # U 없음
@@ -186,7 +206,8 @@ def test_size_on_verdicts_and_tile_status(world):
     assert all(pairs[k]["tile_status"] == "not_candidate" for k in SAME)  # 같은 계보
     assert all(pairs[k]["judge_size_u_floor"] == U_FLOOR for k in pairs)
     assert all(pairs[k][key] is None for k in pairs for key in sr.JUDGE_SIZE_SCORE_FIELDS if key not in ("judge_size_u_floor", "tile_status", "tile_source"))
-    assert pairs[("A1", "B2")]["tile_source"] in ("layer", "binding") and pairs[("A1", "B1")]["tile_source"] is None
+    assert pairs[("A1", "B2")]["tile_source"] in ("layer", "binding") and pairs[("A1", "B1")]["tile_source"] in ("layer", "binding")
+    assert pairs[("A2", "B1")]["tile_source"] is None
 
 
 def test_size_on_summary_structure(world):
@@ -196,16 +217,16 @@ def test_size_on_summary_structure(world):
                                        "factor": 8, "tolerance": 1}
     stats = judge["size"]["stats"]
     assert set(stats) == {"pairs_usage_below_floor", "pairs_tiled", "pairs_capped", "tile_status"}
-    assert stats["pairs_usage_below_floor"] == 1 and stats["pairs_tiled"] == 2 and stats["pairs_capped"] == 0  # tile 을 부른 쌍 수(실패 포함)
-    assert stats["tile_status"] == {"not_candidate": 12, "geometry_unsupported": 2, "usage_below_floor": 1}
+    assert stats["pairs_usage_below_floor"] == 1 and stats["pairs_tiled"] == 3 and stats["pairs_capped"] == 0  # tile 을 부른 쌍 수(실패 포함). usage_below_floor 는 reason 쌍 수
+    assert stats["tile_status"] == {"not_candidate": 12, "geometry_unsupported": 3}
     cases = judge["cases"]
     assert cases["size_differs_usage_below_floor"] == 1 and cases["size_differs_tiled"] == 0 and cases["size_differs_tiled_different"] == 0
-    assert cases["size_differs_tile_unsupported"] == 2 and cases["size_differs_out_of_support"] == 3  # U 없음 쌍도 out_of_support
+    assert cases["size_differs_tile_unsupported"] == 3 and cases["size_differs_out_of_support"] == 3  # U 없음 쌍도 out_of_support
     assert cases["case_2"] == 4  # B 쌍 1 + 같은 크기 쌍 1 + 값을 안 정한 (A4, B1)·(A4, B2) 2
 
 
-def test_default_tile_max_pairs_is_2000(world):
-    assert size_run(world)["summary"]["judge"]["size"]["config"]["max_pairs"] == 2000 == sr.JUDGE_TILE_MAX_PAIRS
+def test_default_tile_max_pairs_is_20000(world):
+    assert size_run(world)["summary"]["judge"]["size"]["config"]["max_pairs"] == 20000 == sr.JUDGE_TILE_MAX_PAIRS
 
 
 def test_size_off_leaves_no_trace(world):
@@ -227,12 +248,12 @@ def test_scores_csv_gets_the_size_columns_only_when_on(world, tmp_path):
                                           "tile_applied", "tile_step_replaced", "tile_radius_y_cells", "tile_radius_x_cells", "tile_shift_min_y", "tile_shift_max_y",
                                           "tile_shift_min_x", "tile_shift_max_x")
     rows = {(r["product_a"], r["product_b"]): r for r in csv.DictReader((tmp_path / "on.scores.csv").open(encoding="utf-8", newline=""))}
-    assert rows[("A1", "B1")]["tile_status"] == "usage_below_floor" and rows[("A1", "B2")]["tile_status"] == "geometry_unsupported"
+    assert rows[("A1", "B1")]["tile_status"] == "geometry_unsupported" and rows[("A1", "B2")]["tile_status"] == "geometry_unsupported"
     assert {r["judge_size_u_floor"] for r in rows.values()} == {"0.75"}
     assert all(r[key] == "" for r in rows.values() for key in sr.JUDGE_SIZE_SCORE_FIELDS if key not in ("judge_size_u_floor", "tile_status", "tile_source"))
     assert "size_differs_usage_below_floor" in (tmp_path / "on.scores.csv").read_text(encoding="utf-8")
     off_text = (tmp_path / "off.scores.csv").read_text(encoding="utf-8")
-    assert "tile_status" not in off_text and "usage_below_floor" not in off_text
+    assert "tile_status" not in off_text and "usage_below_floor" not in off_text  # off 에는 reason 이 나올 수 없다
 
 
 def test_review_page_renders_with_the_new_reasons(world):

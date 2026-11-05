@@ -256,6 +256,89 @@ def test_unit_align_failed_when_no_unit_can_be_matched():
     assert out["tile_status"] == "unit_align_failed" and out["tile_p"] is None
 
 
+# --------------------------------------------------------------------------- R1 adv:3 시작점 후보, adv:2 부분 실패 보정
+
+def align_of(sa, sb, shift):
+    plan = st.tile_plan(st.unit_geometry(sa["full_shape"], 8), st.unit_geometry(sb["full_shape"], 8), 8, 1)
+    return plan, st.align_tiles(plan, sources(sa, sb), sa["valid"], sb["valid"], shift)
+
+
+@pytest.mark.parametrize("shift", [(3, 0), (0, -4), (4, -4), (5, 5), (-6, 3)])
+def test_origin_candidate_rescues_a_center_shift_that_is_off_by_three_or_more_cells(shift):
+    """같은 설계 쌍의 중심 정렬 shift 가 원점에서 3칸 이상 어긋나도 (0, 0) 후보로 정렬된다(R1 탐침의 실패 영역).
+    기하 예측의 늘어남 항 때문에 한 축 3칸은 입력 shift 로도 정렬되는 경우가 있어 한 축만 어긋난 경우는 4칸부터 단정한다."""
+    sa, sb = product(552, DESIGN), product(590, DESIGN)
+    plan, out = align_of(sa, sb, shift)
+    assert out["origin"] == "zero" and not out["unit_failed"]
+    result = st.tile_pattern_axis(sa, sb, shift, sources(sa, sb), KEYS)
+    assert result["tile_status"] == "ok" and result["tile_p"] >= 0.95
+    assert result["tile_p"] == st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)["tile_p"]
+
+
+@pytest.mark.parametrize("shift", [(0, 0), (1, 0), (0, -2), (2, 2)])
+def test_input_shift_is_kept_when_it_works_at_least_as_well(shift):
+    sa, sb = product(560, DESIGN), product(560, DESIGN)
+    _, out = align_of(sa, sb, shift)
+    assert out["origin"] == "shift" and not out["unit_failed"]  # 둘 다 4 unit 성공이고 Dice 가 같으면 입력 shift
+
+
+def test_origin_candidate_is_deterministic():
+    sa, sb = product(552, DESIGN), product(590, DESIGN)
+    first, second = (st.tile_pattern_axis(sa, sb, (4, -4), sources(sa, sb), KEYS) for _ in range(2))
+    assert first == second
+
+
+def displaced_units(sa, offsets):
+    """sa 와 같은 크기의 B: unit 마다 B[y, x] = A[y + dy, x + dx] 가 되도록 놓는다(offsets: {unit: (dy, dx)})."""
+    plan = st.tile_plan(st.unit_geometry(sa["full_shape"], 8), st.unit_geometry(sa["full_shape"], 8), 8, 1)
+    sb = {**sa, "rasters": {}}
+    for key, r in sa["rasters"].items():
+        m = np.zeros_like(r["mask"])
+        for q, (y0, y1, x0, x1) in plan["units"].items():
+            dy, dx = offsets[q]
+            m[y0:y1, x0:x1] = st._crop(r["mask"], y0 + dy, y1 + dy, x0 + dx, x1 + dx)
+        sb["rasters"][key] = {"mask": m}
+    return sb
+
+
+def test_partial_unit_failure_is_corrected_with_the_mean_residual_of_the_successful_units():
+    sa = product(560, DESIGN)
+    offsets = {(0, 0): (2, 2), (0, 1): (2, 2), (1, 0): (2, 2), (1, 1): (4, 4)}  # 한 unit 만 입력 예측(0, 0)에서 4칸 어긋나 탐색 반경(실효 ±2) 밖이다
+    sb = displaced_units(sa, offsets)
+    plan, out = align_of(sa, sb, (0, 0))
+    assert out["unit_corrected"] == 1 and out["unit_failed"] == {}
+    assert out["unit_shifts"][(1, 1)] == (4, 4) and out["unit_shifts"][(0, 0)] == (2, 2)
+    # 보정 없이는 이 unit 이 실패한다: 같은 unit 만 따로 맞춰 본다
+    layers = {k: (np.asarray(a), np.asarray(b)) for k, (a, b) in sources(sa, sb).items()}
+    alone = st.match_tile(layers, sa["valid"], sb["valid"], plan["units"][(1, 1)], st._unit_prediction(plan, (0, 0), (1, 1), (0, 0)),
+                          (3, 3), min_support=4)
+    assert not alone["applied"]
+    result = st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)
+    assert result["tile_status"] == "ok"
+
+
+def test_partial_failure_that_stays_failed_uses_the_corrected_prediction():
+    sa = product(560, DESIGN)
+    offsets = {(0, 0): (2, 2), (0, 1): (2, 2), (1, 0): (2, 2), (1, 1): (9, 9)}  # 보정 후 예측(2, 2)에서도 7칸 어긋남
+    _, out = align_of(sa, displaced_units(sa, offsets), (0, 0))
+    assert set(out["unit_failed"]) == {(1, 1)} and out["unit_corrected"] == 0
+    assert out["unit_shifts"][(1, 1)] == (2, 2) and out["unit_shifts"][(0, 0)] == (2, 2)
+
+
+def test_residual_mean_rounds_half_even():
+    sa = product(560, DESIGN)
+    offsets = {(0, 0): (1, 2), (0, 1): (2, 2), (1, 0): (1, 1), (1, 1): (7, 7)}  # 성공 3 unit 잔차 평균 (4/3, 5/3) → (1, 2)
+    _, out = align_of(sa, displaced_units(sa, offsets), (0, 0))
+    assert out["unit_shifts"][(0, 0)] == (1, 2) and set(out["unit_failed"]) == {(1, 1)}
+    assert out["unit_shifts"][(1, 1)] == (1, 2)  # 보정된 예측
+
+
+def test_all_units_failing_is_still_unit_align_failed():
+    sa = product(560, DESIGN)
+    sb = displaced_units(sa, {q: (8, 8) for q in ((0, 0), (0, 1), (1, 0), (1, 1))})
+    assert st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)["tile_status"] == "unit_align_failed"
+
+
 def test_same_input_gives_the_same_output():
     sa, sb = product(560, DESIGN), product(598, DESIGN)
     first = st.tile_pattern_axis(sa, sb, (0, 0), sources(sa, sb), KEYS)

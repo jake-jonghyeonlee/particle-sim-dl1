@@ -162,7 +162,7 @@ def test_size_work_rerun_skips_and_every_other_size_request_stops_and_keeps_file
         assert read_summary(work, part)["judge"]["size"]["config"]["u_floor"] == 0.5
         assert read_summary(work, part)["judge"]["size"]["config"]["max_pairs"] == screen_relations.JUDGE_TILE_MAX_PAIRS
     before = tree_digest(work)
-    for args in ([*THREE, *U], [*THREE, "--judge-size-u-floor=0.5", "--judge-tile-max-pairs", "2000"]):  # 기본값을 적어도 같은 설정이다
+    for args in ([*THREE, *U], [*THREE, "--judge-size-u-floor=0.5", "--judge-tile-max-pairs", str(screen_relations.JUDGE_TILE_MAX_PAIRS)]):  # 기본값을 적어도 같은 설정이다
         again = run_assets(stages, tmp_path, png, work, args)
         assert again.returncode == 0 and "skip relations" in again.stderr and "STOP" not in again.stderr, again.stderr[-2000:]
     assert tree_digest(work) == before

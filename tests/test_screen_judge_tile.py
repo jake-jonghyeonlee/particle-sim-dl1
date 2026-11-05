@@ -107,12 +107,12 @@ def test_tile_failure_statuses_keep_unknown_out_of_support_and_tell_the_cause():
 # ---- 대상이 아닌 쌍·cap ---------------------------------------------------------------------------------------------
 def test_pairs_that_are_not_not_run_are_untouched():
     sigs = {"A": product(560, DESIGN), "B": product(598, DESIGN)}
-    below, other = pair("A", "B", u=0.5), pair("A", "B")
-    below.update(tile_status="usage_below_floor", tier="different", reason="size_differs_usage_below_floor", judge_case=2)
+    skipped, other = pair("A", "B", u=0.5), pair("A", "B")
+    skipped.update(tile_status="not_candidate", tier="different", reason="below_pattern_floor", judge_case=2)
     other["tile_status"] = "not_candidate"
-    before = copy.deepcopy([below, other])
-    stage([below, other], sigs)
-    assert [below, other] == before
+    before = copy.deepcopy([skipped, other])
+    stage([skipped, other], sigs)
+    assert [skipped, other] == before
 
 
 def test_cap_tiles_the_highest_u_first_and_marks_the_rest_capped():
@@ -121,6 +121,37 @@ def test_cap_tiles_the_highest_u_first_and_marks_the_rest_capped():
     stage([low, high], sigs, max_pairs=1)
     assert high["tile_status"] == "ok" and low["tile_status"] == "capped"
     assert low.get("tile_p") is None and low.get("tile_source") is None and verdict_of(low) == ("unknown", "size_differs_out_of_support", 3)
+
+
+def test_all_u_values_are_candidates_and_the_order_is_minus_u_then_names():
+    """U 가 크기 기준보다 낮은 쌍도 후보다: U 내림차순(같으면 이름순)으로 앞 max_pairs 개만 돌리고 나머지는 capped(→ U 낮으면 different)."""
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600), ("D", 599))}
+    lowest, mid_b, mid_c, top = pair("A", "B", u=0.3), pair("A", "C", u=0.6), pair("A", "D", u=0.6), pair("B", "C", u=0.99)
+    stage([lowest, mid_b, mid_c, top], sigs, max_pairs=3)
+    assert [p["tile_status"] for p in (top, mid_b, mid_c)] == ["ok", "ok", "ok"] and lowest["tile_status"] == "capped"
+    assert verdict_of(lowest) == ("different", "size_differs_usage_below_floor", 2)
+
+
+def test_tile_call_order_follows_minus_u_then_product_names(monkeypatch):
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600), ("D", 599))}
+    order = []
+    original = st.tile_pattern_axis
+    monkeypatch.setattr(st, "tile_pattern_axis", lambda sa, sb, shift, *a, **k: order.append(sa["full_shape"][0] * 10000 + sb["full_shape"][0]) or original(sa, sb, shift, *a, **k))
+    stage([pair("A", "D", u=0.6), pair("A", "C", u=0.6), pair("A", "B", u=0.3), pair("B", "C", u=0.99)], sigs)
+    full = {n: sigs[n]["full_shape"][0] for n in sigs}
+    assert order == [full["B"] * 10000 + full["C"], full["A"] * 10000 + full["C"], full["A"] * 10000 + full["D"], full["A"] * 10000 + full["B"]]
+
+
+def test_capped_low_u_pair_is_different_and_capped_high_u_pair_is_unknown():
+    sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600))}
+    top, low_u, high_u = pair("A", "C", u=0.99), pair("A", "B", u=0.5), pair("B", "C", u=0.8)
+    stage([top, low_u, high_u], sigs, max_pairs=1)
+    assert top["tile_status"] == "ok" and low_u["tile_status"] == high_u["tile_status"] == "capped"
+    assert verdict_of(low_u) == ("different", "size_differs_usage_below_floor", 2) and verdict_of(high_u) == ("unknown", "size_differs_out_of_support", 3)
+
+
+def test_default_cap_is_20000():
+    assert sr.JUDGE_TILE_MAX_PAIRS == 20000
 
 
 def test_cap_ties_break_on_product_names():
@@ -132,8 +163,9 @@ def test_cap_ties_break_on_product_names():
 
 def test_max_pairs_zero_leaves_everything_not_run():
     sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598))}
-    p = stage([pair("A", "B")], sigs, max_pairs=0)[0]
+    p, low = stage([pair("A", "B"), pair("A", "B", u=0.5)], sigs, max_pairs=0)
     assert p["tile_status"] == "not_run" and p.get("tile_p") is None and "tile_source" not in p and verdict_of(p) == ("unknown", "size_differs_out_of_support", 3)
+    assert low["tile_status"] == "not_run" and verdict_of(low) == ("different", "size_differs_usage_below_floor", 2)  # tile_p 없음 행
 
 
 # ---- shift 약속 ----------------------------------------------------------------------------------------------------
@@ -164,7 +196,7 @@ def test_judge_tile_stage_converts_the_frame_center_shift_to_the_origin_shift(si
     if size_b != 560:  # 변환이 없었다면 원점 이동으로 center 가 들어가 맞지 않는다
         assert st.origin_shift(sa, sb, shift) == residual
         raw = st.tile_pattern_axis(sa, sb, shift, sources(sa, sb), KEYS)
-        assert raw["tile_p"] is None or raw["tile_p"] < p["tile_p"]
+        assert raw["tile_p"] is None or raw["tile_p"] <= p["tile_p"]  # (0, 0) 시작점 후보 덕에 변환 없이도 맞는 경우가 있다
 
 
 def test_judge_tile_stage_passes_the_origin_shift_to_tile_pattern_axis(monkeypatch):
@@ -196,16 +228,15 @@ def test_same_input_gives_the_same_pairs():
 def test_stats_and_cases_match_the_scores_columns():
     sigs = {n: product(u, DESIGN) for n, u in (("A", 560), ("B", 598), ("C", 600), ("D", 601))}
     pairs = [pair("A", "B", u=0.9), pair("A", "C", u=0.99), pair("A", "D", u=0.8)]
-    below = pair("B", "C", u=0.5)
-    below.update(tile_status="usage_below_floor", tier="different", reason="size_differs_usage_below_floor", judge_case=2)
-    pairs.append(below)
+    low = pair("B", "C", u=0.5)  # U 가 낮은 쌍도 후보다: cap 에 걸리면 capped + different
+    pairs.append(low)
     stage(pairs, sigs, max_pairs=2)
     summary = sr.judge_summary(pairs, {"p": {}, "u": {}}, MARGIN_V, None, None, {**SIZE, "max_pairs": 2})
     stats, cases = summary["size"]["stats"], summary["cases"]
     statuses = [p["tile_status"] for p in pairs]
-    assert stats["pairs_capped"] == statuses.count("capped") == 1
-    assert stats["pairs_tiled"] == sum(s not in {"capped", "usage_below_floor", "not_run", "not_candidate"} for s in statuses) == 2
-    assert stats["pairs_usage_below_floor"] == 1
+    assert stats["pairs_capped"] == statuses.count("capped") == 2
+    assert stats["pairs_tiled"] == sum(s not in {"capped", "not_run", "not_candidate"} for s in statuses) == 2
+    assert stats["pairs_usage_below_floor"] == sum(p["reason"] == "size_differs_usage_below_floor" for p in pairs) == 1 and low["tier"] == "different"
     assert stats["tile_status"] == {s: statuses.count(s) for s in sorted(set(statuses))}
     assert cases["size_differs_tiled"] == statuses.count("ok")
     assert cases["size_differs_tile_unsupported"] == sum(s in sr.TILE_FAILURE_STATUSES for s in statuses)
@@ -230,19 +261,21 @@ def fake_tile(p_by_pair):
 
 
 def test_screen_reapplies_the_table_with_tile_p(world, monkeypatch):
-    fake = fake_tile([0.2, 0.9])  # 후보 (A1,B2) U .75 → 첫 번째, (A3,B2) U .95 → 정렬상 U 가 높은 이쪽이 먼저
+    fake = fake_tile([0.2, 0.9, None])  # 후보 (A3,B2) U .95 → 첫 번째, (A1,B2) U .75 → 두 번째, (A1,B1) U .5 → 세 번째(tile 실패)
     monkeypatch.setattr(st, "tile_pattern_axis", fake)
     result = size_run(world)
     pairs = by_pair(result)
-    # U 내림차순: (A3,B2)=0.95 가 첫 호출(tile_p 0.2 → different), (A1,B2)=0.75 가 두 번째(tile_p 0.9 → close)
+    # U 내림차순: (A3,B2)=0.95 가 첫 호출(tile_p 0.2 → different), (A1,B2)=0.75 가 두 번째(tile_p 0.9 → close), (A1,B1)=0.5 는 tile 실패 + U 낮음 → different
     assert verdict(pairs[("A3", "B2")]) == ("different", "size_differs_below_pattern_floor_tiled", 2)
     assert verdict(pairs[("A1", "B2")]) == ("unknown", "close_to_same_lineage", 3)
+    assert verdict(pairs[("A1", "B1")]) == ("different", "size_differs_usage_below_floor", 2) and pairs[("A1", "B1")]["tile_status"] == "unit_align_failed"
     assert pairs[("A3", "B2")]["tile_p"] == 0.2 and pairs[("A3", "B2")]["axis_p_eff"] == 0.2 and pairs[("A3", "B2")]["axis_p"] == 0.2
     assert pairs[("A1", "B2")]["axis_p_eff"] == 0.9 and pairs[("A1", "B2")]["axis_p"] == 0.2 and pairs[("A1", "B2")]["tile_count"] == 7
     assert all(pairs[k]["axis_p_eff"] == pairs[k]["axis_p"] for k in pairs if k not in {("A3", "B2"), ("A1", "B2")})
     assert [c["keys"] for c in fake.calls] == [sorted(c["keys"]) for c in fake.calls] and all(c["sources"] for c in fake.calls)
     judge = result["summary"]["judge"]
-    assert judge["size"]["stats"]["pairs_tiled"] == 2 and judge["size"]["stats"]["tile_status"]["ok"] == 2
+    assert judge["size"]["stats"]["pairs_tiled"] == 3 and judge["size"]["stats"]["tile_status"]["ok"] == 2
+    assert judge["size"]["stats"]["pairs_usage_below_floor"] == 1
     assert judge["cases"]["size_differs_tiled"] == 2 and judge["cases"]["size_differs_tiled_different"] == 1
     assert judge["cases"]["size_differs_out_of_support"] == 1  # U 없음 쌍 (A2,B1) 만 남는다
 
@@ -251,18 +284,20 @@ def test_screen_max_pairs_zero_and_cap(world, monkeypatch):
     fake = fake_tile([0.9])
     monkeypatch.setattr(st, "tile_pattern_axis", fake)
     zero = size_run(world, judge_tile_max_pairs=0)
-    assert not fake.calls and zero["summary"]["judge"]["size"]["stats"]["tile_status"]["not_run"] == 2
+    assert not fake.calls and zero["summary"]["judge"]["size"]["stats"]["tile_status"]["not_run"] == 3
+    assert verdict(by_pair(zero)[("A1", "B1")]) == ("different", "size_differs_usage_below_floor", 2)
     capped = size_run(world, judge_tile_max_pairs=1)
     pairs = by_pair(capped)
-    assert pairs[("A3", "B2")]["tile_status"] == "ok" and pairs[("A1", "B2")]["tile_status"] == "capped"
+    assert pairs[("A3", "B2")]["tile_status"] == "ok" and pairs[("A1", "B2")]["tile_status"] == "capped" and pairs[("A1", "B1")]["tile_status"] == "capped"
     stats = capped["summary"]["judge"]["size"]["stats"]
-    assert stats["pairs_capped"] == 1 and stats["pairs_tiled"] == 1
+    assert stats["pairs_capped"] == 2 and stats["pairs_tiled"] == 1
     assert verdict(pairs[("A1", "B2")]) == ("unknown", "size_differs_out_of_support", 3)
+    assert verdict(pairs[("A1", "B1")]) == ("different", "size_differs_usage_below_floor", 2)
 
 
 def test_axis_p_eff_orders_the_cross_group_cap(world, monkeypatch):
     """tile 로 different 가 된 교차 그룹 쌍도 cap 에서 P 순서(tile_p 가 있으면 tile_p)로 가려진다."""
-    monkeypatch.setattr(st, "tile_pattern_axis", fake_tile([0.1, 0.1]))
+    monkeypatch.setattr(st, "tile_pattern_axis", fake_tile([0.1, 0.1, 0.1]))
     groups = {"A1": "g1", "A2": "g1", "A3": "g1", "A4": "g1", "B1": "g2", "B2": "g2"}
     result = size_run(world, groups=groups, cross_group_fraction=0.0)
     pairs = by_pair(result)

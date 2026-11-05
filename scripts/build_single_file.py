@@ -459,7 +459,7 @@ def _user_floor_source(args):
 
 JUDGE_ARGS = ("--judge", "--judge-floor-p", "--judge-floor-u")
 SIZE_ARGS = ("--judge-size-u-floor", "--judge-tile-max-pairs")
-SIZE_MAX_PAIRS_DEFAULT = 2000  # screen_relations.JUDGE_TILE_MAX_PAIRS 와 같은 값(테스트가 같음을 단정한다). --judge-tile-max-pairs 를 생략했을 때 기록되는 값
+SIZE_MAX_PAIRS_DEFAULT = 20000  # screen_relations.JUDGE_TILE_MAX_PAIRS 와 같은 값(테스트가 같음을 단정한다). --judge-tile-max-pairs 를 생략했을 때 기록되는 값
 JUDGE_MODES = ("legacy", "three-axis")
 
 

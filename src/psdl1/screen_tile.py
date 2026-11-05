@@ -296,24 +296,58 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
     """unit 이동 → tile 이동 → G1. plan 은 status ok 여야 한다.
 
     반환: offsets (tile 목록 순서의 (dy, dx)), predictions (tile 기하 예측), applied (매처 결과를 쓴 tile), reasons, step_replaced (G1 이 되돌린 수),
-    unit_shifts {unit: (dy, dx) 중심 이동}, unit_failed {unit: 이유} (기하 예측으로 대체한 unit)."""
+    unit_shifts {unit: (dy, dx) 중심 이동}, unit_failed {unit: 이유} (기하 예측으로 대체한 unit), origin ("shift"|"zero": 고른 시작점 후보),
+    unit_corrected (잔차 보정으로 성공한 unit 수).
+
+    시작점: 입력 shift 와 기하 원점 (0, 0) 두 후보로 unit 단계를 돌려 성공 unit 수가 많은 쪽, 같으면 성공 unit Dice 평균이 높은 쪽, 같으면 입력 shift 를 쓴다.
+    부분 실패 보정: 일부 unit 만 성공하면 성공 unit 의 (실제 − 예측) 잔차 평균(축별, round(Fraction) 반올림 half-even)을 실패 unit 예측에 더해 한 번 다시 맞춘다."""
     if plan["status"] != "ok":
         raise ValueError(f"plan status is {plan['status']}")
     ry, rx = plan["radius_cells"]
     uy_r, ux_r = plan["unit_radius_cells"]
-    unit_shift, unit_failed, unit_center = {}, {}, {}
-    for q in sorted(plan["units"]):
-        y0, y1, x0, x1 = plan["units"][q]
-        center = ((y0 + y1) // 2, (x0 + x1) // 2)
-        pred = _unit_prediction(plan, shift, q, center)
-        res = match_tile(layers, valid_a, valid_b, plan["units"][q], pred, (uy_r, ux_r), min_support=min_support_cells(plan["units"][q]),
-                         min_layer_support=min_layer_support_cells(plan["units"][q]), min_dice=min_dice)
-        unit_center[q] = center
-        if res["applied"]:
-            unit_shift[q] = (pred[0] + res["delta"][0], pred[1] + res["delta"][1])
-        else:
-            unit_shift[q] = pred
-            unit_failed[q] = res["reason"]
+
+    def run_units(origin, pred_add=None):
+        shifts, failed, dices, results = {}, {}, {}, {}
+        for q in sorted(plan["units"]):
+            y0, y1, x0, x1 = plan["units"][q]
+            center = ((y0 + y1) // 2, (x0 + x1) // 2)
+            pred = _unit_prediction(plan, origin, q, center)
+            if pred_add is not None and q in pred_add:
+                pred = (pred[0] + pred_add[q][0], pred[1] + pred_add[q][1])
+            res = match_tile(layers, valid_a, valid_b, plan["units"][q], pred, (uy_r, ux_r), min_support=min_support_cells(plan["units"][q]),
+                             min_layer_support=min_layer_support_cells(plan["units"][q]), min_dice=min_dice)
+            results[q] = (pred, res)
+            if res["applied"]:
+                shifts[q] = (pred[0] + res["delta"][0], pred[1] + res["delta"][1])
+                dices[q] = res["dice"]
+            else:
+                shifts[q] = pred
+                failed[q] = res["reason"]
+        return shifts, failed, dices, results
+
+    origins = [("shift", (int(shift[0]), int(shift[1])))]
+    if origins[0][1] != (0, 0):
+        origins.append(("zero", (0, 0)))
+    best = None
+    for name, origin in origins:
+        run = run_units(origin)
+        score = (len(run[2]), (sum(run[2].values()) / len(run[2])) if run[2] else -1.0)
+        if best is None or score > best[0]:  # 엄밀히 클 때만 바꾼다: 같으면 입력 shift
+            best = (score, name, origin, run)
+    _, origin_name, origin, (unit_shift, unit_failed, dices, results) = best
+    unit_center = {q: ((plan["units"][q][0] + plan["units"][q][1]) // 2, (plan["units"][q][2] + plan["units"][q][3]) // 2) for q in plan["units"]}
+    corrected = 0
+    if unit_failed and dices:
+        residuals = [(unit_shift[q][0] - results[q][0][0], unit_shift[q][1] - results[q][0][1]) for q in dices]
+        mean = tuple(int(round(Fraction(sum(r[ax] for r in residuals), len(residuals)))) for ax in (0, 1))
+        retry = run_units(origin, {q: mean for q in unit_failed})
+        for q in sorted(unit_failed):
+            unit_shift[q] = retry[0][q]
+            if q in retry[1]:
+                unit_failed[q] = retry[1][q]
+            else:
+                del unit_failed[q]
+                corrected += 1
     tiles = plan["tiles"]
     preds, offsets, applied, reasons = [], [], [], []
     for t in tiles:
@@ -347,7 +381,7 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
             reasons[k] = "step_exceeded"
             replaced += 1
     return {"offsets": offsets, "predictions": preds, "applied": applied, "reasons": reasons, "step_replaced": replaced,
-            "unit_shifts": unit_shift, "unit_failed": unit_failed}
+            "unit_shifts": unit_shift, "unit_failed": unit_failed, "origin": origin_name, "unit_corrected": corrected}
 
 
 def warp_raster(mask_b, plan, offsets):
