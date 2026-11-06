@@ -54,7 +54,8 @@ JUDGE_MODES = ("legacy", "three-axis")
 JUDGE_SCHEMA = "dl1_judge_v1"
 JUDGE_SIZE_SUPPORT_PX = 7  # PLAN v1.2 G-size: LAYER 정렬에서 |ΔU| 가 이 값 이하인 크기 차만 P 가 믿을 만하다(T2 측정 근거)
 JUDGE_TILE_MAX_PAIRS = 20000  # --judge-tile-max-pairs 기본값
-JUDGE_SIZE_FIXED = {"support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "factor": 8, "tolerance": 1}  # screen_tile 상수(MAX_DELTA_U_PX·S_MAX_CELLS·TILE_MIN_CELLS)와 같은 값(순환 import 라 값으로 적고 테스트가 같음을 단정한다). summary.judge.size.config 에 고정해 기록한다
+JUDGE_SIZE_FIXED = {"support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "xy_support_px": 50, "xy_ratio_min": 0.15, "tile_min_cells_xy": 5, "factor": 8,
+                    "tolerance": 1}  # screen_tile 상수(MAX_DELTA_U_PX·S_MAX_CELLS·TILE_MIN_CELLS·XY_SUPPORT_PX·XY_RATIO_MIN·TILE_MIN_CELLS_XY)와 같은 값(순환 import 라 값으로 적고 테스트가 같음을 단정한다). summary.judge.size.config 에 고정해 기록한다
 TILE_FAILURE_STATUSES = frozenset({"not_run", "capped", "geometry_unsupported", "out_of_support", "tile_too_small", "too_many_tiles", "unit_align_failed", "low_coverage"})
 TILE_NOT_EXECUTED = frozenset({None, "not_run", "capped", "not_candidate"})  # 이 밖의 tile_status 는 tile_pattern_axis 를 실제로 부른 쌍이다
 
@@ -518,7 +519,8 @@ def load_floor_spec(path):
         block = judge["size"]
         config = block.get("config") if isinstance(block, dict) else None
         if not isinstance(config, dict) or set(config) != {"u_floor", "enabled", "max_pairs", *JUDGE_SIZE_FIXED}:
-            raise bad("size needs a config with u_floor, enabled, max_pairs, support_px, s_max_cells, tile_min_cells, factor and tolerance")
+            raise bad("size needs a config with u_floor, enabled, max_pairs, support_px, s_max_cells, tile_min_cells, xy_support_px, xy_ratio_min, tile_min_cells_xy, "
+                      "factor and tolerance (a summary written before the xy support range lacks the xy keys: move the relations and run again)")
         if not number(config["u_floor"]) or isinstance(config["u_floor"], bool) or not 0 <= config["u_floor"] <= 1:
             raise bad("size.config.u_floor must be a number in [0,1]")
         if config["enabled"] is not True:

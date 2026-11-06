@@ -77,10 +77,49 @@ def test_tile_width_follows_the_delta_u_and_limits():
     assert p["radius_cells"] == (3, 3) and p["unit_radius_cells"] == (3, 3)  # 반경은 ΔU 와 무관한 고정값
     assert plan_of(560, 600)["status"] == "ok" and plan_of(560, 600)["tile_cells"] == (7, 7)  # 지원 상한 ΔU 40
     assert plan_of(552, 592)["status"] == "tile_too_small"  # 552 // 80 = 6 칸 < 7
-    assert plan_of(560, 601)["status"] == "out_of_support"
+    assert plan_of(560, 611)["status"] == "out_of_support"  # ΔU 51 은 두 축이 함께 늘어나도 지원 밖
     assert plan_of(480, 541)["status"] == "out_of_support"
     same = plan_of(552, 552)
     assert same["status"] == "ok" and same["tile_cells"] == (34, 34) and same["radius_cells"] == (3, 3)
+
+
+def rect_plan(a, b):
+    """a, b: (U_y, U_x). 축마다 U 가 다른 쌍의 계획."""
+    return st.tile_plan(*(st.unit_geometry((2 * uy + 1000, 2 * ux + 1000), 8) for uy, ux in (a, b)), 8, 1)
+
+
+def test_xy_stretch_above_forty_is_supported_down_to_five_cells():
+    assert (st.XY_SUPPORT_PX, st.XY_RATIO_MIN, st.TILE_MIN_CELLS_XY) == (50, 0.15, 5)
+    for u, delta, cells in ((560, 41, 6), (560, 50, 5), (552, 50, 5), (500, 50, 5), (1000, 50, 10)):  # 두 축이 함께 늘어난 쌍: 폭 U // (2·ΔU), 최소 5 칸
+        p = rect_plan((u, u), (u + delta, u + delta))
+        assert p["status"] == "ok" and p["tile_cells"] == (cells, cells), (u, delta)
+    assert rect_plan((492, 492), (542, 542))["status"] == "tile_too_small"  # 492 // 100 = 4 칸 < 5
+    assert rect_plan((552, 552), (592, 592))["status"] == "tile_too_small"  # 40 이하는 여전히 최소 7 칸
+    assert rect_plan((552, 552), (590, 590))["status"] == "ok"
+
+
+def test_xy_stretch_above_forty_needs_both_axes_the_same_sign_and_the_ratio():
+    base = 560
+    ok = lambda dy, dx: rect_plan((base, base), (base + dy, base + dx))["status"]
+    assert ok(50, 8) == "ok" and ok(8, 50) == "ok" and ok(45, 7) == "ok" and ok(42, 7) == "ok"  # 비율 0.16·0.156·0.167: 하한 0.15 이상
+    assert ok(50, 40) == "ok" and ok(45, 50) == "ok" and ok(45, 9) == "ok"
+    assert ok(50, 7) == "out_of_support" and ok(7, 50) == "out_of_support"  # 비율 0.14
+    assert ok(45, 6) == "out_of_support" and ok(42, 6) == "out_of_support"  # 0.133·0.143
+    assert ok(50, 0) == "out_of_support" and ok(0, 50) == "out_of_support"  # 한 축만 늘어남
+    assert ok(41, 0) == "out_of_support" and ok(0, 41) == "out_of_support"
+    assert ok(51, 51) == "out_of_support" and ok(50, 51) == "out_of_support"
+    assert ok(40, 0) == "ok" and ok(0, 40) == "ok" and ok(40, 33) == "ok"  # 40 이하는 한 축만 늘어나도 지원(옛 동작)
+    # 부호가 다르면(한 축은 늘고 한 축은 줄어듦) 지원 밖
+    assert rect_plan((610, 560), (560, 610))["status"] == "out_of_support"
+    assert rect_plan((560, 610), (610, 560))["status"] == "out_of_support"
+    shrink = rect_plan((610, 610), (560, 560))  # 둘 다 줄어듦도 xy 다: 작은 쪽 U 로 폭을 정한다
+    assert shrink["status"] == "ok" and shrink["delta_u_px"] == (-50, -50) and shrink["tile_cells"] == (5, 5)
+
+
+def test_is_xy_stretch_uses_an_exact_ratio():
+    assert st.is_xy_stretch((50, 8)) and st.is_xy_stretch((45, 7)) and st.is_xy_stretch((-50, -8)) and st.is_xy_stretch((41, 41)) and st.is_xy_stretch((8, 50))
+    assert st.is_xy_stretch((20, 3)) and not st.is_xy_stretch((20, 2))  # 3/20 = 0.15 는 경계(정확한 분수 비교)
+    assert not st.is_xy_stretch((45, 6)) and not st.is_xy_stretch((50, 7)) and not st.is_xy_stretch((50, -50)) and not st.is_xy_stretch((50, 0)) and not st.is_xy_stretch((0, 0))
 
 
 def test_layer_support_is_capped_but_omega_support_follows_the_area():

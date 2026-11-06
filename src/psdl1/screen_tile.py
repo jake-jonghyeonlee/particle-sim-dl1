@@ -6,7 +6,8 @@
 
 구조
   unit_geometry   축마다 U_px = (길이 − 1000)/2. 원본 px 경계 500, 500+U, 500+2U 를 한 번만 floor(px/factor) 로 양자화해 공유 경계 배열을 만든다.
-  tile_plan       ΔU(B−A)로 tile 폭 T = U_min/(2·ΔU)(최소 7 칸), 탐색 반경(unit·tile 모두 3 고정), tile 목록을 정한다. ΔU 가 MAX_DELTA_U_PX(40) 를 넘거나 범위를 벗어나면 이유 상태를 돌려준다.
+  tile_plan       ΔU(B−A)로 tile 폭 T = U_min/(2·ΔU)(최소 7 칸), 탐색 반경(unit·tile 모두 3 고정), tile 목록을 정한다. max|ΔU| 가 MAX_DELTA_U_PX(40) 이하면 그대로 지원하고,
+                  40 위 XY_SUPPORT_PX(50) 이하는 두 축이 같은 부호로 함께 늘어난 쌍(비율 ≥ XY_RATIO_MIN)만 지원한다(tile 최소 TILE_MIN_CELLS_XY 5 칸). 그 밖은 이유 상태를 돌려준다.
   match_tile      compare(layer_align) 규칙의 tile 매처: 고정 Ω, Dice 우선 층 순서, 모호함·낮은 점수·탐색 경계는 거부(→ 기하 예측으로 대체).
   align_tiles     시작점 후보(기하 원점 (0,0), 입력 shift)마다 unit 이동 → tile 이동 → G1(이웃 tile 단차 상자) → coverage 를 돌리고 고른다.
   warp_raster     tile 마다 B 를 그 이동으로 잘라 A 좌표에 놓는다.
@@ -28,9 +29,12 @@ from .screen_relations import boundary_f1
 FACTOR = 8
 TOLERANCE = 1
 MARGIN_PX = 500
-MAX_DELTA_U_PX = 40  # 지원 범위(합성 게이트 근거: scripts/measure_unit_stretch.py --tile). 이 위는 out_of_support
+MAX_DELTA_U_PX = 40  # 지원 범위(합성 게이트 근거: scripts/measure_unit_stretch.py --tile). 이 위는 두 축이 함께 늘어난 쌍(아래 XY_*)만 지원하고 나머지는 out_of_support
 S_MAX_CELLS = 2
 TILE_MIN_CELLS = 7  # 게이트에서 확인한 가장 좁은 tile 폭(U 560, ΔU 40)
+XY_SUPPORT_PX = 50  # 두 축이 함께 늘어난 쌍의 지원 상한: max(|ΔU_y|, |ΔU_x|) 가 40 위 50 이하이면 XY_RATIO_MIN 을 만족하는 같은 부호 쌍만 지원한다
+XY_RATIO_MIN = 0.15  # min(|ΔU_y|, |ΔU_x|) / max(...) 하한(0.05 간격; 합성 게이트 (a) 를 만족하는 가장 작은 값: scripts/measure_unit_stretch.py --tile --xy-sweep. 0.10 부터 (a) 실패)
+TILE_MIN_CELLS_XY = 5  # 40 위 구간의 tile 최소 폭(U 552, ΔU 50 → 5 칸)
 TILE_DIVISOR = 2  # tile 폭 = U_min / (2·ΔU): tile 안 늘어남 차가 0.5 칸 이하
 UNIT_RADIUS_CELLS = 3  # 기하 예측이 정확해서 unit·tile 탐색 반경은 ΔU 와 무관한 작은 고정값(경계에 닿은 후보는 search_bound 로 거부하므로 실효 ±2)
 TILE_RADIUS_CELLS = 3
@@ -114,6 +118,14 @@ def unit_regions(geometry):
     return {(iy, ix): (by[iy], by[iy + 1], bx[ix], bx[ix + 1]) for iy in (0, 1) for ix in (0, 1)}
 
 
+def is_xy_stretch(delta):
+    """ΔU (y, x) 가 두 축이 함께 늘어난(또는 줄어든) 쌍인가: 같은 부호이고 min/max 비율이 XY_RATIO_MIN 이상. 부호가 다르거나 한 축이 0 이면 아니다."""
+    dy, dx = int(delta[0]), int(delta[1])
+    if dy * dx <= 0:
+        return False
+    return Fraction(min(abs(dy), abs(dx)), max(abs(dy), abs(dx))) >= Fraction(repr(XY_RATIO_MIN))
+
+
 def tile_plan(geometry_a, geometry_b, factor, tolerance):
     """tile 계획. factor ≠ 8 이거나 tolerance ≠ 1 이면 ValueError. 그 밖의 지원 밖은 status 로 돌려준다(tile_status 값).
 
@@ -131,9 +143,11 @@ def tile_plan(geometry_a, geometry_b, factor, tolerance):
     plan["units"] = unit_regions(geometry_a)
     plan["unit_radius_cells"] = (UNIT_RADIUS_CELLS, UNIT_RADIUS_CELLS)
     plan["radius_cells"] = (TILE_RADIUS_CELLS, TILE_RADIUS_CELLS)
-    if max(abs(delta[0]), abs(delta[1])) > MAX_DELTA_U_PX:
+    top = max(abs(delta[0]), abs(delta[1]))
+    if top > XY_SUPPORT_PX or (top > MAX_DELTA_U_PX and not is_xy_stretch(delta)):
         plan["status"] = "out_of_support"
         return plan
+    min_cells = TILE_MIN_CELLS if top <= MAX_DELTA_U_PX else TILE_MIN_CELLS_XY
     tile = []
     for ax in (0, 1):
         u_min_px = min(geometry_a["u_px"][ax], geometry_b["u_px"][ax])
@@ -142,7 +156,7 @@ def tile_plan(geometry_a, geometry_b, factor, tolerance):
         t = cap if delta[ax] == 0 else min(u_min_px // (TILE_DIVISOR * abs(delta[ax])), cap)
         tile.append(t)
     plan["tile_cells"] = tuple(tile)
-    if min(tile) < TILE_MIN_CELLS:
+    if min(tile) < min_cells:
         plan["status"] = "tile_too_small"
         return plan
     tiles = []

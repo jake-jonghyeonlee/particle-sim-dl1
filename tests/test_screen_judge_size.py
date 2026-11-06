@@ -214,7 +214,7 @@ def test_size_on_summary_structure(world):
     judge = size_run(world, judge_tile_max_pairs=7)["summary"]["judge"]
     assert judge["schema"] == "dl1_judge_v1"
     assert judge["size"]["config"] == {"u_floor": U_FLOOR, "enabled": True, "max_pairs": 7, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7,
-                                       "factor": 8, "tolerance": 1}
+                                       "xy_support_px": 50, "xy_ratio_min": 0.15, "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1}
     stats = judge["size"]["stats"]
     assert set(stats) == {"pairs_usage_below_floor", "pairs_tiled", "pairs_capped", "tile_status"}
     assert stats["pairs_usage_below_floor"] == 1 and stats["pairs_tiled"] == 3 and stats["pairs_capped"] == 0  # tile 을 부른 쌍 수(실패 포함). usage_below_floor 는 reason 쌍 수
@@ -283,7 +283,8 @@ def r02_run(world, out, path, spec=None, **kwargs):
 def test_incremental_carries_the_size_config_and_recounts_the_stats(world, tmp_path):
     r01, out, path = r01_with_size(world, tmp_path, judge_size_u_floor=U_FLOOR, judge_tile_max_pairs=9)
     spec = load_floor_spec(path)
-    assert spec["judge"]["size"] == {"u_floor": U_FLOOR, "enabled": True, "max_pairs": 9, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "factor": 8, "tolerance": 1}
+    assert spec["judge"]["size"] == {"u_floor": U_FLOOR, "enabled": True, "max_pairs": 9, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7,
+                                     "xy_support_px": 50, "xy_ratio_min": 0.15, "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1}
     r02 = r02_run(world, out, path)
     size = r02["summary"]["judge"]["size"]
     assert size["config"] == r01["summary"]["judge"]["size"]["config"]
@@ -334,13 +335,24 @@ def test_incremental_rejects_other_factor_or_tolerance_for_a_stored_size_config(
     ({"u_floor": 1.5}, "u_floor"), ({"u_floor": True}, "u_floor"), ({"u_floor": None}, "u_floor"), ({"enabled": False}, "enabled"),
     ({"max_pairs": -1}, "max_pairs"), ({"max_pairs": 1.5}, "max_pairs"), ({"max_pairs": True}, "max_pairs"),
     ({"factor": 4}, "factor"), ({"tolerance": 0}, "tolerance"), ({"support_px": 30}, "support_px"), ({"s_max_cells": 3}, "s_max_cells"),
-    ({"tile_min_cells": 4}, "tile_min_cells"),
+    ({"tile_min_cells": 4}, "tile_min_cells"), ({"xy_support_px": 40}, "xy_support_px"), ({"xy_ratio_min": 0.8}, "xy_ratio_min"),
+    ({"tile_min_cells_xy": 7}, "tile_min_cells_xy"),
 ])
 def test_load_floor_spec_validates_the_size_block(tmp_path, changes, message):
-    config = {"u_floor": 0.75, "enabled": True, "max_pairs": 2000, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "factor": 8, "tolerance": 1, **changes}
+    config = {"u_floor": 0.75, "enabled": True, "max_pairs": 2000, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "xy_support_px": 50, "xy_ratio_min": 0.15,
+              "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1, **changes}
     document = judge_document()
     document["judge"]["size"] = {"config": config, "stats": {}}
     with pytest.raises(ValueError, match=message):
+        load_floor_spec(write_spec(tmp_path, document))
+
+
+def test_load_floor_spec_rejects_a_size_summary_written_before_the_xy_support_range(tmp_path):
+    """T9 이전 r01 summary(support_px 40, xy 키 없음)는 기본값으로 읽지 않고 거부한다: 지원 범위가 다른 설정을 섞지 않는다. 문구는 relations 를 옮기고 다시 돌리라고 안내한다."""
+    old = {"u_floor": 0.75, "enabled": True, "max_pairs": 2000, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "factor": 8, "tolerance": 1}
+    document = judge_document()
+    document["judge"]["size"] = {"config": old, "stats": {}}
+    with pytest.raises(ValueError, match=r"xy_support_px.*move the relations and run again"):
         load_floor_spec(write_spec(tmp_path, document))
 
 
@@ -413,3 +425,6 @@ def test_fixed_size_config_matches_screen_tile_constants():
     assert sr.JUDGE_SIZE_FIXED["support_px"] == screen_tile.MAX_DELTA_U_PX
     assert sr.JUDGE_SIZE_FIXED["s_max_cells"] == screen_tile.S_MAX_CELLS
     assert sr.JUDGE_SIZE_FIXED["tile_min_cells"] == screen_tile.TILE_MIN_CELLS
+    assert sr.JUDGE_SIZE_FIXED["xy_support_px"] == screen_tile.XY_SUPPORT_PX
+    assert sr.JUDGE_SIZE_FIXED["xy_ratio_min"] == screen_tile.XY_RATIO_MIN
+    assert sr.JUDGE_SIZE_FIXED["tile_min_cells_xy"] == screen_tile.TILE_MIN_CELLS_XY
