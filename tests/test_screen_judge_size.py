@@ -214,7 +214,7 @@ def test_size_on_summary_structure(world):
     judge = size_run(world, judge_tile_max_pairs=7)["summary"]["judge"]
     assert judge["schema"] == "dl1_judge_v1"
     assert judge["size"]["config"] == {"u_floor": U_FLOOR, "enabled": True, "max_pairs": 7, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7,
-                                       "xy_support_px": 50, "xy_ratio_min": 0.15, "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1}
+                                       "xy_support_px": 50, "xy_ratio_min": 0.5, "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1}
     stats = judge["size"]["stats"]
     assert set(stats) == {"pairs_usage_below_floor", "pairs_tiled", "pairs_capped", "tile_status"}
     assert stats["pairs_usage_below_floor"] == 1 and stats["pairs_tiled"] == 3 and stats["pairs_capped"] == 0  # tile 을 부른 쌍 수(실패 포함). usage_below_floor 는 reason 쌍 수
@@ -284,7 +284,7 @@ def test_incremental_carries_the_size_config_and_recounts_the_stats(world, tmp_p
     r01, out, path = r01_with_size(world, tmp_path, judge_size_u_floor=U_FLOOR, judge_tile_max_pairs=9)
     spec = load_floor_spec(path)
     assert spec["judge"]["size"] == {"u_floor": U_FLOOR, "enabled": True, "max_pairs": 9, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7,
-                                     "xy_support_px": 50, "xy_ratio_min": 0.15, "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1}
+                                     "xy_support_px": 50, "xy_ratio_min": 0.5, "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1}
     r02 = r02_run(world, out, path)
     size = r02["summary"]["judge"]["size"]
     assert size["config"] == r01["summary"]["judge"]["size"]["config"]
@@ -339,7 +339,7 @@ def test_incremental_rejects_other_factor_or_tolerance_for_a_stored_size_config(
     ({"tile_min_cells_xy": 7}, "tile_min_cells_xy"),
 ])
 def test_load_floor_spec_validates_the_size_block(tmp_path, changes, message):
-    config = {"u_floor": 0.75, "enabled": True, "max_pairs": 2000, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "xy_support_px": 50, "xy_ratio_min": 0.15,
+    config = {"u_floor": 0.75, "enabled": True, "max_pairs": 2000, "support_px": 40, "s_max_cells": 2, "tile_min_cells": 7, "xy_support_px": 50, "xy_ratio_min": 0.5,
               "tile_min_cells_xy": 5, "factor": 8, "tolerance": 1, **changes}
     document = judge_document()
     document["judge"]["size"] = {"config": config, "stats": {}}

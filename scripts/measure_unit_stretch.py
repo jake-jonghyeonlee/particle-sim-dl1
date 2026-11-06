@@ -208,7 +208,7 @@ def gate_failures(records):
 
 
 def delta_pair(delta, axis):
-    """축 이름과 ΔU 에서 (ΔU_y, ΔU_x). x·y·xy 는 한 축 또는 같은 값이고, "r0.15" 같은 비율 축은 y 가 ΔU 이고 x 가 ceil(비율·ΔU)이다(올림이라 실제 비율이 이름의 비율보다 작아지지 않는다).
+    """축 이름과 ΔU 에서 (ΔU_y, ΔU_x). x·y·xy 는 한 축 또는 같은 값이고, "r0.50" 같은 비율 축은 y 가 ΔU 이고 x 가 ceil(비율·ΔU)이다(올림이라 실제 비율이 이름의 비율보다 작아지지 않는다).
     그 밖(ΔU=0 의 "-")은 (0, 0)."""
     if not delta:
         return 0, 0

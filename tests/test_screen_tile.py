@@ -89,7 +89,7 @@ def rect_plan(a, b):
 
 
 def test_xy_stretch_above_forty_is_supported_down_to_five_cells():
-    assert (st.XY_SUPPORT_PX, st.XY_RATIO_MIN, st.TILE_MIN_CELLS_XY) == (50, 0.15, 5)
+    assert (st.XY_SUPPORT_PX, st.XY_RATIO_MIN, st.TILE_MIN_CELLS_XY) == (50, 0.5, 5)
     for u, delta, cells in ((560, 41, 6), (560, 50, 5), (552, 50, 5), (500, 50, 5), (1000, 50, 10)):  # 두 축이 함께 늘어난 쌍: 폭 U // (2·ΔU), 최소 5 칸
         p = rect_plan((u, u), (u + delta, u + delta))
         assert p["status"] == "ok" and p["tile_cells"] == (cells, cells), (u, delta)
@@ -101,10 +101,10 @@ def test_xy_stretch_above_forty_is_supported_down_to_five_cells():
 def test_xy_stretch_above_forty_needs_both_axes_the_same_sign_and_the_ratio():
     base = 560
     ok = lambda dy, dx: rect_plan((base, base), (base + dy, base + dx))["status"]
-    assert ok(50, 8) == "ok" and ok(8, 50) == "ok" and ok(45, 7) == "ok" and ok(42, 7) == "ok"  # 비율 0.16·0.156·0.167: 하한 0.15 이상
-    assert ok(50, 40) == "ok" and ok(45, 50) == "ok" and ok(45, 9) == "ok"
-    assert ok(50, 7) == "out_of_support" and ok(7, 50) == "out_of_support"  # 비율 0.14
-    assert ok(45, 6) == "out_of_support" and ok(42, 6) == "out_of_support"  # 0.133·0.143
+    assert ok(50, 25) == "ok" and ok(25, 50) == "ok" and ok(45, 23) == "ok" and ok(42, 21) == "ok"  # 비율 0.5·0.511·0.5: 하한 0.5 이상(경계는 지원)
+    assert ok(50, 40) == "ok" and ok(45, 50) == "ok"
+    assert ok(50, 24) == "out_of_support" and ok(24, 50) == "out_of_support"  # 비율 0.48
+    assert ok(45, 22) == "out_of_support" and ok(42, 20) == "out_of_support"  # 0.489·0.476
     assert ok(50, 0) == "out_of_support" and ok(0, 50) == "out_of_support"  # 한 축만 늘어남
     assert ok(41, 0) == "out_of_support" and ok(0, 41) == "out_of_support"
     assert ok(51, 51) == "out_of_support" and ok(50, 51) == "out_of_support"
@@ -117,9 +117,9 @@ def test_xy_stretch_above_forty_needs_both_axes_the_same_sign_and_the_ratio():
 
 
 def test_is_xy_stretch_uses_an_exact_ratio():
-    assert st.is_xy_stretch((50, 8)) and st.is_xy_stretch((45, 7)) and st.is_xy_stretch((-50, -8)) and st.is_xy_stretch((41, 41)) and st.is_xy_stretch((8, 50))
-    assert st.is_xy_stretch((20, 3)) and not st.is_xy_stretch((20, 2))  # 3/20 = 0.15 는 경계(정확한 분수 비교)
-    assert not st.is_xy_stretch((45, 6)) and not st.is_xy_stretch((50, 7)) and not st.is_xy_stretch((50, -50)) and not st.is_xy_stretch((50, 0)) and not st.is_xy_stretch((0, 0))
+    assert st.is_xy_stretch((50, 25)) and st.is_xy_stretch((45, 23)) and st.is_xy_stretch((-50, -25)) and st.is_xy_stretch((41, 41)) and st.is_xy_stretch((25, 50))
+    assert st.is_xy_stretch((20, 10)) and not st.is_xy_stretch((21, 10))  # 10/20 = 0.5 는 경계(정확한 분수 비교)
+    assert not st.is_xy_stretch((45, 22)) and not st.is_xy_stretch((50, 24)) and not st.is_xy_stretch((50, -50)) and not st.is_xy_stretch((50, 0)) and not st.is_xy_stretch((0, 0))
 
 
 def test_layer_support_is_capped_but_omega_support_follows_the_area():

@@ -33,7 +33,7 @@ MAX_DELTA_U_PX = 40  # 지원 범위(합성 게이트 근거: scripts/measure_un
 S_MAX_CELLS = 2
 TILE_MIN_CELLS = 7  # 게이트에서 확인한 가장 좁은 tile 폭(U 560, ΔU 40)
 XY_SUPPORT_PX = 50  # 두 축이 함께 늘어난 쌍의 지원 상한: max(|ΔU_y|, |ΔU_x|) 가 40 위 50 이하이면 XY_RATIO_MIN 을 만족하는 같은 부호 쌍만 지원한다
-XY_RATIO_MIN = 0.15  # min(|ΔU_y|, |ΔU_x|) / max(...) 하한(0.05 간격; 합성 게이트 (a) 를 만족하는 가장 작은 값: scripts/measure_unit_stretch.py --tile --xy-sweep. 0.10 부터 (a) 실패)
+XY_RATIO_MIN = 0.5  # min(|ΔU_y|, |ΔU_x|) / max(...) 하한. 사용자 결정(여유를 위해). 게이트 (a) 는 0.15 까지 통과했다(scripts/measure_unit_stretch.py --tile --xy-sweep; 0.10 부터 실패)
 TILE_MIN_CELLS_XY = 5  # 40 위 구간의 tile 최소 폭(U 552, ΔU 50 → 5 칸)
 TILE_DIVISOR = 2  # tile 폭 = U_min / (2·ΔU): tile 안 늘어남 차가 0.5 칸 이하
 UNIT_RADIUS_CELLS = 3  # 기하 예측이 정확해서 unit·tile 탐색 반경은 ΔU 와 무관한 작은 고정값(경계에 닿은 후보는 search_bound 로 거부하므로 실효 ±2)

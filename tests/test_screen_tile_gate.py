@@ -37,7 +37,7 @@ def false():
 
 @pytest.fixture(scope="module")
 def xy_same():
-    return mus.tile_measure(units=(560,), deltas=(45, 50), phases=(0,), axes=("x", "xy"), ratios=(st.XY_RATIO_MIN, 0.10))
+    return mus.tile_measure(units=(560,), deltas=(45, 50), phases=(0,), axes=("x", "xy"), ratios=(st.XY_RATIO_MIN, 0.45))
 
 
 @pytest.fixture(scope="module")
@@ -66,15 +66,15 @@ def test_same_design_beyond_the_support_range_is_out_of_support_without_p(same):
 
 
 def test_xy_stretch_above_forty_keeps_tile_p_and_other_shapes_are_out_of_support(xy_same):
-    assert len(xy_same) == 1 * 2 + 2 * 4 * 1 * 2  # ΔU=0 (위상 1 × 경로 2) + ΔU 2 × 축 4(x, xy, r0.15, r0.10) × 위상 1 × 경로 2
+    assert len(xy_same) == 1 * 2 + 2 * 4 * 1 * 2  # ΔU=0 (위상 1 × 경로 2) + ΔU 2 × 축 4(x, xy, r0.50, r0.45) × 위상 1 × 경로 2
     bad = [describe(r) for r in mus.same_failures(xy_same)]
     assert not bad, f"{len(bad)} failing: " + "; ".join(bad)
-    supported = [r for r in xy_same if r["delta"] and r["axis"] in ("xy", "r0.15")]
+    supported = [r for r in xy_same if r["delta"] and r["axis"] in ("xy", "r0.50")]
     assert len(supported) == 2 * 2 * 2 and all(r["tile_status"] == "ok" and r["tile_p"] is not None for r in supported)
     assert min(r["tile_p"] - r["p0"] for r in supported) >= -mus.MARGIN_P
     assert {(r["delta"], r["axis"], r["tile_size_y_cells"], r["tile_size_x_cells"]) for r in supported} == {
-        (45, "xy", 6, 6), (45, "r0.15", 6, 35), (50, "xy", 5, 5), (50, "r0.15", 5, 35)}  # 560 // (2·ΔU) 칸, 축마다(느슨한 축은 unit 한 칸 수의 절반 35 로 막힌다)
-    unsupported = [r for r in xy_same if r["delta"] and r["axis"] in ("x", "r0.10")]
+        (45, "xy", 6, 6), (45, "r0.50", 6, 12), (50, "xy", 5, 5), (50, "r0.50", 5, 11)}  # 560 // (2·ΔU) 칸, 축마다
+    unsupported = [r for r in xy_same if r["delta"] and r["axis"] in ("x", "r0.45")]
     assert len(unsupported) == 2 * 2 * 2 and all(r["tile_status"] == "out_of_support" and r["tile_p"] is None for r in unsupported)
     assert all(r["tier"] == "unknown" and r["reason"] == "size_differs_out_of_support" for r in unsupported)
 
@@ -101,7 +101,7 @@ def test_different_patterns_are_not_made_close_by_tile_alignment(false):
 
 def test_different_patterns_stay_different_in_the_xy_range_above_forty(xy_false):
     n = len(mus.VARIANTS)
-    assert len(xy_false) == n * 2 + 2 * n * 2  # ΔU=0 기준(변형 × 경로 2) + ΔU 50 × 축 2(xy, r0.15) × 변형 × 경로 2
+    assert len(xy_false) == n * 2 + 2 * n * 2  # ΔU=0 기준(변형 × 경로 2) + ΔU 50 × 축 2(xy, r0.50) × 변형 × 경로 2
     bad = [describe(r) for r in mus.false_failures(xy_false)]
     assert not bad, f"{len(bad)} failing: " + "; ".join(bad)
     stretched = [r for r in xy_false if r["delta"]]
@@ -155,15 +155,15 @@ def test_in_range_pair_with_a_too_narrow_tile_must_report_tile_too_small():
     assert not mus.in_tile_support(narrow) and mus.expected_out_status(narrow) == "tile_too_small"
     assert mus.in_tile_support({"unit": 560, "delta": 40}) and mus.in_tile_support({"unit": 552, "delta": 38})
     assert mus.expected_out_status({"unit": 560, "delta": 51}) == "out_of_support"
-    # 40 위: 두 축이 함께 늘어난 쌍(비율 ≥ 0.15)만 지원하고 tile 최소 5 칸. 레코드에 axis 가 없으면 두 축이 같다(xy)
+    # 40 위: 두 축이 함께 늘어난 쌍(비율 ≥ 0.5)만 지원하고 tile 최소 5 칸. 레코드에 axis 가 없으면 두 축이 같다(xy)
     xy = {"unit": 552, "delta": 50, "axis": "xy"}
     assert mus.in_tile_support(xy) and mus.in_tile_support({"unit": 560, "delta": 41})
     assert not mus.in_tile_support({**xy, "unit": 492}) and mus.expected_out_status({**xy, "unit": 492}) == "tile_too_small"
-    assert mus.in_tile_support({"unit": 560, "delta": 45, "axis": "r0.15"}) and not mus.in_tile_support({"unit": 560, "delta": 45, "axis": "r0.10"})
-    for axis in ("x", "y", "r0.10"):
+    assert mus.in_tile_support({"unit": 560, "delta": 45, "axis": "r0.50"}) and not mus.in_tile_support({"unit": 560, "delta": 45, "axis": "r0.45"})
+    for axis in ("x", "y", "r0.45"):
         assert mus.expected_out_status({"unit": 560, "delta": 45, "axis": axis}) == "out_of_support"
     assert mus.expected_out_status({"unit": 560, "delta": 51, "axis": "xy"}) == "out_of_support"
-    assert mus.delta_pair(45, "r0.15") == (45, 7) and mus.delta_pair(42, "r0.15") == (42, 7) and mus.delta_pair(50, "r0.10") == (50, 5)  # 올림: 실제 비율이 이름보다 작아지지 않는다
+    assert mus.delta_pair(45, "r0.50") == (45, 23) and mus.delta_pair(42, "r0.50") == (42, 21) and mus.delta_pair(42, "r0.45") == (42, 19) and mus.delta_pair(50, "r0.45") == (50, 23)  # 올림: 실제 비율이 이름보다 작아지지 않는다
     assert mus.delta_pair(45, "x") == (0, 45) and mus.delta_pair(0, "-") == (0, 0)
 
 
@@ -183,9 +183,9 @@ def test_same_failures_rules():
     assert not mus.same_failures([rec(delta=51, tile_status="out_of_support", tile_p=None)])
     assert mus.same_failures([rec(delta=51, tile_status="ok")])
     # 40 위는 두 축이 함께 늘어난 쌍만 ok 여야 하고, 한 축·비율 미달은 out_of_support 여야 한다
-    assert not mus.same_failures([rec(delta=45, axis="xy"), rec(delta=45, axis="r0.15"), rec(delta=45, axis="x", tile_status="out_of_support", tile_p=None),
-                                  rec(delta=45, axis="r0.10", tile_status="out_of_support", tile_p=None)])
-    assert mus.same_failures([rec(delta=45, axis="x")]) and mus.same_failures([rec(delta=45, axis="r0.10")])
+    assert not mus.same_failures([rec(delta=45, axis="xy"), rec(delta=45, axis="r0.50"), rec(delta=45, axis="x", tile_status="out_of_support", tile_p=None),
+                                  rec(delta=45, axis="r0.45", tile_status="out_of_support", tile_p=None)])
+    assert mus.same_failures([rec(delta=45, axis="x")]) and mus.same_failures([rec(delta=45, axis="r0.45")])
     assert mus.same_failures([rec(delta=45, axis="xy", tile_status="out_of_support", tile_p=None)])
 
 
