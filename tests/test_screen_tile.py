@@ -276,10 +276,49 @@ def test_origin_candidate_rescues_a_center_shift_that_is_off_by_three_or_more_ce
 
 
 @pytest.mark.parametrize("shift", [(0, 0), (1, 0), (0, -2), (2, 2)])
-def test_input_shift_is_kept_when_it_works_at_least_as_well(shift):
+def test_origin_zero_is_kept_when_the_input_shift_works_equally_well(shift):
     sa, sb = product(560, DESIGN), product(560, DESIGN)
     _, out = align_of(sa, sb, shift)
-    assert out["origin"] == "shift" and not out["unit_failed"]  # 둘 다 4 unit 성공이고 Dice 가 같으면 입력 shift
+    assert out["origin"] == "zero" and not out["unit_failed"] and out["coverage"] >= st.COVERAGE_MIN  # 둘 다 coverage·성공 수·Dice 가 같으면 (0, 0)
+
+
+def test_input_shift_wins_only_when_strictly_better():
+    sa = product(560, DESIGN)
+    sb = displaced_units(sa, {q: (4, 4) for q in ((0, 0), (0, 1), (1, 0), (1, 1))})  # (0, 0) 에서는 탐색 반경 밖이라 모든 unit 이 실패한다
+    _, out = align_of(sa, sb, (4, 4))
+    assert out["origin"] == "shift" and not out["unit_failed"]
+    assert st.tile_pattern_axis(sa, sb, (4, 4), sources(sa, sb), KEYS)["tile_status"] == "ok"
+
+
+def fake_run(coverage, failed, dice):
+    units = ((0, 0), (0, 1), (1, 0), (1, 1))
+    return {"offsets": [], "predictions": [], "applied": [], "reasons": [], "step_replaced": 0, "unit_shifts": {}, "unit_failed": {q: "low_score" for q in units[:failed]},
+            "unit_corrected": 0, "unit_dices": {q: dice for q in units[failed:]}, "coverage": coverage}
+
+
+@pytest.mark.parametrize("zero, shift, want", [
+    ((0.5, 0, 0.0), (0.95, 3, 0.9), "shift"),   # coverage 0.9 미만인 (0, 0) 은 성공 unit 수·Dice 가 더 좋아도 진다
+    ((0.95, 3, 0.9), (0.5, 0, 0.0), "zero"),
+    ((0.95, 1, 0.9), (0.95, 2, 0.5), "shift"),  # coverage 가 둘 다 충분하면 성공 unit 수
+    ((0.95, 2, 0.5), (0.95, 2, 0.8), "shift"),  # 성공 unit 수가 같으면 Dice 평균
+    ((0.95, 2, 0.8), (0.95, 2, 0.8), "zero"),   # 모두 같으면 (0, 0)
+    ((0.95, 0, 0.0), (0.95, 0, 0.0), "zero"),   # 둘 다 모든 unit 이 실패해도 (0, 0)
+    ((0.91, 4, 0.5), (0.99, 4, 0.5), "zero"),   # coverage 는 임계(0.9) 통과 여부만 본다: 값이 더 높다고 이기지 않는다
+])
+def test_origin_selection_order_is_coverage_then_unit_count_then_dice_then_zero(monkeypatch, zero, shift, want):
+    plan = st.tile_plan(geometry(480), geometry(480), 8, 1)
+    results = {(0, 0): fake_run(zero[0], 4 - zero[1], zero[2]), (7, 7): fake_run(shift[0], 4 - shift[1], shift[2])}
+    calls = []
+    monkeypatch.setattr(st, "_align_from", lambda plan, layers, va, vb, origin, min_dice: calls.append(origin) or results[origin])
+    out = st.align_tiles(plan, {}, None, None, (7, 7))
+    assert out["origin"] == want and calls == [(0, 0), (7, 7)] and "unit_dices" not in out
+
+
+def test_a_zero_input_shift_runs_the_candidate_once(monkeypatch):
+    plan = st.tile_plan(geometry(480), geometry(480), 8, 1)
+    calls = []
+    monkeypatch.setattr(st, "_align_from", lambda plan, layers, va, vb, origin, min_dice: calls.append(origin) or fake_run(1.0, 0, 1.0))
+    assert st.align_tiles(plan, {}, None, None, (0, 0))["origin"] == "zero" and calls == [(0, 0)]
 
 
 def test_origin_candidate_is_deterministic():

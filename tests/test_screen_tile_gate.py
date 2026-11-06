@@ -67,11 +67,11 @@ def test_different_patterns_are_not_made_close_by_tile_alignment(false):
     assert not bad, f"{len(bad)} failing: " + "; ".join(bad)
     # P_var0 가 낮은 변형이 실제로 있어야 이 검증이 의미가 있다. ΔU=0 쌍은 p_var0 == single_p, 늘어난 쌍의 p_var0 는 그 변형의 ΔU=0 값이다
     low = [r for r in false if r["delta"] and r["p_var0"] < mus.FALSE_P]
-    assert {"mixed", "cutdrift"} <= {r["variant"] for r in low}  # R1 adv:1: P_var0 가 낮은 쪽에 퍼진 변형(전체 게이트는 U 1000 의 dense 도 0.34 로 포함한다)
+    assert {"mixed", "cutdrift", "half_pixel"} <= {r["variant"] for r in low}  # R2 adv:2: half_pixel 은 P_var0 0.25–0.30 쪽. R1 adv:1: P_var0 가 낮은 쪽에 퍼진 변형(전체 게이트는 U 1000 의 dense 도 0.34 로 포함한다)
     assert {"dense", "keep_pixel"} <= {r["variant"] for r in false if r["delta"] and r["p_var0"] < mus.RECORD_P}  # 기록 구간(0.35–0.40)까지 퍼진 변형
     assert all(r["tier_low_u"] in {"different", "unknown"} for r in false)  # U 낮음 판정을 같이 잰다
     assert all(r["p_var0"] == r["single_p"] for r in false if r["delta"] == 0)
-    assert all(r["tile_p"] is None or r["tile_p"] <= r["p_var0"] + mus.FALSE_SLACK for r in low)
+    assert all(r["tile_p"] is None or r["tile_p"] <= max(r["p_var0"], r["p_var0_best"]) + mus.FALSE_SLACK for r in low)  # 기준은 두 경로 중 높은 단일 P(gate 와 같다)
 
 
 def test_support_range_boundary_needs_the_minimum_tile_width():
@@ -81,6 +81,31 @@ def test_support_range_boundary_needs_the_minimum_tile_width():
     assert by_unit[ok_unit]["tile_status"] == "ok" and by_unit[ok_unit]["tile_size_y_cells"] == st.TILE_MIN_CELLS and by_unit[ok_unit]["tile_p"] is not None
     assert by_unit[small_unit]["tile_status"] == "tile_too_small" and by_unit[small_unit]["tile_p"] is None
     assert not mus.support_failures(records)
+
+
+def test_repeat_unit_input_shift_does_not_move_the_start_point_away_from_the_origin():
+    """같은 설계의 늘어난 쌍(U 552, ΔU 38)에 입력 이동을 한 unit(y)+반 unit(x) 밀어 넣거나 실자료 M13·WF3 의 layer_shift 를 넣어도 (0, 0) 이 골라지고 tile 이 맞는다."""
+    records = mus.repeat_measure(cases=((552, 38),))
+    assert [r["shift_name"] for r in records] == ["none", "minus", "plus", "real"]
+    assert next(r for r in records if r["shift_name"] == "real")["input_shift"] == mus.REAL_SHIFT
+    assert {r["origin"] for r in records} == {"zero"}
+    assert all(r["tile_status"] == "ok" and r["coverage"] >= st.COVERAGE_MIN and r["tile_p"] >= r["p0"] - mus.MARGIN_P for r in records)
+    assert abs(next(r for r in records if r["shift_name"] == "minus")["origin_shift"][0]) > 60  # 입력 이동이 실제로 한 unit 가까이 어긋나 있다
+    assert not mus.repeat_failures(records)
+
+
+def test_repeat_failures_rules():
+    base = {"origin": "zero", "tile_status": "ok", "tile_p": 1.0, "p0": 1.0, "tier": "unknown", "repeat_equal": True}
+    assert not mus.repeat_failures([base])
+    assert mus.repeat_failures([{**base, "origin": "shift"}]) and mus.repeat_failures([{**base, "tile_p": 0.94}]) and mus.repeat_failures([{**base, "tier": "different"}])
+    assert mus.repeat_failures([{**base, "tile_status": "low_coverage", "tile_p": None}])
+
+
+def test_in_range_pair_with_a_too_narrow_tile_must_report_tile_too_small():
+    narrow = {"unit": 552, "delta": 40}  # 552 // 80 = 6 칸 < 7
+    assert not mus.in_tile_support(narrow) and mus.expected_out_status(narrow) == "tile_too_small"
+    assert mus.in_tile_support({"unit": 560, "delta": 40}) and mus.in_tile_support({"unit": 552, "delta": 38})
+    assert mus.expected_out_status({"unit": 560, "delta": 41}) == "out_of_support"
 
 
 def rec(**kw):
@@ -107,6 +132,8 @@ def test_false_failures_use_the_unstretched_variant_p_not_the_stretched_single_p
     assert mus.false_failures([rec(tile_p=0.25, tier="unknown", **low)])  # tile_p 가 있는데 different 가 아니다
     assert mus.false_failures([rec(tile_p=0.25, tier="different", tier_low_u="unknown", **low)])  # U 가 낮은 판정도 different 여야 한다(혼합 판정)
     assert mus.false_failures([rec(tile_p=None, tier_low_u="unknown", **low)])  # tile 실패 + U 낮음 → tile_p 없음 행은 different
+    assert not mus.false_failures([rec(tile_p=0.26, tier="different", p_var0=0.12, p_var0_best=0.27)])  # anchor 경로 P_var0 가 낮아도 경로 중 높은 값이 기준
+    assert mus.false_failures([rec(tile_p=0.36, tier="different", p_var0=0.12, p_var0_best=0.27)])
     assert not mus.false_failures([rec(tile_p=0.95, tier="unknown", p_var0=0.8)])  # 원래 비슷한 변형은 기준 밖
     assert not mus.false_failures([rec(delta=0, tile_p=0.95, tier="unknown", p_var0=0.2)])  # ΔU=0 은 기준 측정용
     assert mus.false_failures([rec(repeat_equal=False, p_var0=0.8)])

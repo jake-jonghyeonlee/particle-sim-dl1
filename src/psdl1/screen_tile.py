@@ -8,7 +8,7 @@
   unit_geometry   축마다 U_px = (길이 − 1000)/2. 원본 px 경계 500, 500+U, 500+2U 를 한 번만 floor(px/factor) 로 양자화해 공유 경계 배열을 만든다.
   tile_plan       ΔU(B−A)로 tile 폭 T = U_min/(2·ΔU)(최소 7 칸), 탐색 반경(unit·tile 모두 3 고정), tile 목록을 정한다. ΔU 가 MAX_DELTA_U_PX(40) 를 넘거나 범위를 벗어나면 이유 상태를 돌려준다.
   match_tile      compare(layer_align) 규칙의 tile 매처: 고정 Ω, Dice 우선 층 순서, 모호함·낮은 점수·탐색 경계는 거부(→ 기하 예측으로 대체).
-  align_tiles     unit 이동 → tile 이동 → G1(이웃 tile 단차 상자) 반복.
+  align_tiles     시작점 후보(기하 원점 (0,0), 입력 shift)마다 unit 이동 → tile 이동 → G1(이웃 tile 단차 상자) → coverage 를 돌리고 고른다.
   warp_raster     tile 마다 B 를 그 이동으로 잘라 A 좌표에 놓는다.
   tile_pattern_axis  unit 영역 Ω 의 binding 별 경계 F1 평균 = tile_p.
 
@@ -292,17 +292,45 @@ def _neighbor_pairs(tiles):
     return pairs
 
 
+def _coverage(plan, valid_a, valid_b, offsets):
+    """tile 이동 offsets 로 B 를 옮긴 뒤 unit 영역에서 A valid ∧ 옮긴 B valid 가 차지하는 비율(_score 의 coverage 와 같다)."""
+    bounds = plan["geometry_a"]["bounds"]
+    box = (slice(bounds[0][0], bounds[0][2]), slice(bounds[1][0], bounds[1][2]))
+    omega = np.asarray(valid_a, dtype=bool)[box] & warp_raster(valid_b, plan, offsets)[box]
+    return int(np.count_nonzero(omega)) / omega.size if omega.size else 0.0
+
+
 def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
     """unit 이동 → tile 이동 → G1. plan 은 status ok 여야 한다.
 
     반환: offsets (tile 목록 순서의 (dy, dx)), predictions (tile 기하 예측), applied (매처 결과를 쓴 tile), reasons, step_replaced (G1 이 되돌린 수),
-    unit_shifts {unit: (dy, dx) 중심 이동}, unit_failed {unit: 이유} (기하 예측으로 대체한 unit), origin ("shift"|"zero": 고른 시작점 후보),
-    unit_corrected (잔차 보정으로 성공한 unit 수).
+    unit_shifts {unit: (dy, dx) 중심 이동}, unit_failed {unit: 이유} (기하 예측으로 대체한 unit), origin ("zero"|"shift": 고른 시작점 후보),
+    unit_corrected (잔차 보정으로 성공한 unit 수), coverage (고른 후보의 coverage).
 
-    시작점: 입력 shift 와 기하 원점 (0, 0) 두 후보로 unit 단계를 돌려 성공 unit 수가 많은 쪽, 같으면 성공 unit Dice 평균이 높은 쪽, 같으면 입력 shift 를 쓴다.
+    시작점: 기하 원점 (0, 0) 과 입력 shift(다르면) 두 후보를 각각 unit 단계·tile 단계·G1·coverage 까지 돌린다. ① coverage ≥ COVERAGE_MIN 인 후보,
+    ② 성공 unit 수가 많은 후보, ③ 성공 unit Dice 평균이 높은 후보 순으로 고르고, 모두 같으면 (0, 0) 을 쓴다. 입력 shift 는 엄밀히 나을 때만 이긴다
+    (반복 unit 은 한 unit 옆 정렬도 같은 패턴으로 매칭되므로 성공 수와 Dice 만으로는 구별되지 않는다).
     부분 실패 보정: 일부 unit 만 성공하면 성공 unit 의 (실제 − 예측) 잔차 평균(축별, round(Fraction) 반올림 half-even)을 실패 unit 예측에 더해 한 번 다시 맞춘다."""
     if plan["status"] != "ok":
         raise ValueError(f"plan status is {plan['status']}")
+    origins = [("zero", (0, 0))]
+    if (int(shift[0]), int(shift[1])) != (0, 0):
+        origins.append(("shift", (int(shift[0]), int(shift[1]))))
+    best = None
+    for name, origin in origins:
+        run = _align_from(plan, layers, valid_a, valid_b, origin, min_dice)
+        n_ok = len(plan["units"]) - len(run["unit_failed"])
+        score = (run["coverage"] >= COVERAGE_MIN, n_ok, (sum(run["unit_dices"].values()) / len(run["unit_dices"])) if run["unit_dices"] else -1.0)
+        if best is None or score > best[0]:  # 엄밀히 클 때만 바꾼다: 같으면 (0, 0)
+            best = (score, name, run)
+    _, name, run = best
+    out = {k: v for k, v in run.items() if k != "unit_dices"}
+    out["origin"] = name
+    return out
+
+
+def _align_from(plan, layers, valid_a, valid_b, origin, min_dice):
+    """시작점 origin 하나로 unit 이동 → (부분 실패 보정) → tile 이동 → G1 을 돌리고 coverage 를 잰다. align_tiles 의 반환에서 origin 을 뺀 dict + unit_dices."""
     ry, rx = plan["radius_cells"]
     uy_r, ux_r = plan["unit_radius_cells"]
 
@@ -325,16 +353,7 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
                 failed[q] = res["reason"]
         return shifts, failed, dices, results
 
-    origins = [("shift", (int(shift[0]), int(shift[1])))]
-    if origins[0][1] != (0, 0):
-        origins.append(("zero", (0, 0)))
-    best = None
-    for name, origin in origins:
-        run = run_units(origin)
-        score = (len(run[2]), (sum(run[2].values()) / len(run[2])) if run[2] else -1.0)
-        if best is None or score > best[0]:  # 엄밀히 클 때만 바꾼다: 같으면 입력 shift
-            best = (score, name, origin, run)
-    _, origin_name, origin, (unit_shift, unit_failed, dices, results) = best
+    unit_shift, unit_failed, dices, results = run_units(origin)
     unit_center = {q: ((plan["units"][q][0] + plan["units"][q][1]) // 2, (plan["units"][q][2] + plan["units"][q][3]) // 2) for q in plan["units"]}
     corrected = 0
     if unit_failed and dices:
@@ -347,6 +366,7 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
                 unit_failed[q] = retry[1][q]
             else:
                 del unit_failed[q]
+                dices[q] = retry[2][q]
                 corrected += 1
     tiles = plan["tiles"]
     preds, offsets, applied, reasons = [], [], [], []
@@ -381,7 +401,8 @@ def align_tiles(plan, layers, valid_a, valid_b, shift, min_dice=MIN_DICE):
             reasons[k] = "step_exceeded"
             replaced += 1
     return {"offsets": offsets, "predictions": preds, "applied": applied, "reasons": reasons, "step_replaced": replaced,
-            "unit_shifts": unit_shift, "unit_failed": unit_failed, "origin": origin_name, "unit_corrected": corrected}
+            "unit_shifts": unit_shift, "unit_failed": unit_failed, "unit_corrected": corrected, "unit_dices": dices,
+            "coverage": _coverage(plan, valid_a, valid_b, offsets)}
 
 
 def warp_raster(mask_b, plan, offsets):
